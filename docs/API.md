@@ -364,17 +364,39 @@ interface PublicStatus {
   attacks_blocked: number;
   last_attack_run_at: ISO | null;
   audit_events: number;
-  market: { mode: "replay"; nifty: { ltp_paise: Paise; change_bps: Bps } | null };
+  market: { mode: "replay" | "live"; nifty: { ltp_paise: Paise; change_bps: Bps } | null };   // "live" while the 021 gateway runs
   generated_at: ISO;
 }
 ```
 
 ### Account (read-only gateway; uses the broker READ key only)
+Every read uses the caller's **active** account: their paper account, or the 021 sandbox account when they are a listed owner and it is active.
+
 | GET | `/api/account/summary` | `AccountSummary` |
 |---|---|---|
-| GET | `/api/account/holdings` | `Holding[]` |
-| GET | `/api/account/positions` | `Position[]` |
-| GET | `/api/account/orders?status=open\|all\|rejected` | `BrokerOrder[]` |
+| GET | `/api/account/holdings` | `Holding[]` (021 adds `free_quantity`, `btst_quantity`, `sell_quantity`, `today_quantity`, `prev_close_paise`) |
+| GET | `/api/account/positions` | `Position[]` (021 adds `square_off_quantity`, `prev_close_paise`; 021's INTRADAY is shown as MIS) |
+| GET | `/api/account/orders?status=open\|all\|rejected` | `BrokerOrder[]` (021 adds `status_021`, `price_021_paise`, `trigger_021_paise`, `token_021`, `exchange_021`, `exchange_order_number`, `side_known` and `origin`: `"countersign"` or `"external"` for orders placed outside Countersign) |
+| GET | `/api/account/funds` | `{ estimate: boolean; cash_paise; used_margin_paise; available_paise; basis?: string; account_id }`. On 021 `estimate` is `true` (021 has no funds API) and `basis` explains the estimate; `account_id` is masked there |
+
+### Broker accounts (021 sandbox linking)
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/api/broker/accounts` | | `BrokerAccount[]`: the caller's paper account and, for users listed in `CS_021_OWNER_EMAILS`, the 021 sandbox account |
+| POST | `/api/broker/active` | `{ account_id: string }` | `{ active_account_id: string; accounts: BrokerAccount[] }`; `404 ACCOUNT_NOT_FOUND` if the caller cannot operate that account (also when their email was removed from the owner list) |
+| GET | `/api/broker/status` | | `{ active_kind: "paper" \| "021"; gateway021_enabled: boolean; gateway021: null \| { up: boolean; logged_in?; token_expires_at?; account? /* masked */; instruments?; market_socket?; orders_socket?; http? /* 429, 5xx, timeouts, read retries, re-logins */; last_reconciliation? } }`. Never contains a credential, a token or the unmasked account id |
+
+```ts
+interface BrokerAccount {
+  account_id: string;            // for POST /api/broker/active only; display label or masked_id
+  kind: "paper" | "021";
+  label: string;                 // "Paper trading account" | "021 sandbox HACK***3"
+  masked_id: string;
+  active: boolean;
+  status: { connected: boolean; token_expires_at: ISO | null; market_data: "live" | "replay"; last_error: string | null };
+}
+```
+`GET /api/me` also returns `account: { id, label, kind }` for the active account, and `GET /api/security/status` adds `kind` and `label` to `broker`.
 
 ### Market
 | GET | `/api/market/instruments?q=` | `InstrumentHandle[]` |
@@ -382,7 +404,7 @@ interface PublicStatus {
 | GET | `/api/market/quote/{symbol}` | `{ instrument: InstrumentHandle; tick: Tick }` |
 | GET | `/api/market/watchlist` | `{ instrument: InstrumentHandle; tick: Tick }[]` |
 | GET | `/api/market/history/{symbol}?points=300` | `{ time: number /* unix s */; value: number /* rupees */ }[]` |
-| GET | `/api/market/option-chain?underlying=NIFTY&expiry=YYYY-MM-DD&width=8` | `OptionChain` |
+| GET | `/api/market/option-chain?underlying=NIFTY&expiry=YYYY-MM-DD&width=8` | `OptionChain`. With the 021 gateway on it is built from live 021 prices: `iv_bps` is `null` and a leg's `ltp_paise` is `null` until 021 has sent a price for it (never a simulated price) |
 
 ### Chat (Server-Sent Events over POST)
 `POST /api/chat` with `{ conversation_id?: string; message: string; engine?: "auto" | "ollama" | "gemini" | "groq" | "deterministic" }` returns `text/event-stream`. Each SSE `data:` line is one JSON object:
@@ -430,6 +452,8 @@ interface ApprovalStart {
 }
 ```
 
+A price standing instruction whose condition is already true at the live price is answered with a `clarify` card instead of a proposal: the question states the live price, and `options` are complete sentences (the order now as a limit order, and a trigger about 2% beyond the live price) that can be sent back as the next message.
+
 Approval errors (HTTP 409/412/422/423) use codes: `APPROVAL_EXPIRED`, `PRICE_DRIFT`, `STALE_MARKET_DATA`, `SIGNATURE_INVALID`, `PAYLOAD_MISMATCH`, `PIN_INVALID`, `PIN_LOCKED`, `TOTP_INVALID`, `PROPOSAL_BLOCKED`, `ALREADY_APPROVED`, `KILL_SWITCH_ENGAGED`, `NO_DEVICE_REGISTERED`.
 
 ### Mandates, plans, outcomes
@@ -444,6 +468,7 @@ interface OutcomeEvent {
   id: string; ts: ISO;
   kind: "ORDER_ACCEPTED" | "ORDER_PARTIALLY_FILLED" | "ORDER_FILLED" | "ORDER_REJECTED" | "ORDER_CANCELLED"
       | "EXECUTION_BLOCKED" | "RECONCILED" | "MANDATE_ARMED" | "MANDATE_TRIGGERED" | "MANDATE_NEEDS_REVIEW" | "ALERT"
+      | "ORDER_NOT_PLACED" | "ORDER_NEEDS_REVIEW" | "EXTERNAL_ORDER"     // 021: not sent (countersign again), lost answer that needs review, order placed outside Countersign
       | "PLAN_COMPLETED" | "PLAN_PARTIALLY_COMPLETED" | "PLAN_FAILED" | "APPROVAL_VERIFIED" | "KILL_SWITCH";
   title: string; detail: string;
   severity: "info" | "success" | "warning" | "danger";
@@ -505,8 +530,8 @@ interface Scoreboard { unapproved_executions: number; naive_unapproved_execution
 ```
 
 ### Demo controls (enabled only when `CS_DEMO_MODE=true`)
-| POST | `/api/demo/reset` | `{ ok: true; account_id: string }`. Resets **only the caller**: their paper account at the broker (orders and trades deleted; cash, holdings and position reseeded) and their own proposals, approvals and execution records, mandates, plans, outcomes, order mirrors and chat. Also sets the feed to `calm`, clears broker faults and refills the LAB1 and NAIVE1 sandboxes. Never touches other users, the kill switch, security events or the audit chain. |
+| POST | `/api/demo/reset` | `{ ok: true; account_id: string }`. Answers `409 NOT_RESETTABLE` when the caller's active account is the 021 sandbox account. Resets **only the caller**: their paper account at the broker (orders and trades deleted; cash, holdings and position reseeded) and their own proposals, approvals and execution records, mandates, plans, outcomes, order mirrors and chat. Also sets the feed to `calm`, clears broker faults and refills the LAB1 and NAIVE1 sandboxes. Never touches other users, the kill switch, security events or the audit chain. |
 |---|---|---|
 | POST | `/api/demo/feed` | `{ scenario: "calm" \| "dip_to_trigger" \| "spike" \| "crash" \| "stale"; symbol?: string }` |
-| POST | `/api/demo/broker-fault` | `{ mode: "none" \| "accept_then_drop" \| "delay_ack" \| "reject" \| "partial_fill" \| "connection_failure"; count?: number }` |
-| GET | `/api/demo/state` | `{ feed_mode: string; broker_fault: string; scenarios: string[] }` |
+| POST | `/api/demo/broker-fault` | `{ mode: "none" \| "accept_then_drop" \| "delay_ack" \| "reject" \| "partial_fill" \| "connection_failure"; count?: number }`. On the paper broker every mode applies. On the 021 account only `accept_then_drop` (the gateway drops 021's answer after 021 accepted: reconciled, nothing sent twice), `connection_failure` (the next order fails in the gateway before any byte is sent: `NOT_PLACED`) and `none` apply, for at most 3 orders, and only when the gateway runs with `CS_021_TEST_FAULTS=true` (`403 FAULTS_DISABLED` otherwise, `422 FAULT_NOT_ON_021` for other modes). Neither changes what 021 does. |
+| GET | `/api/demo/state` | `{ feed_mode: "replay" \| "live"; broker_fault: string; broker: "paper" \| "021"; faults_available?: string[] /* 021 */; scenarios: string[] }` |
