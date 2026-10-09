@@ -615,7 +615,7 @@ def set_fault(body: FaultBody, c: Caller = Depends(need("admin"))) -> dict:
         raise HTTPException(422, {"code": "UNKNOWN_FAULT", "message": f"Fault must be one of {sorted(allowed)}."})
     with _lock:
         _fault["mode"] = body.mode
-        _fault["remaining"] = 0 if body.mode == "none" else max(1, body.count)
+        _fault["remaining"] = 0 if body.mode == "none" else min(max(1, body.count), 5)  # a drill, never a standing outage
     return dict(_fault)
 
 

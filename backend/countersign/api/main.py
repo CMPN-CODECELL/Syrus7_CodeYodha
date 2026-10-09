@@ -929,8 +929,10 @@ def account_orders(status: str = "all", p: Principal = Depends(current)):
 def market_instruments(q: str | None = None, p: Principal = Depends(current)):
     from countersign.core.verifier import list_instruments
 
+    on021 = settings().gateway021_enabled and broker_kind(p.account_id) == "021"
     with session_scope() as s:
-        return [instruments.handle(i).model_dump(mode="json") for i in list_instruments(s, q)]
+        # On the 021 account, replay-only instruments (no 021 token, simulated prices) are not offered at all.
+        return [instruments.handle(i).model_dump(mode="json") for i in list_instruments(s, q) if not on021 or i.token_021 is not None]
 
 
 @app.get("/api/market/quote/{symbol}")
@@ -1036,10 +1038,15 @@ def broker_status(p: Principal = Depends(current)):
     with session_scope() as s:
         acct = s.get(Account, p.account_id)
         kind = acct.broker_kind if acct is not None else "paper"
+        # Gateway details (account label, token expiry, counters, last reconciliation) only for traders who can
+        # operate the 021 account; everyone else learns only whether the live feed is up.
+        operator = settings().gateway021_enabled and any(linking.can_operate(s, p.user_id, a) for a in s.execute(select(Account.id).where(Account.broker_kind == "021")).scalars())
     out: dict = {"active_kind": kind, "gateway021_enabled": settings().gateway021_enabled, "gateway021": None}
     if settings().gateway021_enabled:
         st = _gateway_status()
-        if st is not None:
+        if st is not None and not operator:
+            out["gateway021"] = {"up": time.time() - float(st.get("ts") or 0) < 10}
+        elif st is not None:
             m = st.get("market") or {}
             o = st.get("orders_socket") or {}
             out["gateway021"] = {
@@ -1449,6 +1456,30 @@ def _demo_only() -> None:
         raise HTTPException(404, {"code": "NOT_FOUND", "message": "Demo controls are disabled."})
 
 
+# Headers a Cloudflare tunnel always adds; a visitor cannot remove them, so their presence means "came from outside".
+_EDGE_HEADERS = ("cf-connecting-ip", "cf-ray", "cdn-loop", "cf-visitor")
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}  # testserver: the in-process test client
+
+
+def _host_name(value: str) -> str:
+    v = value.strip().lower()
+    if v.startswith("["):
+        return v[1:].split("]", 1)[0]
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
+def _local_presenter(request: Request) -> None:
+    """Presenter controls move the shared replay feed and the paper broker for everyone, so they answer only on this
+    machine: a loopback peer, a loopback Host and (when the Next.js proxy forwarded it) a loopback X-Forwarded-Host,
+    and no tunnel headers. Enforced here, not only by the tunnel's path rule, so path tricks (/API/demo, /api/./demo,
+    %2e segments) that reach the API from the public URL are refused too."""
+    _demo_only()
+    peer = request.client.host if request.client else ""
+    hosts = [request.headers.get("host", "")] + request.headers.get("x-forwarded-host", "").split(",")
+    if peer not in _LOOPBACK or any(h in request.headers for h in _EDGE_HEADERS) or any(_host_name(h) not in _LOCAL_HOSTS for h in hosts if h.strip()):
+        raise HTTPException(404, {"code": "NOT_FOUND", "message": "Presenter controls are only available on the machine that runs Countersign."})
+
+
 # Presenter fault buttons on the 021 account map to the gateway's two drills (CS_021_TEST_FAULTS=true). They never
 # change what 021 does: one drops the gateway's answer after 021 accepted, the other fails before anything is sent.
 GATEWAY_FAULTS = {"none": "none", "accept_then_drop": "drop_after_accept", "connection_failure": "fail_before_send"}
@@ -1459,7 +1490,7 @@ def _on_021(p: Principal) -> bool:
 
 
 @app.get("/api/demo/state")
-def demo_state(p: Principal = Depends(current)):
+def demo_state(_local: None = Depends(_local_presenter), p: Principal = Depends(current)):
     _demo_only()
     scenarios = ["calm", "dip_to_trigger", "spike", "crash", "stale"]
     if _on_021(p):
@@ -1482,7 +1513,7 @@ class FeedBody(BaseModel):
 
 
 @app.post("/api/demo/feed")
-def demo_feed(body: FeedBody, p: Principal = Depends(current)):
+def demo_feed(body: FeedBody, _local: None = Depends(_local_presenter), p: Principal = Depends(current)):
     _demo_only()
     iid = None
     if body.symbol:
@@ -1503,7 +1534,7 @@ class FaultBody(BaseModel):
 
 
 @app.post("/api/demo/broker-fault")
-def demo_fault(body: FaultBody, p: Principal = Depends(current)):
+def demo_fault(body: FaultBody, _local: None = Depends(_local_presenter), p: Principal = Depends(current)):
     _demo_only()
     if _on_021(p):
         mode = GATEWAY_FAULTS.get(body.mode)
@@ -1523,7 +1554,7 @@ def demo_fault(body: FaultBody, p: Principal = Depends(current)):
 
 
 @app.post("/api/demo/reset")
-def demo_reset(p: Principal = Depends(current)):
+def demo_reset(_local: None = Depends(_local_presenter), p: Principal = Depends(current)):
     """Resets ONLY the caller: their paper account at the broker and their own proposals, approvals and execution
     records, mandates, plans, outcomes, order mirrors and chat. Other traders, the kill switch, security events and
     the audit chain are untouched. Also calms the replay feed, clears broker faults and refills the sandboxes."""

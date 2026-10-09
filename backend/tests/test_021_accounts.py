@@ -129,3 +129,17 @@ def test_a_listed_owner_takes_over_from_an_unlisted_anchor(owners, monkeypatch):
         anchor = s.execute(text("SELECT u.email FROM accounts a JOIN users u ON u.id = a.user_id WHERE a.id=:a"), {"a": ACCT}).scalar()
     assert anchor == partner.lower()
     assert c1.get("/api/me").json()["account"]["kind"] == "paper"
+
+
+def test_presenter_controls_answer_only_on_this_machine(owners):
+    # The tunnel's path rule is not the only guard: /API/demo or /api/./demo reach the API, which refuses any request
+    # that came from the public URL (forwarded host, Host header or Cloudflare headers).
+    main, _, (owner, _) = owners
+    c = new_client(main)
+    signup(c, email("presenter"))
+    assert c.get("/api/demo/state").status_code == 200
+    for h in ({"x-forwarded-host": "countersign.everyrepo.me"}, {"host": "countersign.everyrepo.me"}, {"cf-ray": "8a1b2c3d4e5f-BOM"}, {"x-forwarded-host": "localhost:3000,countersign.everyrepo.me"}):
+        r = c.get("/api/demo/state", headers=h)
+        assert r.status_code == 404, h
+        assert c.post("/api/demo/feed", json={"scenario": "calm"}, headers={**csrf(c), **h}).status_code == 404, h
+    assert c.get("/api/demo/state", headers={"x-forwarded-host": "localhost:3000"}).status_code == 200
