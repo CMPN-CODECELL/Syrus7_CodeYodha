@@ -27,6 +27,11 @@ STEP_FROM_STATUS = {
 }
 
 
+def _ref(o: dict, tag: str | None) -> str:
+    """021 has no client order tag: there the id is Countersign's own placement reference, matched by the gateway."""
+    return f"Countersign ref {tag}" if o.get("broker") == "021" else f"tag {tag}"
+
+
 def apply_order_update(s: Session, o: dict) -> None:
     tag = o.get("client_order_id")
     # Lock order for every writer (postback, periodic sync, executor ack): outbox row first, then the mirror row.
@@ -54,7 +59,7 @@ def apply_order_update(s: Session, o: dict) -> None:
         ob.state = "RECONCILED_FOUND"
         ob.reconciled = True
         audit.record(s, "executor", "RECONCILIATION", "outbox", ob.id, {"result": "LATE_FOUND", "was": was, "broker_order_id": o["broker_order_id"]})
-        state.outcome(s, "RECONCILED", "Order found after all", f"The broker now shows order {o['broker_order_id']} (tag {tag}), which had been reported {was.replace('_', ' ').lower()}. It was not resent automatically; check that you did not place it again.", "warning", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"])
+        state.outcome(s, "RECONCILED", "Order found after all", f"The broker now shows order {o['broker_order_id']} ({_ref(o, tag)}), which had been reported {was.replace('_', ' ').lower()}. It was not resent automatically; check that you did not place it again.", "warning", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"])
     ob.broker_order_id = ob.broker_order_id or o["broker_order_id"]
     ob.broker_status = o["status"]
     ob.filled_quantity = o["filled_quantity"]
@@ -76,7 +81,7 @@ def apply_order_update(s: Session, o: dict) -> None:
     acct = p.account_id if p else (o.get("account_id") or "*")
     st = o["status"]
     if st == "OPEN" and prev_status is None:
-        state.outcome(s, "ORDER_ACCEPTED", f"Order accepted: {o['side']} {o['quantity']} {sym}", f"Broker order {o['broker_order_id']} (tag {tag}) is open.", "info", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"], account_id=acct)
+        state.outcome(s, "ORDER_ACCEPTED", f"Order accepted: {o['side']} {o['quantity']} {sym}", f"Broker order {o['broker_order_id']} ({_ref(o, tag)}) is open.", "info", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"], account_id=acct)
     elif st == "PARTIALLY_FILLED" or (st == "CANCELLED" and 0 < o["filled_quantity"] < o["quantity"]):
         if st == "PARTIALLY_FILLED":
             state.outcome(s, "ORDER_PARTIALLY_FILLED", f"Partially filled: {o['filled_quantity']}/{o['quantity']} {sym}", f"Average {inr(o.get('avg_fill_price_paise'))}. {o.get('reject_reason') or ''}".strip(), "warning", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"], account_id=acct)
