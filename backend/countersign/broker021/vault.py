@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import getpass
 import json
+import logging
 import os
+import subprocess
 import threading
 from functools import lru_cache
 from pathlib import Path
@@ -27,12 +30,38 @@ from countersign.core.config import REPO_ROOT
 
 LINK_KEY_FILE = "gateway021_link_key.pem"
 STORE_KEY_FILE = "gateway021_store.key"
+STATUS_KEY_FILE = "gateway021_status.key"
+KEY_FILES = (LINK_KEY_FILE, STORE_KEY_FILE, STATUS_KEY_FILE)
+log = logging.getLogger("countersign.gateway021.vault")
 OAEP = padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
 MAX_PLAINTEXT = 190  # RSA-2048 with OAEP SHA-256: 256 - 2 * 32 - 2 bytes
 
 
 class VaultError(Exception):
     """The ciphertext could not be opened (wrong key, tampered or malformed). Never carries plaintext."""
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def restrict_file(path: Path) -> bool:
+    """Leaves only the current OS user able to read or change a key file. POSIX: chmod 0o600. Windows: icacls removes
+    the inherited entries (for example the Users group) and grants the current user full control; the arguments are a
+    list (no shell), so a path or user name is never interpreted by a shell. Returns False and logs a warning that names
+    only the file when it fails; never raises."""
+    try:
+        if not _is_windows():
+            os.chmod(path, 0o600)
+            return True
+        user = os.environ.get("USERNAME") or getpass.getuser()
+        r = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"], capture_output=True, timeout=20, check=False, shell=False)
+        if r.returncode == 0:
+            return True
+        log.warning("Could not restrict the ACL of %s to the current user (icacls exit %s); other local users may be able to read it.", path.name, r.returncode)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("Could not restrict the permissions of %s to the current user (%s).", path.name, type(e).__name__)
+    return False
 
 
 def _write_once(path: Path, data: bytes) -> None:
@@ -43,6 +72,7 @@ def _write_once(path: Path, data: bytes) -> None:
         return  # another start created it first; the existing key wins
     with os.fdopen(fd, "wb") as f:
         f.write(data)
+    restrict_file(path)
 
 
 class Vault:
@@ -51,6 +81,7 @@ class Vault:
         self._lock = threading.Lock()
         self._priv: rsa.RSAPrivateKey | None = None
         self._aead: AESGCM | None = None
+        self._status: bytes | None = None
 
     # ------------------------------------------------------------------ link key (browser -> gateway)
 
@@ -97,10 +128,28 @@ class Vault:
                 self._aead = AESGCM(key)
             return self._aead
 
+    def status_key(self) -> bytes:
+        """The HMAC key that names accounts in the gateway status (never leaves this process)."""
+        with self._lock:
+            if self._status is None:
+                p = self.dir / STATUS_KEY_FILE
+                if not p.exists():
+                    _write_once(p, base64.b64encode(os.urandom(32)))
+                key = base64.b64decode(p.read_bytes().strip())
+                if len(key) != 32:
+                    raise VaultError(f"{STATUS_KEY_FILE} is not a 256-bit key.")
+                self._status = key
+            return self._status
+
     def ensure_keys(self) -> None:
-        """Creates both keys on first start (no-op afterwards)."""
+        """Creates the three keys on first start (no-op afterwards)."""
         self._private_key()
         self._store_key()
+        self.status_key()
+
+    def restrict_files(self) -> dict[str, bool]:
+        """Re-applies owner-only permissions to every existing key file (gateway start). File name -> applied."""
+        return {name: restrict_file(self.dir / name) for name in KEY_FILES if (self.dir / name).exists()}
 
     @staticmethod
     def _aad(ucc: str, user_id: str) -> bytes:
