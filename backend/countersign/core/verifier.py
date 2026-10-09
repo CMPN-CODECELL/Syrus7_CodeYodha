@@ -18,7 +18,7 @@ from fractions import Fraction
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from countersign.core import charges, instruments, market, portfolio
+from countersign.core import charges, circuits021, instruments, market, portfolio
 from countersign.core.config import settings
 from countersign.core.models import Instrument
 from countersign.core.money import inr, round_to_tick, rupees_to_paise
@@ -780,6 +780,49 @@ def _is_021_account(s: Session, account_id: str) -> bool:
     return acct is not None and acct.broker_kind == "021"
 
 
+def price_band(s: Session, account_id: str, inst: Instrument) -> tuple[int, int]:
+    """Today's (lower, upper) band for orders on this account: the instruments file, narrowed on a 021 account by the
+    limits 021 refused today (circuits021). Never wider than the file."""
+    lo, hi = inst.lower_circuit_paise or 0, inst.upper_circuit_paise or 0
+    if _is_021_account(s, account_id):
+        got = circuits021.learned(inst.instrument_id) or {}
+        lo = max(lo, int(got.get("lower_paise") or 0))
+        if got.get("upper_paise"):
+            hi = min(hi, int(got["upper_paise"])) if hi else int(got["upper_paise"])
+    return lo, hi
+
+
+def _circuit_021_issues(inst: Instrument, order: CanonicalOrder) -> list[Issue]:
+    """021 accounts only: every price 021 receives (limit, trigger and, for MARKET and SL-M, the protected worst-case
+    price) must be inside the stricter of the instruments-file band and the limits 021 refused today. A limit or trigger
+    outside the file band is already reported as PRICE_BAND."""
+    got = circuits021.learned(inst.instrument_id) or {}
+    lo_l, hi_l = int(got.get("lower_paise") or 0), int(got.get("upper_paise") or 0)
+    lo_f, hi_f = inst.lower_circuit_paise or 0, inst.upper_circuit_paise or 0
+    prices = [("limit_price", order.limit_price_paise, "limit price"), ("trigger_price", order.trigger_price_paise, "trigger price")]
+    if order.order_type in (OrderType.MARKET, OrderType.SLM):
+        prices.append(("protection_price", order.protection_price_paise, "protected market price"))
+    out: list[Issue] = []
+    said: set[str] = set()
+    for label, price, what in prices:
+        if price is None:
+            continue
+        outside_file = price < lo_f or (hi_f and price > hi_f)
+        if outside_file:
+            if label == "protection_price":
+                out.append(Issue(code="PRICE_BAND", severity="BLOCK", message=f"The protected market price {inr(price)} is outside today's price band ({inr(lo_f)} to {inr(hi_f)}), so 021 would refuse it. Use a limit order inside the band or choose another stock.", field=label))
+            continue
+        if lo_l > lo_f and price < lo_l and "lower" not in said:
+            said.add("lower")
+            at = circuits021.ist_hhmm(float(got.get("lower_learned_at") or 0))
+            out.append(Issue(code="CIRCUIT_021", severity="BLOCK", message=f"021 will not accept {inst.symbol} below {inr(lo_l)} today (it refused an order below that price at {at} IST). Your {what} is {inr(price)}. Use a limit of at least {inr(lo_l)} or choose another stock.", field=label))
+        elif hi_l and (not hi_f or hi_l < hi_f) and price > hi_l and "upper" not in said:
+            said.add("upper")
+            at = circuits021.ist_hhmm(float(got.get("upper_learned_at") or 0))
+            out.append(Issue(code="CIRCUIT_021", severity="BLOCK", message=f"021 will not accept {inst.symbol} above {inr(hi_l)} today (it refused an order above that price at {at} IST). Your {what} is {inr(price)}. Use a limit of at most {inr(hi_l)} or choose another stock.", field=label))
+    return out
+
+
 def verify_order(
     s: Session,
     order: CanonicalOrder,
@@ -841,6 +884,8 @@ def verify_order(
             issues.append(Issue(code="TICK_SIZE", severity="BLOCK", message=f"{inr(price)} is not a multiple of the tick size {inr(inst.tick_size_paise)}. Valid nearby prices: {inr(down)} or {inr(down + inst.tick_size_paise)}.", field=label))
         if price < inst.lower_circuit_paise or price > inst.upper_circuit_paise:
             issues.append(Issue(code="PRICE_BAND", severity="BLOCK", message=f"{inr(price)} is outside today's price band ({inr(inst.lower_circuit_paise)} to {inr(inst.upper_circuit_paise)}).", field=label))
+    if _is_021_account(s, account.account_id):
+        issues += _circuit_021_issues(inst, order)
     issues += _stop_loss_issues(order, tick.ltp_paise)
 
     worst = order.worst_case_price()
@@ -1213,7 +1258,7 @@ def build_mandate(
         br.clarify = (r.message + " Please give the exact symbol.", [c.symbol for c in r.candidates][:6])
         return None, br, issues
     inst = r.instrument
-    ask = _already_true_question(intent, inst)
+    ask = _already_true_question(intent, inst, price_band(s, account.account_id, inst))
     if ask is not None:
         # Never arm an instruction that would fire on the next tick: the trader chooses an order now or a new trigger.
         br.clarify = ask
@@ -1283,7 +1328,7 @@ def _rupees_text(paise: int) -> str:
 _PRODUCT_WORD = {Product.CNC: " delivery", Product.MIS: " intraday"}
 
 
-def _already_true_question(intent: MandateIntent, inst) -> tuple[str, list[str]] | None:
+def _already_true_question(intent: MandateIntent, inst, band: tuple[int, int] | None = None) -> tuple[str, list[str]] | None:
     """A clarifying question when a price condition is already true at the live price, or None. The options are
     complete sentences: the order placed now (a normal countersigned order) or a trigger on the far side of the price."""
     if intent.field != "LTP" or intent.threshold_price is None:
@@ -1315,7 +1360,7 @@ def _already_true_question(intent: MandateIntent, inst) -> tuple[str, list[str]]
     qty = int(o.quantity)
     product = _PRODUCT_WORD.get(o.product, "") if o.product else ""
     limit = rupees_to_paise(o.limit_price) if o.limit_price is not None else threshold
-    lo, hi = inst.lower_circuit_paise or 0, inst.upper_circuit_paise or 0
+    lo, hi = band or (inst.lower_circuit_paise or 0, inst.upper_circuit_paise or 0)  # 021 accounts: narrowed by price_band
     in_band = (not hi or lo <= limit <= hi) and (inst.tick_size_paise <= 0 or limit % inst.tick_size_paise == 0)
     # The live price can sit off the tick grid: round it so a buy stays marketable (up) and a sell too (down).
     now_limit = limit if in_band else round_to_tick(ltp, inst.tick_size_paise, "up" if o.side == Side.BUY else "down")
