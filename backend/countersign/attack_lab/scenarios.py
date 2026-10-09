@@ -116,13 +116,30 @@ class Lab:
         return self.job(pid)
 
     def set_price(self, iid: str, paise: int) -> None:
+        """Sets a simulated price and waits until it really holds. On an instrument the 021 gateway prices live, a live
+        tick can land before the gateway sees the feed's override (it rereads the override set about every second),
+        so the price must stay put for a few seconds; if a live tick replaces it, it is set again. A price that never
+        holds raises, so the scenario reports ERROR (rerun it), never a misleading FAILED_OPEN."""
+        from countersign.core.config import settings
+        from countersign.core.instruments import REPLAY_ONLY
+
+        live = settings().gateway021_enabled and iid.rsplit(":", 1)[-1] not in REPLAY_ONLY
+        settle = 2.5 if live else 0.0
         events.publish(events.CH_FEED_CONTROL, {"cmd": "set", "instrument_id": iid, "ltp_paise": paise})
-        end = time.time() + 5
+        end = time.time() + 12
+        since = None
         while time.time() < end:
             t = market.latest(iid)
             if t and abs(t.ltp_paise - paise) <= 10:
-                return
+                since = since or time.time()
+                if time.time() - since >= settle:
+                    return
+            else:
+                if since is not None:
+                    events.publish(events.CH_FEED_CONTROL, {"cmd": "set", "instrument_id": iid, "ltp_paise": paise})
+                since = None
             time.sleep(0.1)
+        raise RuntimeError(f"the simulated price for {iid} did not hold (a live tick kept replacing it); rerun the scenario")
 
     def calm(self) -> None:
         events.publish(events.CH_FEED_CONTROL, {"cmd": "scenario", "name": "calm"})
