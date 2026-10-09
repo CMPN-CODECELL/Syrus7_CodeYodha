@@ -1,0 +1,61 @@
+# Testing and proof
+
+## 1. Automated tests (pytest + Hypothesis)
+Run: `cd backend && uv run pytest -q` (needs the Postgres and Valkey containers). Tests use an isolated database (`countersign_test`) and Valkey db 1, and plug a fault-injecting fake broker into the **real** executor pipeline.
+
+| File | What it proves |
+|---|---|
+| `test_core.py` | RFC 8785 hashing is key-order independent and any field change changes the hash (property-based); parser routes every spec example and never guesses (clarifies "some", "around", "my calls"); WebAuthn assertions verify only for the exact signed payload, origin and device; Ed25519 attestation binds payload and method; audit scrubs secrets |
+| `test_verifier.py` | lot size, freeze quantity, tick size, price band, margin, holdings, look-alike symbols, suspended instruments, stale data, market-order protection, field provenance, misread blocking |
+| `test_executor.py` | exactly one order on the happy path; timeout after acceptance reconciles without duplicate; connection refused retries once safely; replay rejected; expired approval never executes; tampered order and payload refused; price drift blocks; kill switch halts; plan needs one signature and is immutable |
+| `test_mandates.py` | 8 concurrent triggers fire exactly once; restart does not re-fire; crossing during downtime goes to NEEDS_REVIEW; mandate scope cannot be widened |
+| `test_stateful.py` | Hypothesis `RuleBasedStateMachine` over random interleavings of approve / execute with broker faults / replay / tamper / expire / price drift, with invariants checked after every step: every broker order is countersigned for that exact hash; no duplicate tags; no capability reuse |
+| `test_accounts.py` (16) | sign-up creates a user, a seeded paper account and a session; duplicate emails refused case-insensitively; each field validated; login mints a new session and failures look identical; lockout after 5 failures with backoff, also for unknown emails; a stranger cannot lock the owner out (the lock is per client, decays after 15 quiet minutes and a passkey sign-in lifts it); foreign origins refused; per-IP rate limit; passkey sign-in updates the sign counter and refuses revoked, virtual, lab and forged credentials; weak and non-ASCII PINs refused; PIN recovery needs the password and the authenticator; demo login never opens a real account and is refused through the web proxy, from a foreign origin or from another host; kill switch release needs the caller's PIN; passkey registration is discoverable and accepts a 48-character label |
+| `test_factors.py` (9) | a password-only session cannot register a passkey, start authenticator setup or reset the PIN (`STEP_UP_REQUIRED`, `TOTP_REQUIRED`); a fresh step-up unlocks changes for 10 minutes and a replaced authenticator stays active until the new one is confirmed; onboarding flows from PIN to passkey and authenticator without extra prompts; PIN recovery with a passkey needs a passkey step-up and signs out other sessions; every active passkey can countersign and the payload names them, a foreign passkey cannot; rate limits match exact paths, report `retry_after_s` and ignore `X-Forwarded-For`; security events are scoped to the caller (drills only under scope=all, stored resolved); the Attack Lab drill releases only the halt it caused; model reasoning (`<think>`) never reaches the chat |
+| `test_isolation.py` (7) | user B cannot read, reject or approve user A's proposal; account and history endpoints use the caller's own account; events carry owners and the stream hides other traders; the audit list shows own and system events only; the public status has no personal data; demo reset touches only the caller; the executor refuses an order for an account the approver does not own |
+| `test_broker_accounts.py` (7) | a provisioned account is seeded exactly like DEMO1; key scopes cover trader accounts but never NAIVE1; provisioned accounts stay in scope after a broker restart; an account reset is isolated to one account; the monitor watches provisioned accounts and skips NAIVE1, and does not flag an order deleted by a reset mid-check; sign-up through the real broker app to the portfolio and reset |
+
+Tests share the stack's Valkey channels, so an autouse `published` fixture in `conftest.py` captures everything tests publish instead of sending it; running the suite never disturbs a live stack.
+
+**Result (2026-10-09): 82 passed in about 35 s** (43 earlier tests, 29 for accounts, isolation and per-account broker scopes, and 10 for approval-method step-up, lockout and the review fixes).
+
+## 2. Formal model (TLA+ / TLC)
+`formal/Countersign.tla` models approvals, tampering, replayed execution requests, the single-use capability, broker acceptance with lost responses, executor crashes and recovery.
+
+```
+cd formal
+java -cp tla2tools.jar tlc2.TLC -config Countersign.cfg -deadlock Countersign.tla       # Countersign protocol
+java -cp tla2tools.jar tlc2.TLC -config CountersignNaive.cfg -deadlock Countersign.tla  # naive blind retry
+```
+| Model | Result |
+|---|---|
+| Countersign (`NAIVE = FALSE`) | **No error.** 5,773 states generated, 1,521 distinct, depth 11. Invariants `NoUnapprovedOrder`, `SignedVersionOnly`, `AtMostOnce`, `TypeOK` hold in every reachable state. |
+| Naive copilot (`NAIVE = TRUE`) | **`AtMostOnce` violated** in 6 steps: approve -> execute -> broker accepts but response lost -> blind retry -> second send -> two orders for one approval. |
+
+## 3. Attack Lab (live, end to end)
+See `ATTACK_LAB.md`: 9/9 scenarios blocked, 0 unapproved executions, naive baseline 5 unapproved orders.
+
+## 4. Fault injection and chaos
+* Paper broker faults (`POST /api/demo/broker-fault`): `accept_then_drop`, `delay_ack`, `reject`, `partial_fill`, `connection_failure`.
+* Feed scenarios (`POST /api/demo/feed`): `dip_to_trigger` (505 -> 500 -> 499 on ABCCORP), `spike` (+3%), `crash`, `stale`, `calm`.
+* Process chaos: kill the executor (`scripts/stop.py` or Task Manager) mid-plan and start it again; DBOS recovers the workflow and the outbox + reconciliation prevent duplicates.
+* Toxiproxy (optional, free): `docker compose --profile chaos up -d toxiproxy`, create a proxy `127.0.0.1:18100 -> broker:8100`, set `CS_BROKER_URL=http://127.0.0.1:18100` for the executor and add a `timeout` toxic.
+
+## 5. End-to-end smoke test
+`uv run --project backend python scripts/smoke.py`: automation sign-in to the demo account (`/api/auth/demo-login`, scripts only), read-only queries, chat-drafted order, PIN countersign, executor, broker fill, outcomes, monitor (0 violations), audit chain verification.
+
+`uv run --project backend python scripts/flows.py`: standing instruction fired once by the `dip_to_trigger` replay, a plan whose step 1 partially fills (step 2 SKIPPED, plan PARTIALLY_COMPLETED), and a resting order that is modified and then cancelled, each with its own countersignature.
+
+## 6. Browser end-to-end test (real backend)
+`python scripts/e2e_browser.py [--headed] [--device "Pixel 7"]` (needs `pip install playwright httpx` and `playwright install chromium` once). Drives Chromium against the running stack the way a new trader meets Countersign, with passkeys from Chrome's WebAuthn virtual authenticator (CDP). `--device` takes any Playwright device descriptor ("Pixel 7", "iPhone 15") and runs it in Chromium.
+1. **Landing page** renders with live public status; **Explore the Countersign Copilot** while signed out goes to `/signin?next=/copilot`.
+2. **Sign up** a throwaway account (`e2e.<random>@example.test`); the response carries a new `PT` paper account.
+3. **Onboarding**: `1234` is refused in the page and by the API (`422 WEAK_PIN`), a random strong PIN is saved, the passkey is registered, the authenticator app is linked with a computed TOTP code.
+4. **Copilot**: the header is one row with three controls and "All systems normal"; *What is my P&L today?* is answered; then, with the composer switched to the **Deterministic** engine so the journey never depends on a hosted model, *Buy 10 RELIANCE at 2800* is countersigned with the **passkey** and *Buy 1 TCS* with the **chosen PIN**, each until "Broker acknowledged".
+5. **Attack Lab** from the UI: 9/9 BLOCKED, 0 unapproved. **Security Center**: the account panel shows the email and paper account; the kill switch is engaged (red banner) and released with the chosen PIN.
+6. **Sign out**, **sign in with email and password** (then the landing page's Explore goes straight to `/copilot`), sign out, **sign in with the passkey** (no email typed), sign out, and a signed-out visit to `/copilot` redirects to `/signin?next=%2Fcopilot`.
+7. **API checks** with a second new user: its paper account is seeded exactly like the demo portfolio, and it cannot list, open or approve the first user's proposals, sees no orders and gets 404 for the first user's conversation (skipped, not failed, if the first user drafted nothing). Finally, `demo-login` through the web server must answer `403`.
+
+It fails on any page error and on any API response of 400 or above except the expected ones (the signed-out `401`s; the deliberate weak-PIN probe is sent outside the page). It revokes the test passkey afterwards and saves screenshots to `.logs/e2e/<device>_*.png`.
+
+**Recorded result (2026-10-09, after the review fixes):** 27/27 checks passed at desktop (1440x900) and 27/27 with `--device "Pixel 7"`. In the same session `scripts/smoke.py` and `scripts/flows.py` passed (0 monitor violations, audit chain intact), and `pnpm typecheck`, `pnpm lint` and `pnpm build` were clean.
