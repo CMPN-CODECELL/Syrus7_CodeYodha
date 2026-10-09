@@ -32,11 +32,15 @@ function makeClient() {
   return client;
 }
 
+// next-themes renders its no-flash theme script from this client component. Only the copy in the server HTML needs to
+// run, so the client render marks it inert; otherwise React 19 warns about an executable script rendered on the client.
+const themeScriptProps = { type: typeof window === "undefined" ? "text/javascript" : "text/plain" };
+
 export function Providers({ children }: { children: ReactNode }) {
   const [client] = useState(makeClient);
   return (
     <QueryClientProvider client={client}>
-      <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
+      <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange scriptProps={themeScriptProps}>
         <TooltipProvider delay={200}>
           {children}
           <Toaster position="bottom-right" closeButton visibleToasts={4} />
