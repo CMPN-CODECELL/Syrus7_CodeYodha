@@ -8,30 +8,35 @@ A BLOCK issue means no approval can be created and the broker is never called.""
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from fractions import Fraction
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from countersign.core import charges, instruments, market
+from countersign.core import charges, instruments, market, portfolio
 from countersign.core.config import settings
 from countersign.core.models import Instrument
-from countersign.core.money import inr, rupees_to_paise
-from countersign.core.parser import Facts
+from countersign.core.money import inr, round_to_tick, rupees_to_paise
+from countersign.core.parser import Facts, detect_holdings_alert, normalize, parse_fraction
 from countersign.core.schemas import (
+    ALL_HOLDINGS_ID,
     CanonicalMandate,
     CanonicalOrder,
     CanonicalPlan,
     Disagreement,
     FieldRow,
+    InstrumentHandle,
     Issue,
     MandateIntent,
     MandatePredicate,
     OrderIntent,
     OrderPreview,
+    OrderStateRef,
     OrderType,
     PlanStepSpec,
     Product,
@@ -39,6 +44,16 @@ from countersign.core.schemas import (
     Source,
     Validity,
 )
+
+STOP_TYPES = (OrderType.SL, OrderType.SLM)
+MAX_PLAN_STEPS = 6  # free-form plans the trader dictates step by step
+MAX_GENERATED_PLAN_STEPS = 20  # exit and rebalance plans, where every step is computed by this verifier
+
+
+def product_of(row: dict) -> str:
+    """Broker product names normalised to ours (021 reports intraday as INTRADAY)."""
+    p = str(row.get("product") or "").upper()
+    return "MIS" if p == "INTRADAY" else p
 
 
 # ------------------------------------------------------------------ account state
@@ -52,6 +67,7 @@ class AccountState:
     used_margin_paise: int = 0
     holdings: dict[str, dict] = field(default_factory=dict)
     positions: dict[str, dict] = field(default_factory=dict)
+    position_rows: list[dict] = field(default_factory=list)  # one row per instrument AND product
     open_orders: list[dict] = field(default_factory=list)
     segments: list[str] = field(default_factory=lambda: ["EQ", "FO"])
     trading_enabled: bool = True
@@ -69,6 +85,7 @@ class AccountState:
             st.holdings[h["instrument_id"]] = h
         for p in gateway.positions():
             st.positions[p["instrument_id"]] = p
+            st.position_rows.append(p)
         st.open_orders = gateway.orders(status="open")
         return st
 
@@ -80,12 +97,39 @@ class AccountState:
         p = self.positions.get(instrument_id)
         return int(p["quantity"]) if p else 0
 
-    def pending_sell_qty(self, instrument_id: str) -> int:
+    def pending_sell_qty(self, instrument_id: str, exclude_order_id: str | None = None) -> int:
         return sum(
             int(o["pending_quantity"])
             for o in self.open_orders
-            if o["instrument_id"] == instrument_id and o["side"] == "SELL" and o["product"] == "CNC"
+            if o["instrument_id"] == instrument_id
+            and o["side"] == "SELL"
+            and product_of(o) == "CNC"
+            and (exclude_order_id is None or str(o["broker_order_id"]) != str(exclude_order_id))
         )
+
+    def sellable_holding(self, instrument_id: str, exclude_order_id: str | None = None) -> tuple[int, str]:
+        """Delivery quantity that can still be sold, and the arithmetic behind it.
+
+        With 021 holdings as the gateway reports them (free_quantity = freeQty, settled; btst_quantity = btstQty,
+        bought but not yet settled; sell_quantity = sellQty, already sold or in pending sell orders today):
+        free + btst - max(sellQty, pending CNC sells we can see). With paper holdings (quantity only; fills already
+        reduce it): quantity - pending CNC sells. A MODIFY excludes the order being modified (not an extra sale)."""
+        h = self.holdings.get(instrument_id)
+        if not h or int(h.get("quantity") or 0) <= 0:
+            return 0, "no delivery holding"
+        total = int(h["quantity"])
+        pending = self.pending_sell_qty(instrument_id, exclude_order_id)
+        own = self.pending_sell_qty(instrument_id) - pending
+        if h.get("sell_quantity") is not None:
+            t1 = int(h.get("btst_quantity") or 0)
+            free = int(h["free_quantity"]) if h.get("free_quantity") is not None else total - t1
+            used = max(max(int(h["sell_quantity"]) - own, 0), pending)
+            sellable = max(free + t1 - used, 0)
+            return sellable, f"{free:,} settled + {t1:,} unsettled (T1) - {used:,} already sold or in pending sell orders = {sellable:,} sellable"
+        sellable = max(total - pending, 0)
+        if pending:
+            return sellable, f"{total:,} held - {pending:,} in pending sell orders = {sellable:,} sellable"
+        return sellable, f"{total:,} held, all sellable"
 
     def exposure_paise(self) -> int:
         tot = 0
@@ -126,6 +170,105 @@ def _resolve_option(s: Session, ref: str) -> Instrument | None:
     _, strike, kind = ref.split(":")
     exp = instruments.nifty_expiries()[0]
     return s.get(Instrument, instruments.option_id(exp, int(strike), kind))
+
+
+def _resolve_ref(s: Session, ref: str, known_ids: list[str] | None = None) -> instruments.Resolution:
+    """Resolve a phrase such as 'HDFC Bank': the whole phrase, then the words joined, then each word, then the symbols
+    of instruments the trader already has orders in. A look-alike result is returned as is (it always blocks)."""
+    r = instruments.resolve(s, ref)
+    if r.status in ("RESOLVED", "LOOKALIKE"):
+        return r
+    words = ref.split()
+    for cand in (["".join(words)] if len(words) > 1 else []) + (words if len(words) > 1 else []):
+        r2 = instruments.resolve(s, cand)
+        if r2.status in ("RESOLVED", "LOOKALIKE"):
+            return r2
+    norm = normalize(ref)
+    for iid in known_ids or []:
+        inst = s.get(Instrument, iid)
+        if inst is not None and normalize(inst.symbol) == norm:
+            return instruments._check_lookalike(inst)
+    return r
+
+
+def protection_price(side: Side, reference_paise: int, tick_size_paise: int) -> int:
+    """Worst acceptable price for a market (or SL-M) order: the reference moved against the trader by the
+    configured protection, rounded to the tick away from the trader (never silently better than stated)."""
+    bps = settings().market_protection_bps
+    raw = reference_paise * (10000 + bps) // 10000 if side == Side.BUY else reference_paise * (10000 - bps) // 10000
+    return round_to_tick(raw, tick_size_paise, "up" if side == Side.BUY else "down")
+
+
+def _frac_text(fr: Fraction) -> str:
+    if fr.denominator == 1:
+        return f"{fr.numerator:,}"
+    return f"{float(fr):,.4f}".rstrip("0").rstrip(".")
+
+
+@dataclass
+class ComputedQty:
+    quantity: int = 0
+    product: Product | None = None
+    arithmetic: str = ""
+    basis: str = ""
+    message: str | None = None  # set when no order can be drafted; explains why
+    options: list[str] = field(default_factory=list)
+
+
+def fraction_quantity(account: AccountState, inst: Instrument, frac: Fraction, label: str, facts: Facts, product_hint: Product | None) -> ComputedQty:
+    """Quantity for 'sell half my TCS': the stated fraction of what the trader can sell, rounded DOWN to the lot."""
+    sym = inst.symbol
+    unit = "units" if inst.segment == "FO" else "shares"
+    held, held_note = account.sellable_holding(inst.instrument_id)
+    has_holding = account.holding_qty(inst.instrument_id) > 0
+    rows = [p for p in account.position_rows if p["instrument_id"] == inst.instrument_id and product_of(p) in ("MIS", "NRML") and int(p["quantity"]) != 0]
+    if product_hint in (Product.MIS, Product.NRML):
+        rows = [p for p in rows if product_of(p) == product_hint.value]
+    want_holding = facts.basis == "HOLDING" or product_hint == Product.CNC
+    want_position = facts.basis == "POSITION" or product_hint in (Product.MIS, Product.NRML)
+    base_text = facts.text.strip().rstrip(".?! ")
+    if want_holding and not want_position:
+        source = "holding"
+    elif want_position and not want_holding:
+        source = "position"
+    elif has_holding and rows:
+        return ComputedQty(
+            message=f"You have both a delivery holding of {sym} ({held_note}) and an open {product_of(rows[0])} position. Which one should I sell {label} of?",
+            options=[f"{base_text} from my delivery holding", f"{base_text} from my {'intraday' if product_of(rows[0]) == 'MIS' else 'NRML'} position"],
+        )
+    elif has_holding:
+        source = "holding"
+    elif rows:
+        source = "position"
+    else:
+        return ComputedQty(message=f"You have no {sym} to sell: no delivery holding and no open position. No order was drafted.")
+    if source == "holding":
+        if held <= 0:
+            return ComputedQty(message=f"You have no sellable {sym} in delivery ({held_note}). No order was drafted.")
+        base, product, basis = held, Product.CNC, f"Your {sym} delivery holding: {held_note}"
+    else:
+        if not rows:
+            return ComputedQty(message=f"You have no open {sym} position to sell from. No order was drafted.")
+        if len(rows) > 1:
+            return ComputedQty(message=f"You have {len(rows)} open {sym} positions ({', '.join(product_of(p) for p in rows)}). Say which product to sell from.")
+        p = rows[0]
+        q = int(p["quantity"])
+        if q < 0:
+            return ComputedQty(message=f"Your {sym} {product_of(p)} position is short {abs(q):,}; selling would add to the short. To close it, buy to cover. No order was drafted.")
+        base, product, basis = q, Product(product_of(p)), f"Your {sym} {product_of(p)} position: long {q:,}"
+    raw = Fraction(base) * frac
+    whole = math.floor(raw)
+    lot = max(int(inst.lot_size or 1), 1)
+    qty = whole - whole % lot
+    arithmetic = f"{label} of {base:,} {unit} = {_frac_text(raw)}"
+    if lot > 1 and qty != raw:
+        arithmetic += f", rounded down to whole lots of {lot}: {qty:,}"
+    elif qty != raw:
+        arithmetic += f", rounded down to {qty:,} whole {unit}"
+    if qty <= 0:
+        what = f"whole lots of {lot}" if lot > 1 else f"whole {unit}"
+        return ComputedQty(message=f"{label[:1].upper() + label[1:]} of your {base:,} {sym} {unit} is {_frac_text(raw)}, which rounds down to 0 {what}, so there is nothing to sell. No order was drafted.")
+    return ComputedQty(quantity=qty, product=product, arithmetic=arithmetic, basis=basis)
 
 
 # ------------------------------------------------------------------ build
@@ -206,6 +349,11 @@ def build_order(
     # --- quantity
     qty_note = None
     qty_source = Source.TRADER
+    computed: ComputedQty | None = None
+    model_frac = parse_fraction(intent.quantity_fraction) if intent.quantity_fraction else None
+    if intent.quantity_fraction and model_frac is None:
+        res.clarify = (f"'{intent.quantity_fraction}' is not a fraction I can apply. Say for example 'sell half my {inst.symbol}' or 'sell 25% of my {inst.symbol}'.", [])
+        return res
     if intent.target_order_ref and intent.target_order_ref.startswith("LOTS:"):
         lots = int(intent.target_order_ref.split(":")[1])
         qty = lots * inst.lot_size
@@ -213,6 +361,32 @@ def build_order(
     elif replace_source is not None and intent.quantity is None:
         qty = int(replace_source["quantity"])
         qty_source, qty_note = Source.ACCOUNT, "Copied from the cancelled order."
+    elif side == Side.SELL and facts.fraction is not None and facts.quantity is None:
+        # The trader stated a fraction ("half", "all", "25%"): the quantity is computed here from their own holding,
+        # never taken from the AI. An AI quantity or fraction that differs is a misread and blocks.
+        # Holding or position is decided by the trader's words (or by what exists), never by a product the AI picked.
+        computed = fraction_quantity(account, inst, facts.fraction, facts.fraction_text or "", facts, facts.product)
+        if computed.message:
+            res.clarify = (computed.message, computed.options)
+            return res
+        qty = computed.quantity
+        qty_source, qty_note = Source.ACCOUNT, f"Computed from your holdings: {computed.arithmetic}"
+        if model_frac is not None and model_frac != facts.fraction:
+            qty_source = Source.MODEL
+            res.disagreements.append(Disagreement(field="quantity", trader_value=facts.fraction_text or "", model_value=intent.quantity_fraction or ""))
+            issues.append(Issue(code="FRACTION_MISMATCH", severity="BLOCK", message=f"Misread guard: you said '{facts.fraction_text}' but the AI used the fraction {intent.quantity_fraction}.", field="quantity"))
+        if intent.quantity is not None and int(intent.quantity) != qty:
+            qty_source = Source.MODEL
+            res.disagreements.append(Disagreement(field="quantity", trader_value=f"{facts.fraction_text} = {qty}", model_value=str(intent.quantity)))
+            issues.append(Issue(code="QUANTITY_MISMATCH", severity="BLOCK", message=f"Misread guard: {computed.arithmetic}, but the AI proposed {intent.quantity}. Nothing was approved.", field="quantity"))
+    elif model_frac is not None:
+        computed = fraction_quantity(account, inst, model_frac, intent.quantity_fraction or "", facts, facts.product)
+        if computed.message:
+            res.clarify = (computed.message, computed.options)
+            return res
+        qty = computed.quantity
+        qty_source, qty_note = Source.MODEL, f"You did not state a fraction; the AI chose {intent.quantity_fraction}."
+        issues.append(Issue(code="FRACTION_NOT_STATED", severity="BLOCK", message=f"You did not ask to sell a fraction of {inst.symbol}; the AI chose {intent.quantity_fraction}. Refusing a quantity you never stated or implied.", field="quantity"))
     else:
         qty = intent.quantity
         if qty is None:
@@ -239,6 +413,18 @@ def build_order(
         issues.append(Issue(code="ORDER_TYPE_NOT_STATED", severity="BLOCK", message="The AI chose a MARKET order but you did not ask for one.", field="order_type"))
     if otype == OrderType.LIMIT and facts.market and replace_source is None:
         res.disagreements.append(Disagreement(field="order_type", trader_value="MARKET", model_value="LIMIT"))
+    if otype in STOP_TYPES and not facts.stop_loss:
+        type_source = Source.MODEL
+        issues.append(Issue(code="ORDER_TYPE_NOT_STATED", severity="BLOCK", message=f"The AI chose a {otype.value} (stop-loss) order but you did not ask for a stop-loss.", field="order_type"))
+    if facts.stop_loss and replace_source is None:
+        wanted = OrderType.SLM if facts.slm else OrderType.SL if facts.price is not None else None
+        if otype not in STOP_TYPES or (wanted is not None and otype != wanted):
+            type_source = Source.MODEL
+            res.disagreements.append(Disagreement(field="order_type", trader_value=wanted.value if wanted else "stop-loss", model_value=otype.value))
+            issues.append(Issue(code="ORDER_TYPE_MISMATCH", severity="BLOCK", message=f"Misread guard: you asked for a {wanted.value if wanted else 'stop-loss'} order but the AI drafted {otype.value}.", field="order_type"))
+        elif wanted is None and otype == OrderType.SLM:
+            type_source = Source.MODEL
+            issues.append(Issue(code="ORDER_TYPE_NOT_STATED", severity="BLOCK", message="You gave a stop-loss trigger but did not say SL-M (market once triggered); the AI chose it. Say 'SL-M', or state a limit price.", field="order_type"))
 
     limit_paise = None
     price_source = Source.TRADER
@@ -257,24 +443,50 @@ def build_order(
             price_source = Source.MODEL
             price_note = "This price does not appear in your request."
             issues.append(Issue(code="PRICE_NOT_STATED", severity="BLOCK", message=f"The limit price {inr(limit_paise)} was not stated by you; the AI inferred it.", field="limit_price"))
+        elif otype == OrderType.SL and facts.price is None and facts.trigger is not None and Decimal(str(facts.trigger)) == Decimal(str(intent.limit_price)):
+            price_source = Source.MODEL
+            price_note = "You gave this number as the trigger, not as a limit price."
+            issues.append(Issue(code="PRICE_NOT_STATED", severity="BLOCK", message=f"You stated {inr(limit_paise)} as the stop-loss trigger, not as a limit price; the AI reused it as the limit. State a limit price, or ask for SL-M.", field="limit_price"))
 
     trigger_paise = rupees_to_paise(intent.trigger_price) if intent.trigger_price is not None else None
+    trig_source = Source.TRADER
+    trig_note = None
+    if otype in STOP_TYPES and trigger_paise is None:
+        res.clarify = (f"What trigger price for this {otype.value} order on {inst.symbol}?", [])
+        return res
+    if trigger_paise is not None:
+        if facts.trigger is not None and Decimal(str(facts.trigger)) != Decimal(str(intent.trigger_price)):
+            trig_source, trig_note = Source.MODEL, f"AI proposed {inr(trigger_paise)} but you said {inr(rupees_to_paise(facts.trigger))}."
+            res.disagreements.append(Disagreement(field="trigger_price", trader_value=str(facts.trigger), model_value=str(intent.trigger_price)))
+            issues.append(Issue(code="TRIGGER_MISMATCH", severity="BLOCK", message=f"Misread guard: you said trigger {inr(rupees_to_paise(facts.trigger))} but the AI proposed {inr(trigger_paise)}.", field="trigger_price"))
+        elif facts.trigger is None and not facts.mentions_number(intent.trigger_price):
+            trig_source, trig_note = Source.MODEL, "This trigger does not appear in your request."
+            issues.append(Issue(code="TRIGGER_NOT_STATED", severity="BLOCK", message=f"The trigger price {inr(trigger_paise)} was not stated by you; the AI inferred it.", field="trigger_price"))
 
     tick = market.latest(inst.instrument_id)
     protection = None
-    if otype in (OrderType.MARKET, OrderType.SLM):
+    protection_note = None
+    if otype == OrderType.MARKET:
         if tick is None:
             issues.append(Issue(code="NO_MARKET_DATA", severity="BLOCK", message=f"No live price for {inst.symbol}; a market order cannot be price-protected.", field="order_type"))
         else:
-            bps = settings().market_protection_bps
-            raw = tick.ltp_paise * (10000 + bps) // 10000 if side == Side.BUY else tick.ltp_paise * (10000 - bps) // 10000
-            from countersign.core.money import round_to_tick
-
-            protection = round_to_tick(raw, inst.tick_size_paise, "up" if side == Side.BUY else "down")
+            protection = protection_price(side, tick.ltp_paise, inst.tick_size_paise)
+            protection_note = f"Worst case: {inr(protection)} per unit, {inr(protection * int(qty))} for {int(qty):,}. The order fills at the best available price but never {'above' if side == Side.BUY else 'below'} this cap ({settings().market_protection_bps / 100:.2f}% from the live price {inr(tick.ltp_paise)})."
+    elif otype == OrderType.SLM and trigger_paise is not None:
+        # Once triggered, an SL-M order trades near the trigger, so its cap is measured from the trigger, not today's LTP.
+        protection = protection_price(side, trigger_paise, inst.tick_size_paise)
+        protection_note = f"Once triggered it fills at the best available price but never {'above' if side == Side.BUY else 'below'} {inr(protection)} ({settings().market_protection_bps / 100:.2f}% from the trigger)."
 
     product = intent.product
     product_source = Source.TRADER
-    if product is None:
+    product_note = None
+    if computed is not None and computed.product is not None:
+        if product is None:
+            product, product_source, product_note = computed.product, Source.ACCOUNT, "Same product as the holding or position being sold."
+        elif product != computed.product:
+            product_source = Source.MODEL
+            issues.append(Issue(code="PRODUCT_MISMATCH", severity="BLOCK", message=f"The quantity was computed from your {computed.product.value} {'holding' if computed.product == Product.CNC else 'position'}, but the AI chose product {product.value}.", field="product"))
+    elif product is None:
         product = Product.NRML if inst.segment == "FO" else Product.CNC
         product_source = Source.DEFAULT
     elif facts.product != product:
@@ -302,16 +514,18 @@ def build_order(
         FieldRow(key="instrument", label="Instrument", display=f"{inst.symbol}  ({inst.display_name})", source=inst_source, flagged=flagged_inst, note=inst_note or ("Look-alike characters detected" if "LOOKALIKE_SYMBOL" in (inst.flags or []) else None)),
         FieldRow(key="instrument_id", label="Instrument ID", display=inst.instrument_id, source=Source.INSTRUMENT),
         FieldRow(key="quantity", label="Quantity", display=f"{qty:,}", source=qty_source, flagged=qty_source == Source.MODEL, note=qty_note),
-        FieldRow(key="order_type", label="Order type", display=otype.value, source=type_source, flagged=type_source == Source.MODEL),
     ]
+    if computed is not None:
+        res.fields.append(FieldRow(key="quantity_basis", label="Computed from", display=computed.basis, source=Source.ACCOUNT, note="Read from your broker account when this draft was made"))
+    res.fields.append(FieldRow(key="order_type", label="Order type", display=otype.value, source=type_source, flagged=type_source == Source.MODEL))
+    if trigger_paise is not None:
+        res.fields.append(FieldRow(key="trigger_price", label="Trigger price", display=inr(trigger_paise), source=trig_source, flagged=trig_source == Source.MODEL, note=trig_note))
     if limit_paise is not None:
         res.fields.append(FieldRow(key="limit_price", label="Limit price", display=inr(limit_paise), source=price_source, flagged=price_source == Source.MODEL, note=price_note))
-    if trigger_paise is not None:
-        res.fields.append(FieldRow(key="trigger_price", label="Trigger price", display=inr(trigger_paise), source=Source.TRADER if facts.mentions_number(intent.trigger_price) else Source.MODEL))
     if protection is not None:
-        res.fields.append(FieldRow(key="protection_price", label="Worst-case protected price", display=inr(protection), source=Source.RISK, note=f"Market order capped at {settings().market_protection_bps / 100:.2f}% from the live price"))
+        res.fields.append(FieldRow(key="protection_price", label="Worst-case protected price", display=inr(protection), source=Source.RISK, note=protection_note))
     res.fields += [
-        FieldRow(key="product", label="Product", display=product.value, source=product_source),
+        FieldRow(key="product", label="Product", display=product.value, source=product_source, note=product_note),
         FieldRow(key="validity", label="Validity", display=validity.value, source=Source.DEFAULT if intent.validity is None else Source.TRADER),
         FieldRow(key="lot_size", label="Lot size", display=str(inst.lot_size), source=Source.INSTRUMENT),
         FieldRow(key="tick_size", label="Tick size", display=inr(inst.tick_size_paise), source=Source.INSTRUMENT),
@@ -319,7 +533,162 @@ def build_order(
     return res
 
 
+def _state_ref(o: dict) -> OrderStateRef:
+    return OrderStateRef(quantity=int(o["quantity"]), order_type=OrderType(o["order_type"]), limit_price_paise=o.get("limit_price_paise"), trigger_price_paise=o.get("trigger_price_paise"))
+
+
+def _arrow(old: int | None, new: int | None) -> str:
+    return f"{inr(old)} → {inr(new)}" if old != new else f"{inr(new)} (unchanged)"
+
+
+def _build_modify_stop_loss(s: Session, intent: OrderIntent, facts: Facts, account: AccountState) -> BuildResult:
+    """'Move my stop-loss on HDFC Bank up to 1640': find the trader's one open SL order on that instrument and build a
+    MODIFY carrying its full new state (new trigger; for SL, a limit that keeps the original trigger-to-limit gap
+    unless the trader stated one). Old values travel in modify_from so the card shows old -> new."""
+    res = BuildResult()
+    issues = res.issues
+    named_by_id = False
+    if intent.target_order_ref:
+        target = next((o for o in account.open_orders if str(o["broker_order_id"]) == str(intent.target_order_ref)), None)
+        if target is None:
+            res.clarify = (f"I could not find an open order {intent.target_order_ref}. Ask me 'what are my open orders?' to see them.", [])
+            return res
+        if target.get("order_type") not in ("SL", "SL-M"):
+            res.clarify = (f"Order {target['broker_order_id']} is a {target.get('order_type')} order, not a stop-loss, so it has no trigger to move.", [])
+            return res
+        named_by_id = True
+        inst = s.get(Instrument, target["instrument_id"])
+        if inst is None:
+            res.clarify = (f"Order {target['broker_order_id']} is for an instrument that is not in today's instrument master.", [])
+            return res
+    else:
+        r = _resolve_ref(s, intent.instrument_ref or "", [o["instrument_id"] for o in account.open_orders])
+        if r.status == "LOOKALIKE":
+            res.clarify = (r.message + " Please type the exact ASCII symbol.", [c.symbol for c in r.candidates if instruments.is_ascii_symbol(c.symbol)])
+            return res
+        if r.status != "RESOLVED":
+            res.clarify = ((r.message or "Which instrument?") + " Which stock's stop-loss should I move? Give the exact symbol.", [c.symbol for c in r.candidates][:6])
+            return res
+        inst = r.instrument
+        cands = [o for o in account.open_orders if o["instrument_id"] == inst.instrument_id and o.get("order_type") in ("SL", "SL-M")]
+        new_text = f"{intent.trigger_price}" if intent.trigger_price is not None else "<new trigger>"
+        if not cands:
+            others = [o for o in account.open_orders if o["instrument_id"] == inst.instrument_id]
+            msg = f"You have no open stop-loss order on {inst.symbol}, so there is no trigger to move."
+            if others:
+                msg += " Your open " + inst.symbol + " orders are: " + "; ".join(f"{o['broker_order_id']} ({o['side']} {int(o['quantity']):,} {o['order_type']})" for o in others) + "."
+            msg += f" To place a new stop-loss, say for example 'sell 10 {inst.symbol} stop loss trigger <price> limit <price>'."
+            res.clarify = (msg, [])
+            return res
+        if len(cands) > 1:
+            listing = "; ".join(f"order {o['broker_order_id']}: {o['side']} {int(o['quantity']):,}, trigger {inr(o.get('trigger_price_paise'))}" for o in cands)
+            res.clarify = (f"You have {len(cands)} open stop-loss orders on {inst.symbol} ({listing}). Which one should move?", [f"Move my stop-loss order {o['broker_order_id']} to {new_text}" for o in cands][:6])
+            return res
+        target = cands[0]
+    res.instrument = inst
+
+    if named_by_id:
+        inst_source, inst_note = Source.ACCOUNT, "The instrument of the order you named"
+        if str(target["broker_order_id"]) not in facts.text:
+            issues.append(Issue(code="TARGET_NOT_STATED", severity="BLOCK", message=f"You did not name order {target['broker_order_id']}; the AI chose it.", field="target"))
+            inst_source, inst_note = Source.MODEL, "You did not name this order. The AI chose it."
+    elif _trader_mentions_instrument(facts, inst):
+        inst_source, inst_note = Source.TRADER, None
+    else:
+        inst_source, inst_note = Source.MODEL, "You did not name this instrument. The AI chose it."
+        issues.append(Issue(code="INSTRUMENT_NOT_STATED", severity="BLOCK", message=f"The instrument {inst.symbol} was not named in your request; the AI inferred it.", field="instrument"))
+
+    otype = OrderType(target["order_type"])
+    side = Side(target["side"])
+    old_trig = target.get("trigger_price_paise")
+    old_limit = target.get("limit_price_paise")
+    if intent.trigger_price is None:
+        res.clarify = (f"What new trigger price for your {inst.symbol} stop-loss (now {inr(old_trig)})?", [])
+        return res
+    new_trig = rupees_to_paise(intent.trigger_price)
+    trig_source, trig_note = Source.TRADER, None
+    if facts.trigger is not None and Decimal(str(facts.trigger)) != Decimal(str(intent.trigger_price)):
+        trig_source, trig_note = Source.MODEL, f"AI proposed {inr(new_trig)} but you said {inr(rupees_to_paise(facts.trigger))}."
+        res.disagreements.append(Disagreement(field="trigger_price", trader_value=str(facts.trigger), model_value=str(intent.trigger_price)))
+        issues.append(Issue(code="TRIGGER_MISMATCH", severity="BLOCK", message=f"Misread guard: you said {inr(rupees_to_paise(facts.trigger))} but the AI proposed {inr(new_trig)}.", field="trigger_price"))
+    elif facts.trigger is None and not facts.mentions_number(intent.trigger_price):
+        trig_source, trig_note = Source.MODEL, "This trigger does not appear in your request."
+        issues.append(Issue(code="TRIGGER_NOT_STATED", severity="BLOCK", message=f"The new trigger {inr(new_trig)} was not stated by you; the AI inferred it.", field="trigger_price"))
+    if old_trig is not None and new_trig == old_trig:
+        issues.append(Issue(code="NO_CHANGE", severity="BLOCK", message=f"The stop-loss trigger is already {inr(old_trig)}; there is nothing to modify.", field="trigger_price"))
+    elif old_trig is not None and facts.direction is not None:
+        wrong = (facts.direction == "UP" and new_trig < old_trig) or (facts.direction == "DOWN" and new_trig > old_trig)
+        if wrong:
+            res.disagreements.append(Disagreement(field="trigger_price", trader_value=f"move {facts.direction.lower()}", model_value=f"{inr(old_trig)} to {inr(new_trig)}"))
+            issues.append(Issue(code="DIRECTION_MISMATCH", severity="BLOCK", message=f"You said to move the stop-loss {facts.direction.lower()}, but {inr(new_trig)} is {'below' if new_trig < old_trig else 'above'} the current trigger {inr(old_trig)}.", field="trigger_price"))
+
+    new_limit = None
+    limit_source, limit_note = Source.ACCOUNT, None
+    if otype == OrderType.SL:
+        if intent.limit_price is not None:
+            new_limit = rupees_to_paise(intent.limit_price)
+            limit_source = Source.TRADER
+            if facts.price is not None and Decimal(str(facts.price)) != Decimal(str(intent.limit_price)):
+                limit_source, limit_note = Source.MODEL, f"AI proposed {inr(new_limit)} but you said {inr(rupees_to_paise(facts.price))}."
+                res.disagreements.append(Disagreement(field="limit_price", trader_value=str(facts.price), model_value=str(intent.limit_price)))
+                issues.append(Issue(code="PRICE_MISMATCH", severity="BLOCK", message=f"Misread guard: you said limit {inr(rupees_to_paise(facts.price))} but the AI proposed {inr(new_limit)}.", field="limit_price"))
+            elif facts.price is None:
+                limit_source, limit_note = Source.MODEL, "You did not state a new limit price."
+                issues.append(Issue(code="PRICE_NOT_STATED", severity="BLOCK", message=f"The new limit {inr(new_limit)} was not stated by you; the AI inferred it.", field="limit_price"))
+        else:
+            if old_limit is None or old_trig is None:
+                res.clarify = (f"Your {inst.symbol} SL order has no current limit to carry over. What limit price should it use?", [])
+                return res
+            gap = old_limit - old_trig
+            new_limit = new_trig + gap
+            limit_note = f"Keeps your order's trigger-to-limit gap: old limit {inr(old_limit)} - old trigger {inr(old_trig)} = {inr(gap)}, so new limit = {inr(new_trig)} {'+' if gap >= 0 else '-'} {inr(abs(gap))}"
+    elif intent.limit_price is not None:
+        res.clarify = (f"Your {inst.symbol} stop-loss is SL-M (no limit price). I can move its trigger; changing it to an SL limit order is a new order. Cancel it and place a new SL order instead.", [])
+        return res
+    protection = protection_price(side, new_trig, inst.tick_size_paise) if otype == OrderType.SLM else None
+
+    product = Product(product_of(target))
+    canonical = CanonicalOrder(
+        action="MODIFY",
+        account_id=account.account_id,
+        instrument=instruments.handle(inst),
+        side=side,
+        quantity=int(target["quantity"]),
+        order_type=otype,
+        product=product,
+        validity=Validity(target.get("validity") or "DAY"),
+        limit_price_paise=new_limit,
+        trigger_price_paise=new_trig,
+        protection_price_paise=protection,
+        target_broker_order_id=str(target["broker_order_id"]),
+        modify_from=_state_ref(target),
+    )
+    res.canonical = canonical
+    res.fields = [
+        FieldRow(key="action", label="Action", display="MODIFY stop-loss", source=Source.TRADER),
+        FieldRow(key="target", label="Target order", display=str(target["broker_order_id"]), source=Source.ACCOUNT, note="Your only open stop-loss order on this instrument" if not named_by_id else "The order id you gave"),
+        FieldRow(key="instrument", label="Instrument", display=f"{inst.symbol}  ({inst.display_name})", source=inst_source, flagged=inst_source == Source.MODEL, note=inst_note),
+        FieldRow(key="instrument_id", label="Instrument ID", display=inst.instrument_id, source=Source.INSTRUMENT),
+        FieldRow(key="side", label="Side", display=side.value, source=Source.ACCOUNT, note="Unchanged"),
+        FieldRow(key="quantity", label="Quantity", display=f"{int(target['quantity']):,}", source=Source.ACCOUNT, note="Unchanged"),
+        FieldRow(key="order_type", label="Order type", display=otype.value, source=Source.ACCOUNT, note="Unchanged"),
+        FieldRow(key="trigger_price", label="Trigger price", display=_arrow(old_trig, new_trig), source=trig_source, flagged=trig_source == Source.MODEL, note=trig_note),
+    ]
+    if otype == OrderType.SL:
+        res.fields.append(FieldRow(key="limit_price", label="Limit price", display=_arrow(old_limit, new_limit), source=limit_source, flagged=limit_source == Source.MODEL, note=limit_note))
+    if protection is not None:
+        res.fields.append(FieldRow(key="protection_price", label="Worst-case protected price", display=inr(protection), source=Source.RISK, note=f"Once triggered it fills at the best available price but never {'above' if side == Side.BUY else 'below'} this cap"))
+    res.fields += [
+        FieldRow(key="product", label="Product", display=product.value, source=Source.ACCOUNT, note="Unchanged"),
+        FieldRow(key="validity", label="Validity", display=canonical.validity.value, source=Source.ACCOUNT, note="Unchanged"),
+        FieldRow(key="tick_size", label="Tick size", display=inr(inst.tick_size_paise), source=Source.INSTRUMENT),
+    ]
+    return res
+
+
 def _build_modify_cancel(s: Session, intent: OrderIntent, facts: Facts, account: AccountState, engine: str) -> BuildResult:
+    if intent.action == "MODIFY" and (intent.trigger_price is not None or facts.stop_loss):
+        return _build_modify_stop_loss(s, intent, facts, account)
     res = BuildResult()
     ref = (intent.target_order_ref or intent.instrument_ref or "").strip()
     target = None
@@ -342,6 +711,15 @@ def _build_modify_cancel(s: Session, intent: OrderIntent, facts: Facts, account:
         target = matches[0]
     inst = s.get(Instrument, target["instrument_id"])
     res.instrument = inst
+    if intent.action == "MODIFY" and target.get("order_type") in ("SL", "SL-M"):
+        trig = inr(target.get("trigger_price_paise"))
+        res.clarify = (
+            f"Order {target['broker_order_id']} is a {target['order_type']} stop-loss (trigger {trig}"
+            + (f", limit {inr(target.get('limit_price_paise'))}" if target.get("limit_price_paise") else "")
+            + f"). Do you want to move its trigger? For example 'move my stop-loss on {inst.symbol} to <new trigger>'.",
+            [],
+        )
+        return res
     new_price = rupees_to_paise(intent.limit_price) if intent.limit_price is not None else target.get("limit_price_paise")
     canonical = CanonicalOrder(
         action=intent.action,
@@ -350,12 +728,13 @@ def _build_modify_cancel(s: Session, intent: OrderIntent, facts: Facts, account:
         side=Side(target["side"]),
         quantity=int(target["quantity"]),
         order_type=OrderType(target["order_type"]),
-        product=Product(target["product"]),
+        product=Product(product_of(target)),
         validity=Validity(target["validity"]),
         limit_price_paise=new_price,
         trigger_price_paise=target.get("trigger_price_paise"),
         protection_price_paise=target.get("protection_price_paise"),
         target_broker_order_id=target["broker_order_id"],
+        modify_from=_state_ref(target) if intent.action == "MODIFY" else None,
     )
     res.canonical = canonical
     price_src = Source.TRADER
@@ -440,10 +819,12 @@ def verify_order(
         if price is None:
             continue
         if price % inst.tick_size_paise != 0:
+            # Never rounded silently: the trader restates a valid price.
             down = price - price % inst.tick_size_paise
             issues.append(Issue(code="TICK_SIZE", severity="BLOCK", message=f"{inr(price)} is not a multiple of the tick size {inr(inst.tick_size_paise)}. Valid nearby prices: {inr(down)} or {inr(down + inst.tick_size_paise)}.", field=label))
         if price < inst.lower_circuit_paise or price > inst.upper_circuit_paise:
             issues.append(Issue(code="PRICE_BAND", severity="BLOCK", message=f"{inr(price)} is outside today's price band ({inr(inst.lower_circuit_paise)} to {inr(inst.upper_circuit_paise)}).", field=label))
+    issues += _stop_loss_issues(order, tick.ltp_paise)
 
     worst = order.worst_case_price()
     if worst is None:
@@ -457,22 +838,29 @@ def verify_order(
 
     value = q * worst
     charges_total, breakdown = charges.estimate(inst.segment, order.product.value, order.side.value, value)
-    held = account.holding_qty(inst.instrument_id) + (holdings_adjust or {}).get(inst.instrument_id, 0)
+    adjust = (holdings_adjust or {}).get(inst.instrument_id, 0)
+    held = account.holding_qty(inst.instrument_id) + adjust
     pos = account.position_qty(inst.instrument_id)
+    if account.position_rows:
+        pos = sum(int(p["quantity"]) for p in account.position_rows if p["instrument_id"] == inst.instrument_id and product_of(p) != "CNC")
+    pos_same_product = sum(int(p["quantity"]) for p in account.position_rows if p["instrument_id"] == inst.instrument_id and product_of(p) == order.product.value) if account.position_rows else pos
     current = held + pos
     margin = 0
     if order.side == Side.BUY:
         margin = value + charges_total if order.product == Product.CNC or inst.segment == "FO" else value // 5 + charges_total
     else:
         if order.product == Product.CNC:
-            available_to_sell = held - account.pending_sell_qty(inst.instrument_id)
+            exclude = order.target_broker_order_id if order.action == "MODIFY" else None
+            sellable, how = account.sellable_holding(inst.instrument_id, exclude)
+            available_to_sell = sellable + adjust
             if q > available_to_sell:
-                issues.append(Issue(code="INSUFFICIENT_HOLDINGS", severity="BLOCK", message=f"You can sell at most {max(available_to_sell, 0)} {inst.symbol} from holdings (held {held}, already pending sell {account.pending_sell_qty(inst.instrument_id)}). Short selling in delivery is not allowed.", field="quantity"))
+                plan_note = f", {-adjust:,} already sold by earlier steps of this plan" if adjust else ""
+                issues.append(Issue(code="INSUFFICIENT_HOLDINGS", severity="BLOCK", message=f"You can sell at most {max(available_to_sell, 0):,} {inst.symbol} from holdings ({how}{plan_note}). Short selling in delivery is not allowed.", field="quantity"))
             margin = charges_total
         else:
             margin = value // 5 + charges_total
-            if pos - q < 0:
-                issues.append(Issue(code="CREATES_SHORT", severity="WARN", message=f"This intraday sell creates a short position of {q - max(pos, 0)} {inst.symbol}."))
+            if order.action == "PLACE" and pos_same_product - q < 0:
+                issues.append(Issue(code="CREATES_SHORT", severity="WARN", message=f"This intraday sell creates a short position of {q - max(pos_same_product, 0)} {inst.symbol}."))
     if order.action == "MODIFY":
         margin = max(0, margin - q * (order.limit_price_paise or 0))
     available = account.available_paise - reserved_paise
@@ -504,20 +892,56 @@ def verify_order(
     return issues, preview
 
 
+def _stop_loss_issues(order: CanonicalOrder, ltp: int) -> list[Issue]:
+    """021 stop-loss rules. Buy SL: trigger above LTP and limit >= trigger. Sell SL: trigger below LTP and limit <= trigger."""
+    out: list[Issue] = []
+    trig = order.trigger_price_paise
+    if order.order_type not in STOP_TYPES:
+        if trig is not None:
+            out.append(Issue(code="TRIGGER_NOT_ALLOWED", severity="BLOCK", message=f"A trigger price only applies to SL and SL-M orders; this is a {order.order_type.value} order.", field="trigger_price"))
+        return out
+    if trig is None:
+        out.append(Issue(code="TRIGGER_REQUIRED", severity="BLOCK", message=f"A {order.order_type.value} order needs a trigger price.", field="trigger_price"))
+        return out
+    lim = order.limit_price_paise
+    if order.order_type == OrderType.SL and lim is None:
+        out.append(Issue(code="LIMIT_REQUIRED", severity="BLOCK", message="An SL order needs a limit price (or use SL-M).", field="limit_price"))
+    if order.side == Side.BUY:
+        if trig <= ltp:
+            out.append(Issue(code="SL_TRIGGER_SIDE", severity="BLOCK", message=f"A buy stop-loss trigger must be above the last traded price {inr(ltp)}; {inr(trig)} is not, so the broker would reject it.", field="trigger_price"))
+        if order.order_type == OrderType.SL and lim is not None and lim < trig:
+            out.append(Issue(code="SL_LIMIT_SIDE", severity="BLOCK", message=f"For a buy stop-loss the limit price must be at or above the trigger: limit {inr(lim)} is below trigger {inr(trig)}.", field="limit_price"))
+    else:
+        if trig >= ltp:
+            out.append(Issue(code="SL_TRIGGER_SIDE", severity="BLOCK", message=f"A sell stop-loss trigger must be below the last traded price {inr(ltp)}; {inr(trig)} is not, so the broker would reject it.", field="trigger_price"))
+        if order.order_type == OrderType.SL and lim is not None and lim > trig:
+            out.append(Issue(code="SL_LIMIT_SIDE", severity="BLOCK", message=f"For a sell stop-loss the limit price must be at or below the trigger: limit {inr(lim)} is above trigger {inr(trig)}.", field="limit_price"))
+    return out
+
+
+def _price_text(order: CanonicalOrder) -> str:
+    if order.order_type == OrderType.LIMIT:
+        return f"@ {inr(order.limit_price_paise)} LIMIT"
+    if order.order_type == OrderType.MARKET:
+        return f"at MARKET, protected at {inr(order.protection_price_paise)}"
+    if order.order_type == OrderType.SLM:
+        return f"SL-M trigger {inr(order.trigger_price_paise)}, protected at {inr(order.protection_price_paise)}"
+    return f"SL trigger {inr(order.trigger_price_paise)} limit {inr(order.limit_price_paise)}"
+
+
 def summarize(order: CanonicalOrder) -> str:
     sym = order.instrument.symbol
     if order.action == "CANCEL":
         return f"CANCEL order {order.target_broker_order_id} ({order.side.value} {order.quantity} {sym})"
     if order.action == "MODIFY":
+        old = order.modify_from
+        if order.order_type in STOP_TYPES and old is not None:
+            parts = [f"trigger {inr(old.trigger_price_paise)} → {inr(order.trigger_price_paise)}"]
+            if order.order_type == OrderType.SL:
+                parts.append(f"limit {inr(old.limit_price_paise)} → {inr(order.limit_price_paise)}")
+            return f"MODIFY {order.order_type.value} order {order.target_broker_order_id}: {order.side.value} {order.quantity:,} {sym}, " + ", ".join(parts)
         return f"MODIFY order {order.target_broker_order_id}: {order.side.value} {order.quantity} {sym}, new limit {inr(order.limit_price_paise)}"
-    price = (
-        f"@ {inr(order.limit_price_paise)} LIMIT"
-        if order.order_type == OrderType.LIMIT
-        else f"at MARKET, protected at {inr(order.protection_price_paise)}"
-        if order.order_type == OrderType.MARKET
-        else f"{order.order_type.value} trigger {inr(order.trigger_price_paise)} limit {inr(order.limit_price_paise)}"
-    )
-    return f"{order.side.value} {order.quantity:,} {sym} {price} ({order.product.value}, {order.validity.value})"
+    return f"{order.side.value} {order.quantity:,} {sym} {_price_text(order)} ({order.product.value}, {order.validity.value})"
 
 
 # ------------------------------------------------------------------ plans
@@ -530,10 +954,12 @@ def build_plan(steps: list[CanonicalOrder], account_id: str, depends: list[int |
     )
 
 
-def verify_plan(s: Session, plan: CanonicalPlan, account: AccountState) -> tuple[list[list[Issue]], list[OrderPreview | None], list[Issue]]:
+def verify_plan(
+    s: Session, plan: CanonicalPlan, account: AccountState, *, max_steps: int = MAX_PLAN_STEPS, independent: bool = False
+) -> tuple[list[list[Issue]], list[OrderPreview | None], list[Issue]]:
     plan_issues: list[Issue] = []
-    if len(plan.steps) > 6:
-        plan_issues.append(Issue(code="PLAN_TOO_LONG", severity="BLOCK", message="Plans are limited to 6 steps."))
+    if len(plan.steps) > max_steps:
+        plan_issues.append(Issue(code="PLAN_TOO_LONG", severity="BLOCK", message=f"Plans are limited to {max_steps} steps; this one has {len(plan.steps)}."))
     reserved = 0
     adjust: dict[str, int] = {}
     per_issues: list[list[Issue]] = []
@@ -550,8 +976,9 @@ def verify_plan(s: Session, plan: CanonicalPlan, account: AccountState) -> tuple
             if o.side == Side.BUY:
                 reserved += prev.estimated_margin_paise
             else:
-                adjust[o.instrument.instrument_id] = adjust.get(o.instrument.instrument_id, 0) - o.quantity
-                if any(x.side == Side.BUY for x in (p.order for p in plan.steps[st.step_no:])):
+                if o.product == Product.CNC:
+                    adjust[o.instrument.instrument_id] = adjust.get(o.instrument.instrument_id, 0) - o.quantity
+                if not independent and any(x.side == Side.BUY for x in (p.order for p in plan.steps[st.step_no:])):
                     plan_issues.append(Issue(code="PLAN_USES_PROCEEDS", severity="INFO", message=f"Later buy steps run only after step {st.step_no} fills (dependency is part of the signed plan)."))
         per_issues.append(iss)
         previews.append(prev)
@@ -562,6 +989,198 @@ def verify_plan(s: Session, plan: CanonicalPlan, account: AccountState) -> tuple
     return per_issues, previews, plan_issues
 
 
+# ------------------------------------------------------------------ generated plans (exit losers, rebalance)
+
+
+@dataclass
+class PlanDraft:
+    """Steps computed entirely by the verifier from account data and live prices. message set means: no plan."""
+
+    orders: list[CanonicalOrder] = field(default_factory=list)
+    fields: list[list[FieldRow]] = field(default_factory=list)
+    issues: list[list[Issue]] = field(default_factory=list)
+    notes: list[Issue] = field(default_factory=list)
+    message: str | None = None
+    title: str = ""
+
+
+def _market_exit(account: AccountState, inst: Instrument, side: Side, qty: int, product: Product, ltp: int) -> CanonicalOrder:
+    return CanonicalOrder(
+        action="PLACE",
+        account_id=account.account_id,
+        instrument=instruments.handle(inst),
+        side=side,
+        quantity=qty,
+        order_type=OrderType.MARKET,
+        product=product,
+        validity=Validity.DAY,
+        protection_price_paise=protection_price(side, ltp, inst.tick_size_paise),
+    )
+
+
+def _type_rows(order: CanonicalOrder, facts: Facts, ltp: int) -> list[FieldRow]:
+    stated = facts.market
+    return [
+        FieldRow(
+            key="order_type",
+            label="Order type",
+            display="MARKET",
+            source=Source.TRADER if stated else Source.DEFAULT,
+            note=None if stated else "You gave no price, so each step is a price-protected market order; its worst case is shown below.",
+        ),
+        FieldRow(
+            key="protection_price",
+            label="Worst-case protected price",
+            display=inr(order.protection_price_paise),
+            source=Source.RISK,
+            note=f"Fills at the best available price but never {'above' if order.side == Side.BUY else 'below'} this cap ({settings().market_protection_bps / 100:.2f}% from the live price {inr(ltp)}). Worst case for the step: {inr((order.protection_price_paise or 0) * order.quantity)}.",
+        ),
+    ]
+
+
+def _open_order_warnings(account: AccountState, inst: Instrument) -> list[Issue]:
+    left = [o for o in account.open_orders if o["instrument_id"] == inst.instrument_id]
+    if not left:
+        return []
+    ids = ", ".join(f"{o['broker_order_id']} ({o['side']} {int(o['quantity']):,} {o['order_type']})" for o in left)
+    return [Issue(code="OPEN_ORDERS_REMAIN", severity="WARN", message=f"You also have open {inst.symbol} orders ({ids}). This plan does not cancel them; if one fills later it opens a new position. Cancel them separately if you no longer want them.")]
+
+
+def build_exit_plan(s: Session, account: AccountState, facts: Facts, *, intraday_only: bool) -> PlanDraft:
+    """'Exit all my losing intraday positions': one exit per position whose unrealised P&L at the live price is
+    below zero, for exactly its square-off quantity. Steps are independent and ordered by loss, largest first."""
+    products = {"MIS"} if intraday_only else {"MIS", "NRML"}
+    label = "intraday (MIS)" if intraday_only else "intraday (MIS) and NRML"
+    if facts.price is not None or facts.quantity is not None:
+        return PlanDraft(message="One price or quantity cannot apply to several positions. Say 'exit all my losing intraday positions' to close each one in full with a price-protected market order, or exit positions one by one with your own prices.")
+    rows = [p for p in account.position_rows if product_of(p) in products and int(p["quantity"]) != 0]
+    if not rows:
+        return PlanDraft(message=f"You have no open {label} positions, so there is nothing to exit. No plan was drafted.")
+    evaluated = []
+    unpriced = []
+    for p in rows:
+        inst = s.get(Instrument, p["instrument_id"])
+        tick = market.latest(p["instrument_id"])
+        sym = inst.symbol if inst else str(p.get("symbol") or p["instrument_id"])
+        if inst is None or tick is None or tick.stale:
+            unpriced.append(sym)
+            continue
+        q = int(p["quantity"])
+        avg = int(p["avg_price_paise"])
+        evaluated.append((p, inst, tick, q, avg, (tick.ltp_paise - avg) * q))
+    losers = sorted((e for e in evaluated if e[5] < 0), key=lambda e: e[5])
+    if not losers:
+        checked = ", ".join(f"{e[1].symbol} {inr(e[5], True)}" for e in evaluated)
+        msg = f"None of your {label} positions is losing at current prices" + (f" ({checked})" if checked else "") + ". No plan was drafted."
+        if unpriced:
+            msg += f" I could not price {', '.join(unpriced)} (no live tick), so they were not checked."
+        return PlanDraft(message=msg)
+    d = PlanDraft(title=f"Exit {len(losers)} losing {label} position(s)")
+    for p, inst, tick, q, avg, pnl in losers:
+        sq = p.get("square_off_quantity")
+        sq = int(sq) if sq not in (None, 0) else -q  # 0 or absent: the broker did not report it
+        side = Side.SELL if sq < 0 else Side.BUY
+        qty = abs(sq)
+        order = _market_exit(account, inst, side, qty, Product(product_of(p)), tick.ltp_paise)
+        step_issues = _open_order_warnings(account, inst)
+        if sq != -q:
+            step_issues.append(Issue(code="SQUARE_OFF_MISMATCH", severity="BLOCK", message=f"The broker's square-off quantity ({sq:+,}) does not close your net position ({q:+,}); refusing to guess which is right.", field="quantity"))
+        rows_ = [
+            FieldRow(key="side", label="Side", display=side.value, source=Source.ACCOUNT, note=f"Closes your {'long' if q > 0 else 'short'} position"),
+            FieldRow(key="instrument", label="Instrument", display=f"{inst.symbol}  ({inst.display_name})", source=Source.ACCOUNT, note="From your open positions"),
+            FieldRow(key="instrument_id", label="Instrument ID", display=inst.instrument_id, source=Source.INSTRUMENT),
+            FieldRow(key="quantity", label="Quantity", display=f"{qty:,}", source=Source.ACCOUNT, note=f"Computed from your positions: the exact square-off quantity of your net position {q:+,}"),
+            FieldRow(key="unrealised_pnl", label="Unrealised P&L now", display=inr(pnl, True), source=Source.FEED, note=f"(live {inr(tick.ltp_paise)} - average {inr(avg)}) x {q:+,}"),
+            *_type_rows(order, facts, tick.ltp_paise),
+            FieldRow(key="product", label="Product", display=order.product.value, source=Source.ACCOUNT, note="Same product as the position"),
+            FieldRow(key="validity", label="Validity", display="DAY", source=Source.DEFAULT),
+            FieldRow(key="lot_size", label="Lot size", display=str(inst.lot_size), source=Source.INSTRUMENT),
+        ]
+        d.orders.append(order)
+        d.fields.append(rows_)
+        d.issues.append(step_issues)
+    scope = "Holdings are not touched." + (" NRML positions are not touched." if intraday_only else "")
+    d.notes.append(
+        Issue(
+            code="EXIT_SCOPE",
+            severity="INFO",
+            message=f"Exits every {label} position whose unrealised P&L is below zero at the live price: {len(losers)} of {len(evaluated)} checked. Each step closes one position in full. {scope} Steps are independent (none waits for another) and ordered by loss, largest first.",
+        )
+    )
+    if unpriced:
+        d.notes.append(Issue(code="EXIT_UNPRICED", severity="WARN", message=f"No live price for {', '.join(unpriced)}, so I could not tell whether they are losing; they are not in this plan."))
+    return d
+
+
+def build_rebalance_plan(s: Session, account: AccountState, facts: Facts, *, max_pct: Decimal) -> PlanDraft:
+    """'Rebalance so no single stock is more than 20% of my portfolio': deterministic sells only (see
+    portfolio.rebalance_sells for the formula), from holdings valued at live prices."""
+    if not (Decimal(0) < max_pct < Decimal(100)):
+        return PlanDraft(message="The maximum weight must be between 0% and 100%.")
+    max_bps = int(max_pct * 100)
+    pct_txt = f"{max_pct.normalize():f}%"
+    held = [(iid, h) for iid, h in account.holdings.items() if int(h.get("quantity") or 0) > 0]
+    if not held:
+        return PlanDraft(message="You have no holdings to rebalance. No plan was drafted.")
+    rows = []
+    missing = []
+    meta: dict[str, tuple[Instrument, int]] = {}
+    for iid, h in held:
+        inst = s.get(Instrument, iid)
+        tick = market.latest(iid)
+        if inst is None or tick is None or tick.stale:
+            missing.append(inst.symbol if inst else str(h.get("symbol") or iid))
+            continue
+        meta[iid] = (inst, tick.ltp_paise)
+        rows.append({"key": iid, "qty": int(h["quantity"]), "price": tick.ltp_paise, "lot": max(int(inst.lot_size or 1), 1)})
+    if missing:
+        return PlanDraft(message=f"I need a live price for every holding to compute weights, and there is none for {', '.join(missing)}. No plan was drafted.")
+    r = portfolio.rebalance_sells(rows, max_bps)
+
+    def w(bps_frac) -> str:
+        return f"{float(bps_frac) / 100:.2f}%"
+
+    if r["status"] == "WITHIN":
+        top = max(r["before"].items(), key=lambda kv: kv[1])
+        return PlanDraft(message=f"Already within the limit: no holding is above {pct_txt} of your holdings value ({inr(r['value_before'])} at live prices). The largest is {meta[top[0]][0].symbol} at {w(top[1])}. No plan was drafted.")
+    if r["status"] == "INFEASIBLE":
+        return PlanDraft(message=f"{r['reason']} No plan was drafted.")
+    d = PlanDraft(title=f"Rebalance to at most {pct_txt} per stock")
+    order_keys = sorted(r["sells"], key=lambda k: r["before"][k], reverse=True)
+    for k in order_keys:
+        sell = r["sells"][k]
+        inst, ltp = meta[k]
+        q = account.holding_qty(k)
+        order = _market_exit(account, inst, Side.SELL, sell, Product.CNC, ltp)
+        rows_ = [
+            FieldRow(key="side", label="Side", display="SELL", source=Source.ACCOUNT, note="Sells only: this plan never buys"),
+            FieldRow(key="instrument", label="Instrument", display=f"{inst.symbol}  ({inst.display_name})", source=Source.ACCOUNT, note="From your holdings"),
+            FieldRow(key="instrument_id", label="Instrument ID", display=inst.instrument_id, source=Source.INSTRUMENT),
+            FieldRow(key="quantity", label="Quantity", display=f"{sell:,}", source=Source.ACCOUNT, note=f"Computed from your holdings: sell {sell:,} of {q:,} so {inst.symbol} is at most {pct_txt} of what remains (rounded up to {'whole shares' if inst.lot_size <= 1 else f'whole lots of {inst.lot_size}'})"),
+            FieldRow(key="weight", label="Weight", display=f"{w(r['before'][k])} → {w(r['after'][k])}", source=Source.FEED, note=f"Value at live {inr(ltp)}: {inr(q * ltp)} → {inr((q - sell) * ltp)}"),
+            *_type_rows(order, facts, ltp),
+            FieldRow(key="product", label="Product", display="CNC", source=Source.ACCOUNT, note="Delivery holding"),
+            FieldRow(key="validity", label="Validity", display="DAY", source=Source.DEFAULT),
+        ]
+        d.orders.append(order)
+        d.fields.append(rows_)
+        d.issues.append(_open_order_warnings(account, inst))
+    after = ", ".join(f"{meta[k][0].symbol} {w(r['before'][k])} → {w(r['after'][k])}" for k in sorted(r["after"], key=lambda k: r["after"][k], reverse=True))
+    d.notes.append(
+        Issue(
+            code="REBALANCE_METHOD",
+            severity="INFO",
+            message=(
+                f"Method: portfolio value = sum of quantity x live price over your holdings only (cash and positions are not counted). Sells only, no buys. "
+                f"Each stock above {pct_txt} is sold down by the fewest whole shares (rounded up to its lot size) so that it is at most {pct_txt} of the holdings value that remains after all the sells. "
+                f"Holdings value {inr(r['value_before'])} → {inr(r['value_after'])}. Fills at market can differ slightly from the live prices used here."
+            ),
+        )
+    )
+    d.notes.append(Issue(code="REBALANCE_RESULT", severity="INFO", message=f"Weights now → after this plan, at live prices: {after}."))
+    return d
+
+
 # ------------------------------------------------------------------ mandates
 
 
@@ -569,7 +1188,9 @@ def build_mandate(
     s: Session, intent: MandateIntent, facts: Facts, account: AccountState, *, engine: str
 ) -> tuple[CanonicalMandate | None, BuildResult, list[Issue]]:
     issues: list[Issue] = []
-    r = instruments.resolve(s, intent.instrument_ref)
+    if intent.scope == "ALL_HOLDINGS":
+        return _build_holdings_alert(intent, facts, account)
+    r = instruments.resolve(s, intent.instrument_ref or "")
     br = BuildResult()
     if r.status != "RESOLVED":
         br.clarify = (r.message + " Please give the exact symbol.", [c.symbol for c in r.candidates][:6])
@@ -630,15 +1251,70 @@ def build_mandate(
     return mandate, br, issues
 
 
+ALL_HOLDINGS_HANDLE = InstrumentHandle(
+    instrument_id=ALL_HOLDINGS_ID,
+    segment="EQ",
+    symbol="ALL HOLDINGS",
+    display_name="Every stock you hold when each price update arrives",
+)
+
+
+def _build_holdings_alert(intent: MandateIntent, facts: Facts, account: AccountState) -> tuple[CanonicalMandate | None, BuildResult, list[Issue]]:
+    """'Tell me when any holding falls 3% in a day': an ALERT over every holding (never an order), firing at most once
+    per holding per IST trading day. The trader must have asked for it; the percentage must be one they stated."""
+    br = BuildResult()
+    issues: list[Issue] = []
+    if intent.kind != "ALERT":
+        br.clarify = ("Standing orders across all holdings are not supported. Name one stock for an order instruction, or ask for an alert on your holdings.", [])
+        return None, br, issues
+    if detect_holdings_alert(facts.text) is None:
+        issues.append(Issue(code="SCOPE_NOT_STATED", severity="BLOCK", message="Your message does not ask for an alert on all of your holdings; the AI chose that scope.", field="instrument"))
+    pct = intent.drop_pct
+    if pct is None:
+        br.clarify = ("By how much should a holding fall before I alert you? For example 'tell me when any holding falls 3% in a day'.", [])
+        return None, br, issues
+    pct = abs(Decimal(str(pct)))
+    if not (Decimal(0) < pct < Decimal(100)):
+        br.clarify = ("The fall must be between 0% and 100%.", [])
+        return None, br, issues
+    if not facts.mentions_number(pct):
+        issues.append(Issue(code="THRESHOLD_NOT_STATED", severity="BLOCK", message=f"The percentage {pct.normalize():f}% was not stated by you; the AI inferred it.", field="threshold"))
+    if intent.field == "DROP_FROM_AVG_BPS":
+        predicate = MandatePredicate(field="DROP_FROM_AVG_BPS", op="GTE", threshold=int(pct * 100))
+    else:
+        predicate = MandatePredicate(field="DAY_CHANGE_BPS", op="LTE", threshold=-int(pct * 100))
+    expires = (datetime.now(UTC) + timedelta(days=max(1, min(intent.expires_days, 30)))).replace(microsecond=0)
+    mandate = CanonicalMandate(
+        account_id=account.account_id,
+        kind="ALERT",
+        instrument=ALL_HOLDINGS_HANDLE,
+        predicate=predicate,
+        one_shot=False,
+        expires_at=expires.isoformat().replace("+00:00", "Z"),
+        scope="ALL_HOLDINGS",
+        fire_policy="ONCE_PER_HOLDING_PER_DAY",
+    )
+    n = sum(1 for h in account.holdings.values() if int(h.get("quantity") or 0) > 0)
+    if n == 0:
+        issues.append(Issue(code="NO_HOLDINGS_YET", severity="WARN", message="You hold no stocks right now; the alert watches whatever you hold when each price update arrives."))
+    issues.append(Issue(code="ALERT_SCOPE", severity="INFO", message=f"Watches every stock you hold when each price update arrives ({n} now). Fires at most once per holding per trading day (IST), survives restarts, and never places an order."))
+    return mandate, br, issues
+
+
 def describe_predicate(m: CanonicalMandate) -> str:
     p = m.predicate
+    who = "any holding" if m.scope == "ALL_HOLDINGS" else m.instrument.symbol
     if p.field == "LTP":
         return f"{m.instrument.symbol} LTP {'<=' if p.op == 'LTE' else '>='} {inr(p.threshold)}"
-    return f"{m.instrument.symbol} falls {p.threshold / 100:.2f}% or more below your average price"
+    if p.field == "DAY_CHANGE_BPS":
+        return f"{who} is down {abs(p.threshold) / 100:.2f}% or more today (vs previous close)"
+    return f"{who} falls {p.threshold / 100:.2f}% or more below your average price"
 
 
 def mandate_summary(m: CanonicalMandate) -> str:
     cond = describe_predicate(m)
+    if m.kind == "ALERT" and m.fire_policy == "ONCE_PER_HOLDING_PER_DAY":
+        return f"ALERT when {cond}: at most once per holding per trading day, never places an order (expires {m.expires_at[:10]})"
     if m.kind == "ALERT":
         return f"ALERT once when {cond} (expires {m.expires_at[:10]})"
     t = m.template
