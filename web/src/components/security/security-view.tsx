@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { PinResetInline, PinSlots, RegisterPasskeyInline, SetPinInline, TotpSetupInline } from "@/components/approval/setup-inline";
+import { BrokerConnectionPanel } from "@/components/broker/broker-connection";
 import { Button } from "@/components/ui/button";
 import { Chip, Dot } from "@/components/ui/chip";
 import { TableShell, Td, Th } from "@/components/ui/data-table";
@@ -31,10 +32,12 @@ import { PageContainer, PageHeader, Panel } from "@/components/ui/panel";
 import { EmptyState, ErrorState, SkeletonRows } from "@/components/ui/states";
 import { api } from "@/lib/api";
 import { accountId, activePasskeys } from "@/lib/auth";
+import { brokerName, displayAccountId } from "@/lib/broker";
 import { errorMessage } from "@/lib/errors";
 import { ago, dateTime, shortHash, time } from "@/lib/format";
 import {
   qk,
+  useActiveBroker,
   useAudit,
   useKillSwitch,
   useMe,
@@ -43,7 +46,7 @@ import {
   useSecurityStatus,
   useSessions,
 } from "@/lib/queries";
-import { PROPOSAL_STATUS } from "@/lib/status";
+import { proposalLook } from "@/lib/status";
 import { useLiveStore } from "@/lib/store";
 import type { AuditVerify, Me, SecurityEventScope, SecurityStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -292,6 +295,7 @@ function AccountRow({ label, children }: { label: string; children: ReactNode })
 }
 
 function AccountPanel({ me }: { me: Me }) {
+  const broker = useActiveBroker();
   const methods = [
     me.has_pin ? "App PIN" : null,
     activePasskeys(me) ? `${activePasskeys(me)} passkey${activePasskeys(me) === 1 ? "" : "s"}` : null,
@@ -302,9 +306,9 @@ function AccountPanel({ me }: { me: Me }) {
       <dl className="divide-y divide-hairline px-4 py-1">
         <AccountRow label="Name">{me.user.display_name}</AccountRow>
         <AccountRow label="Email">{me.email ?? <span className="text-subtle">not on file</span>}</AccountRow>
-        <AccountRow label="Paper account">
-          <span className="num font-medium">{accountId(me)}</span>
-          {me.account?.label && <span className="ml-1.5 text-xs text-subtle">{me.account.label}</span>}
+        <AccountRow label="Trading account">
+          <span className="num font-medium">{displayAccountId(broker.account?.account_id ?? accountId(me), broker.kind)}</span>
+          <span className="ml-1.5 text-xs text-subtle">{brokerName(broker.kind)}</span>
         </AccountRow>
         <AccountRow label="Countersign with">{methods.length ? methods.join(", ") : <span className="text-warning">no method set up yet</span>}</AccountRow>
         <AccountRow label="Session expires">
@@ -569,8 +573,8 @@ function ApprovalHistoryPanel() {
                     <p className="num mt-1 text-[10.5px] text-subtle">{shortHash(a.payload_hash, 12)}</p>
                   </Td>
                   <Td>
-                    <Chip tone={PROPOSAL_STATUS[p.status].tone} size="xs">
-                      {PROPOSAL_STATUS[p.status].label}
+                    <Chip tone={proposalLook(p.status).tone} size="xs">
+                      {proposalLook(p.status).label}
                     </Chip>
                   </Td>
                 </tr>
@@ -675,7 +679,7 @@ export function SecurityView() {
       <PageHeader
         icon={ShieldCheck}
         title="Security Center"
-        description="Countersign methods, the kill switch, the independent monitor and the tamper-evident audit chain."
+        description="Your broker connection, countersign methods, the kill switch, the independent monitor and the tamper-evident audit chain."
       />
       {status.error ? (
         <ErrorState error={status.error} title="Security status unavailable" onRetry={() => void status.refetch()} />
@@ -693,6 +697,7 @@ export function SecurityView() {
           </div>
         </>
       )}
+      {me.data && <BrokerConnectionPanel me={me.data} />}
       {me.data && (
         <div className="grid gap-4 lg:grid-cols-2">
           <AccountPanel me={me.data} />

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useSyncExternalStore } from "react";
-import { LogOut, Monitor, Moon, Presentation, Search, ShieldCheck, Sun } from "lucide-react";
+import { Landmark, LogOut, Monitor, Moon, Presentation, Search, ShieldCheck, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
 import {
   DropdownMenu,
@@ -16,10 +16,10 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { BrokerMenuLine } from "@/components/broker/broker-connection";
 import { Kbd } from "@/components/ui/kbd";
 import { IS_MOCK } from "@/lib/api";
-import { accountId } from "@/lib/auth";
-import { useDemoMode } from "@/lib/queries";
+import { useActiveBroker, useDemoMode } from "@/lib/queries";
 import { useUiStore } from "@/lib/store";
 import type { Me } from "@/lib/types";
 import { BrandMark } from "./brand";
@@ -48,6 +48,7 @@ function UserMenu({ me }: { me: Me }) {
   const demoMode = useDemoMode();
   const isMac = useIsMac();
   const { signOut, pending } = useSignOut();
+  const broker = useActiveBroker();
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -67,13 +68,15 @@ function UserMenu({ me }: { me: Me }) {
             <div className="flex min-w-0 flex-col gap-0.5">
               <span className="truncate text-sm font-medium text-foreground">{me.user.display_name}</span>
               {me.email && <span className="truncate text-xs font-normal text-muted-foreground">{me.email}</span>}
-              <span className="mt-1 text-[11px] font-normal text-subtle">
-                Paper account <span className="num text-muted-foreground">{accountId(me)}</span>
-              </span>
+              <BrokerMenuLine me={me} />
             </div>
           </DropdownMenuLabel>
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
+        <DropdownMenuItem render={<Link href="/security#broker" />}>
+          <Landmark /> Broker connection
+          <DropdownMenuShortcut className="tracking-normal">{broker.kind === "021" ? (broker.live021 ? "021 live" : "021") : "paper"}</DropdownMenuShortcut>
+        </DropdownMenuItem>
         <DropdownMenuItem render={<Link href="/security" />}>
           <ShieldCheck /> Security Center
         </DropdownMenuItem>

@@ -17,8 +17,10 @@ import {
 import { Dot } from "@/components/ui/chip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { brokerHealth } from "@/components/broker/broker-connection";
+import { brokerSystemName } from "@/lib/broker";
 import { ago, ms, time } from "@/lib/format";
-import { useSecurityStatus } from "@/lib/queries";
+import { useActiveBroker, useSecurityStatus } from "@/lib/queries";
 import { useLiveStore } from "@/lib/store";
 import type { Tone } from "@/lib/status";
 import { cn } from "@/lib/utils";
@@ -45,6 +47,37 @@ interface Overall {
   label: string;
 }
 
+export interface MarketSource {
+  live: boolean;
+  /** "Live from the 021 sandbox" or "Replay". */
+  label: string;
+  title: string;
+}
+
+/** Where prices come from for the active account: the 021 market data websocket, or the local replay. */
+export function useMarketSource(): MarketSource {
+  const broker = useActiveBroker();
+  const { data } = useSecurityStatus();
+  if (broker.reported) {
+    if (broker.live021) {
+      return { live: true, label: "Live from the 021 sandbox", title: "Prices stream from the 021 Developer Sandbox market data websocket" };
+    }
+    return {
+      live: false,
+      label: "Replay",
+      title:
+        broker.kind === "021"
+          ? "The 021 market feed is not streaming for this account; prices come from the local replay feed"
+          : "Prices come from a deterministic tick replay, not the live exchange",
+    };
+  }
+  // Older backend: only the feed mode is known.
+  const live = data?.feed.mode === "live";
+  return live
+    ? { live: true, label: "Live feed", title: "The market feed reports a live session" }
+    : { live: false, label: "Replay", title: "Prices come from a deterministic tick replay, not the live exchange" };
+}
+
 /** One place that turns GET /api/security/status plus the live stream into rows and a verdict. */
 export function useSystemHealth() {
   const { data, error, isPending } = useSecurityStatus();
@@ -53,7 +86,12 @@ export function useSystemHealth() {
   const retry = useLiveStore((s) => s.retryInMs);
   const now = useNow(2000);
   const monitor = liveMonitor ?? data?.monitor;
-  const replay = !data || data.feed.mode !== "live";
+  const broker = useActiveBroker();
+  const source = useMarketSource();
+  const replay = !source.live;
+  const account = broker.account;
+  const health = account ? brokerHealth(account, now) : null;
+  const brokerLabel = brokerSystemName(broker.kind);
 
   const connRow: HealthRow = {
     key: "live",
@@ -78,17 +116,27 @@ export function useSystemHealth() {
             key: "broker",
             label: "Broker",
             icon: Landmark,
-            tone: data.broker.healthy ? "profit" : "danger",
-            value: data.broker.healthy ? `Reachable, ${ms(data.broker.latency_ms)}` : "Unreachable",
-            detail: data.broker.healthy ? "Paper broker on a simulated market" : "Executions fail closed until it is back",
+            tone: !data.broker.healthy ? "danger" : health ? health.tone : "profit",
+            value: !data.broker.healthy
+              ? `${brokerLabel} unreachable`
+              : health && health.tone !== "profit"
+                ? `${brokerLabel}: ${health.label.toLowerCase()}`
+                : `${brokerLabel}, ${ms(data.broker.latency_ms)}`,
+            detail: !data.broker.healthy
+              ? "Executions fail closed until it is back"
+              : account?.status.last_error && health?.tone !== "profit"
+                ? account.status.last_error
+                : broker.kind === "021"
+                  ? "021 Developer Sandbox: virtual money on a simulated exchange"
+                  : "Local paper broker on a simulated market",
           },
           {
             key: "feed",
             label: "Market feed",
             icon: RadioTower,
             tone: !data.feed.healthy ? "danger" : (data.feed.last_tick_age_ms ?? 0) > 5000 ? "warning" : "profit",
-            value: `${replay ? "Replay" : "NSE live"}, tick ${ms(data.feed.last_tick_age_ms)} ago`,
-            detail: data.feed.healthy ? "Deterministic tick replay, not the live exchange" : "Stale: approvals and mandates pause",
+            value: `${source.live ? (broker.kind === "021" ? "Live 021 feed" : "Live feed") : "Replay"}, tick ${ms(data.feed.last_tick_age_ms)} ago`,
+            detail: data.feed.healthy ? source.title : "Stale: approvals and mandates pause",
           },
           {
             key: "executor",
@@ -159,7 +207,7 @@ const PILL_TONE: Record<string, string> = {
 
 /** The single status control in the top bar. Opens a popover with every subsystem. */
 export function SystemStatus() {
-  const { rows, overall, replay, unapproved, error } = useSystemHealth();
+  const { rows, overall, unapproved, error } = useSystemHealth();
   return (
     <Popover>
       <PopoverTrigger
@@ -187,7 +235,7 @@ export function SystemStatus() {
               <Dot tone={overall.tone} /> {overall.label}
             </p>
           </div>
-          <ReplayBadge replay={replay} />
+          <MarketSourceBadge />
         </div>
         {error ? (
           <p className="px-4 py-3 text-xs text-muted-foreground">The status endpoint did not answer. The stream reconnects on its own.</p>
@@ -231,24 +279,26 @@ export function SystemStatus() {
   );
 }
 
-/** Replay vs live market, shown in the status popover and on the Market page. */
-export function ReplayBadge({ replay, className }: { replay?: boolean; className?: string }) {
-  const { data } = useSecurityStatus();
-  const isReplay = replay ?? (!data || data.feed.mode !== "live");
+/** Live 021 prices vs replay, shown in the status popover, on the Market page and in the Copilot market tab. */
+export function MarketSourceBadge({ className }: { className?: string }) {
+  const src = useMarketSource();
   return (
     <span
       className={cn(
         "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-[11px] font-medium ring-1 ring-inset",
-        isReplay ? "bg-info/10 text-info ring-info/25" : "bg-profit/10 text-profit ring-profit/25",
+        src.live ? "bg-profit/10 text-profit ring-profit/25" : "bg-info/10 text-info ring-info/25",
         className,
       )}
-      title={isReplay ? "Prices come from a deterministic tick replay, not the live exchange" : "Live NSE session"}
+      title={src.title}
     >
-      <span className={cn("size-1.5 rounded-full", isReplay ? "bg-info" : "animate-pulse bg-profit")} />
-      {isReplay ? "Replay session" : "NSE live"}
+      <span className={cn("size-1.5 rounded-full", src.live ? "animate-pulse bg-profit" : "bg-info")} />
+      {src.label}
     </span>
   );
 }
+
+/** Kept for existing imports. */
+export const ReplayBadge = MarketSourceBadge;
 
 /** Status of the shared SSE connection to /api/events. */
 export function ConnectionIndicator({ className }: { className?: string }) {

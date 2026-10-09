@@ -11,6 +11,7 @@ import { Kpi } from "@/components/ui/kpi";
 import { LiveChange, LivePrice } from "@/components/ui/live-price";
 import { Sparkline } from "@/components/ui/sparkline";
 import { ErrorState, SkeletonCard } from "@/components/ui/states";
+import { displayAccountId } from "@/lib/broker";
 import { compactCount, date, price, time } from "@/lib/format";
 import { useHistory, useProposal } from "@/lib/queries";
 import { useChatStore, useLiveStore } from "@/lib/store";
@@ -50,7 +51,7 @@ function CardFrame({
 
 export function AccountSummaryCard({ data }: { data: AccountSummary }) {
   return (
-    <CardFrame title="Account summary" meta={`${data.account_id} · as of ${time(data.as_of)}`} href="/portfolio">
+    <CardFrame title="Account summary" meta={`${displayAccountId(data.account_id)} · as of ${time(data.as_of)}`} href="/portfolio">
       <div className="grid grid-cols-2 gap-2 p-3 sm:grid-cols-3">
         <Kpi label="Day P&L" paise={data.day_pnl_paise} signed emphasis />
         <Kpi label="Total P&L" paise={data.total_pnl_paise} signed emphasis />
