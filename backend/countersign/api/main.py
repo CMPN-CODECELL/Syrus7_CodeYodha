@@ -51,6 +51,7 @@ from countersign.core.models import (
     User,
     WebauthnChallenge,
 )
+from countersign.broker021 import linking
 from countersign.core.proposals import mandate_view, view
 from countersign.core.schemas import iso
 
@@ -176,7 +177,12 @@ def _validation_err(_: Request, e: RequestValidationError):
 
 @app.exception_handler(BrokerUnavailable)
 def _broker_down(_: Request, e: BrokerUnavailable):
-    return JSONResponse({"code": "BROKER_UNAVAILABLE", "message": "The broker (paper broker) is not reachable. Account data is temporarily unavailable."}, status_code=503)
+    return JSONResponse({"code": "BROKER_UNAVAILABLE", "message": "The broker (paper broker or 021 gateway) is not reachable. Account data is temporarily unavailable."}, status_code=503)
+
+
+@app.exception_handler(BrokerTimeout)
+def _broker_slow(_: Request, e: BrokerTimeout):
+    return JSONResponse({"code": "BROKER_TIMEOUT", "message": "The broker did not answer in time. Account data is temporarily unavailable; nothing was changed."}, status_code=504)
 
 
 @app.exception_handler(BrokerError)
@@ -189,6 +195,10 @@ def _startup() -> None:
     cfg = settings()
     if cfg.broker_write_key:
         sys.exit("api: refusing to start. The API process must never hold the broker WRITE key (credential zone violation).")
+    import os
+
+    if os.environ.get("CS_021_PASSWORD"):
+        sys.exit("api: refusing to start. The 021 password belongs only to the gateway021 process (credential zone violation).")
     from countersign.core.bootstrap import bootstrap
     from countersign.core.mandate_engine import start_background
 
@@ -224,14 +234,14 @@ class DemoLogin(BaseModel):
 
 def _me(s, p_user: User, session_row: SessionRow) -> dict:
     devices = s.execute(select(DeviceCredential).where(DeviceCredential.user_id == p_user.id).order_by(DeviceCredential.created_at)).scalars().all()
-    acct = s.execute(select(Account).where(Account.user_id == p_user.id).order_by(Account.id)).scalars().first()
+    acct = linking.active_account(s, p_user)
     pin_set = bool(p_user.pin_hash)
     passkeys = sum(1 for d in devices if d.revoked_at is None and not d.is_virtual)
     return {
         "user": {"id": p_user.id, "username": p_user.username, "display_name": p_user.display_name},
         "email": p_user.email,
         "account_id": acct.id if acct else None,
-        "account": {"id": acct.id, "label": acct.label} if acct else None,
+        "account": ({"id": acct.id, "label": linking.account_view(s, acct, acct.id)["label"], "kind": acct.broker_kind} if acct else None),
         "devices": [_device(d) for d in devices],
         "has_pin": pin_set,
         "has_totp": bool(p_user.totp_confirmed),
@@ -252,6 +262,7 @@ def _signed_in(request: Request, user_id: str, method: str, status_code: int = 2
     revoke_presented(request)
     with session_scope() as s:
         u = s.get(User, user_id)
+        linking.link_on_sign_in(s, u)
     token, csrf, row = create(u, request.headers.get("user-agent", ""))
     with session_scope() as s:
         u = s.get(User, user_id)
@@ -948,8 +959,111 @@ def market_history(symbol: str, points: int = 300, p: Principal = Depends(curren
 
 @app.get("/api/market/option-chain")
 def market_option_chain(underlying: str = "NIFTY", expiry: str | None = None, width: int = 8, p: Principal = Depends(current)):
+    if settings().gateway021_enabled:
+        # Live 021 chain (instrument file + live option prices); market data, so the same for every trader.
+        from countersign.core.broker_client import market_gateway021
+
+        try:
+            return market_gateway021().option_chain(underlying, expiry, max(2, min(width, 12)))
+        except (BrokerError, BrokerTimeout, BrokerUnavailable) as e:
+            raise HTTPException(503, {"code": "OPTION_CHAIN_UNAVAILABLE", "message": f"The live 021 option chain is not available right now: {getattr(e, 'message', e)}"}) from None
     with session_scope() as s:
         return portfolio.option_chain(s, expiry, max(2, min(width, 12)))
+
+
+# ------------------------------------------------------------------ broker accounts (paper and the linked 021 account)
+
+
+def _gateway_status() -> dict | None:
+    """The gateway's own heartbeat (written every 2 s to Valkey); never carries a credential or the full account id."""
+    if not settings().gateway021_enabled:
+        return None
+    try:
+        raw = events.client().get("cs:gw021:status")
+        return json.loads(raw) if raw else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _account_rows(s, u: User, active_id: str) -> list[dict]:
+    """GET /api/broker/accounts rows. Display `label` (the 021 id is masked there); `account_id` is only for switching."""
+    gw = _gateway_status()
+    rows = []
+    for a in linking.user_accounts(s, u):
+        row = linking.account_view(s, a, active_id)
+        if a.broker_kind == "021":
+            up = bool(gw) and time.time() - float(gw.get("ts") or 0) < 10
+            http = (gw or {}).get("http") or {}
+            row["status"] = {"connected": up and bool(gw.get("logged_in")), "token_expires_at": (gw or {}).get("token_expires_at"), "market_data": "live", "last_error": None if up else "The 021 gateway is not running."}
+            if up and http.get("last_error"):
+                row["status"]["last_error"] = str(http["last_error"])[:200]
+        else:
+            row["status"] = {"connected": True, "token_expires_at": None, "market_data": "live" if settings().gateway021_enabled else "replay", "last_error": None}
+        rows.append(row)
+    return rows
+
+
+@app.get("/api/broker/accounts")
+def broker_accounts(p: Principal = Depends(current)):
+    """The caller's accounts (a JSON array): their paper account and, when linked, the 021 sandbox account.
+    Hackathon linking model: users listed in CS_021_OWNER_EMAILS are linked to the one 021 account the gateway serves;
+    self-service linking of any 021 UCC is future scope."""
+    with session_scope() as s:
+        return _account_rows(s, s.get(User, p.user_id), p.account_id)
+
+
+class ActiveBody(BaseModel):
+    account_id: str
+
+
+@app.post("/api/broker/active")
+def broker_set_active(body: ActiveBody, p: Principal = Depends(current)):
+    with session_scope() as s:
+        u = s.get(User, p.user_id)
+        if not linking.can_operate(s, u.id, body.account_id):
+            raise HTTPException(404, {"code": "ACCOUNT_NOT_FOUND", "message": "You have no account with that id."})
+        u.active_account_id = body.account_id
+        acct = s.get(Account, body.account_id)
+        audit.record(s, "trader", "ACTIVE_ACCOUNT_SWITCHED", "user", u.id, {"to": linking.account_view(s, acct, body.account_id)["label"], "kind": acct.broker_kind})
+        return {"active_account_id": body.account_id, "accounts": _account_rows(s, u, body.account_id)}
+
+
+@app.get("/api/broker/status")
+def broker_status(p: Principal = Depends(current)):
+    """Health of the broker behind the caller's active account. For 021: the gateway's login, sockets, instrument
+    file and HTTP fault counters (no credential or account id is ever included)."""
+    kind = "paper"
+    with session_scope() as s:
+        acct = s.get(Account, p.account_id)
+        kind = acct.broker_kind if acct is not None else "paper"
+    out: dict = {"active_kind": kind, "gateway021_enabled": settings().gateway021_enabled, "gateway021": None}
+    if settings().gateway021_enabled:
+        st = _gateway_status()
+        if st is not None:
+            m = st.get("market") or {}
+            o = st.get("orders_socket") or {}
+            out["gateway021"] = {
+                "up": time.time() - float(st.get("ts") or 0) < 10,
+                "logged_in": st.get("logged_in"),
+                "token_expires_at": st.get("token_expires_at"),
+                "account": st.get("account"),
+                "instruments": {k: (st.get("instruments") or {}).get(k) for k in ("rows", "date", "stocks", "indices", "options")},
+                "market_socket": {k: m.get(k) for k in ("connections", "alive", "subscribed", "ticks_published", "reconnects")},
+                "orders_socket": {"connected": o.get("connected"), "events": o.get("events")},
+                "http": {k: (st.get("http") or {}).get(k) for k in ("http_429", "http_5xx", "timeouts", "read_retries", "relogins_on_401")},
+                "last_reconciliation": {k: v for k, v in (st.get("last_reconciliation") or {}).items() if k in ("result", "broker_order_id", "original_error", "polls")} or None,
+            }
+        else:
+            out["gateway021"] = {"up": False}
+    return out
+
+
+@app.get("/api/account/funds")
+def account_funds(p: Principal = Depends(current)):
+    """Funds of the active account. For 021 this is a clearly labelled estimate (021 has no funds API):
+    estimate=true and basis explain it; 021's own risk checks decide."""
+    f = read_gateway(p.account_id).funds()
+    return {"estimate": False, **f}
 
 
 # ------------------------------------------------------------------ chat
@@ -1222,14 +1336,22 @@ def security_status(p: Principal = Depends(current)):
     ok, lat = broker_health()
     with session_scope() as s:
         ks = state.kill_switch(s)
+        acct = s.get(Account, p.account_id)
+        kind = acct.broker_kind if acct is not None else "paper"
+        broker_label = linking.account_view(s, acct, p.account_id)["label"] if acct is not None else "Paper broker"
+    if kind == "021":
+        # The caller trades on 021: report the gateway (login and sockets), not the local paper broker.
+        gw = _gateway_status()
+        ok = bool(gw) and time.time() - float(gw.get("ts") or 0) < 10 and bool(gw.get("logged_in"))
+        lat = None
     label = engine_label("auto")
     return {
         "kill_switch": ks,
         "monitor": _monitor_status(),
         "executor": {"healthy": bool(hb) and time.time() - float(hb) < 10, "last_heartbeat": iso(datetime.fromtimestamp(float(hb), UTC)) if hb else None, "holds_write_key": True},
         "api": {"holds_write_key": bool(settings().broker_write_key), "llm_has_order_tools": False},
-        "broker": {"healthy": ok, "latency_ms": lat},
-        "feed": {"healthy": bool(feed_hb) and time.time() - float(feed_hb) < 5, "last_tick_age_ms": int((time.time() - float(feed_hb)) * 1000) if feed_hb else None, "mode": "replay (simulated NSE, demo mode)"},
+        "broker": {"healthy": ok, "latency_ms": lat, "kind": kind, "label": broker_label},
+        "feed": {"healthy": bool(feed_hb) and time.time() - float(feed_hb) < 5, "last_tick_age_ms": int((time.time() - float(feed_hb)) * 1000) if feed_hb else None, "mode": "021 live prices (fictional demo instruments replayed)" if settings().gateway021_enabled else "replay (simulated NSE, demo mode)"},
         "llm": {"engine": label, "available": availability()},
     }
 
@@ -1378,6 +1500,10 @@ def demo_reset(p: Principal = Depends(current)):
     records, mandates, plans, outcomes, order mirrors and chat. Other traders, the kill switch, security events and
     the audit chain are untouched. Also calms the replay feed, clears broker faults and refills the sandboxes."""
     _demo_only()
+    with session_scope() as s:
+        acct = s.get(Account, p.account_id)
+        if acct is not None and acct.broker_kind == "021":
+            raise HTTPException(409, {"code": "NOT_RESETTABLE", "message": "The 021 sandbox account is a real broker account and cannot be reset from Countersign. Switch to your paper account to reset demo data."})
     admin = BrokerAdmin()
     # Broker orders go first, then the app rows that authorize them, so the monitor never sees a live order whose
     # countersignature was already deleted.
@@ -1449,7 +1575,7 @@ def _public_status_now() -> dict:
         "attacks_blocked": sum(int((sb or {}).get("run_blocked", 0)) for _, sb in runs),
         "last_attack_run_at": iso(max((st for st, _ in runs), default=None)),
         "audit_events": int(audit_n),
-        "market": {"mode": "replay", "nifty": nifty},
+        "market": {"mode": "live" if settings().gateway021_enabled else "replay", "nifty": nifty},
         "generated_at": iso(datetime.now(UTC)),
     }
 
@@ -1468,7 +1594,8 @@ def public_status():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "db": True, "valkey": events.ping(), "holds_write_key": bool(settings().broker_write_key)}
+    # holds_021_credentials is always False: the 021 UCC, password and token exist only in the gateway021 process.
+    return {"ok": True, "db": True, "valkey": events.ping(), "holds_write_key": bool(settings().broker_write_key), "holds_021_credentials": False, "gateway021_enabled": settings().gateway021_enabled}
 
 
 def main() -> None:
