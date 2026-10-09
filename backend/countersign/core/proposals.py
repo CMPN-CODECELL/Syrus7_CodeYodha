@@ -315,6 +315,33 @@ def create_rebalance_plan(
     return _generated_plan(s, draft, user_text=user_text, account=account, user_id=user_id, engine=engine, conversation_id=conversation_id, origin=origin, kind="REBALANCE")
 
 
+def _duplicate_mandate(s: Session, user_id: str, account_id: str, mandate: CanonicalMandate):
+    """An ACTIVE instruction with the same condition and action would fire twice: BLOCK and keep the existing one. One
+    still awaiting a countersignature only WARNs (it may be an abandoned draft)."""
+    from countersign.core.verifier import Issue
+
+    want = (mandate.predicate.model_dump(), mandate.template.model_dump(mode="json") if mandate.template else None)
+    rows = s.execute(
+        select(StandingMandate).where(
+            StandingMandate.user_id == user_id,
+            StandingMandate.account_id == account_id,
+            StandingMandate.instrument_id == mandate.instrument.instrument_id,
+            StandingMandate.kind == mandate.kind,
+            StandingMandate.state.in_(["ACTIVE", "PENDING_APPROVAL"]),
+        )
+    ).scalars().all()
+    def key(t: dict | None) -> tuple:
+        t = t or {}
+        return t.get("side"), t.get("quantity"), t.get("limit_price_paise"), t.get("product")
+
+    for r in sorted(rows, key=lambda r: r.state != "ACTIVE"):
+        if r.predicate == want[0] and (r.template is None) == (want[1] is None) and (want[1] is None or key(r.template) == key(want[1])):
+            if r.state == "ACTIVE":
+                return Issue(code="DUPLICATE_MANDATE", severity="BLOCK", message=f"An identical standing instruction is already active ({describe_predicate(mandate)}). Keep the existing one: arming a second copy would make it fire twice.")
+            return Issue(code="DUPLICATE_MANDATE", severity="WARN", message="An identical standing instruction is already waiting for your countersignature. Countersign only one of them, or both would fire.")
+    return None
+
+
 def create_mandate(
     s: Session,
     mi: MandateIntent,
@@ -330,6 +357,8 @@ def create_mandate(
     mandate, br, m_issues = build_mandate(s, mi, facts, account, engine=engine)
     if mandate is None:
         return Outcome(clarify=br.clarify or ("I could not build that standing instruction.", []))
+    if (dup := _duplicate_mandate(s, user_id, account.account_id, mandate)) is not None:
+        m_issues = [dup, *m_issues]
     steps_view = []
     if mandate.template is not None:
         t_issues, preview = verify_order(s, mandate.template, account, skip_session=True)

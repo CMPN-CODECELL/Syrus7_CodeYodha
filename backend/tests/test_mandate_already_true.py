@@ -1,7 +1,7 @@
 """A standing instruction whose condition is already true when drafted is never armed silently: the reply states the
 live price and offers complete sentences (an order now, or a trigger on the far side of the price) that parse back."""
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from countersign.core import proposals
 from countersign.core.db import session_scope
@@ -108,3 +108,20 @@ def test_order_now_rounds_an_off_tick_live_price_onto_the_tick_grid():
     q, (now_opt, _) = _draft(f"If Reliance drops below {rupees(off * 3)}, buy 10").clarify
     limit = int(parse(now_opt).order.limit_price * 100)
     assert limit % t == 0 and off <= limit < off + t
+
+
+
+def test_identical_active_alert_blocks_a_second_copy():
+    text_ = "Tell me when any holding falls 3% in a day"
+    first = _draft(text_)
+    assert first.proposal is not None
+    with session_scope() as s:
+        m = s.execute(select(StandingMandate).where(StandingMandate.proposal_id == first.proposal.id)).scalar_one()
+        m.state = "ACTIVE"
+    try:
+        second = _draft(text_)
+        codes = {i["code"]: i["severity"] for i in second.proposal.issues}
+        assert codes.get("DUPLICATE_MANDATE") == "BLOCK" and second.proposal.status == "BLOCKED"
+    finally:
+        with session_scope() as s:
+            s.execute(text("UPDATE mandates SET state='CANCELLED' WHERE user_id=:u AND state IN ('ACTIVE','PENDING_APPROVAL')"), {"u": user_id()})
