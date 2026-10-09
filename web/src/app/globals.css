@@ -1,0 +1,370 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+  Countersign design tokens.
+  Dark-first trading terminal. Surfaces are near-black blue-grey, never pure black.
+  Semantic colors: profit / loss / warning / danger / info, plus two authority accents:
+  --ai (violet, what the model may do) and --human (emerald-teal, what only you may do).
+*/
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-heading: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  /* Editorial serif for landing and auth headlines; --font-display is set by lib/fonts.ts. */
+  --font-serif: var(--font-display), ui-serif, Georgia, serif;
+
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-hairline: var(--hairline);
+  --color-hairline-strong: var(--hairline-strong);
+  --color-subtle: var(--subtle);
+
+  --color-profit: var(--profit);
+  --color-loss: var(--loss);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --color-ai: var(--ai);
+  --color-human: var(--human);
+  --color-success: var(--profit);
+
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+  --radius-3xl: 20px;
+  --radius-4xl: 24px;
+
+  --animate-flash-up-0: flash-up-0 600ms ease-out;
+  --animate-flash-up-1: flash-up-1 600ms ease-out;
+  --animate-flash-down-0: flash-down-0 600ms ease-out;
+  --animate-flash-down-1: flash-down-1 600ms ease-out;
+  --animate-pulse-ring: pulse-ring 1.8s ease-out infinite;
+}
+
+/* Light theme */
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.985 0.003 260);
+  --foreground: oklch(0.22 0.02 262);
+  --surface-1: oklch(1 0 0);
+  --surface-2: oklch(0.975 0.004 260);
+  --surface-3: oklch(0.955 0.006 260);
+  --hairline: oklch(0.25 0.03 262 / 9%);
+  --hairline-strong: oklch(0.25 0.03 262 / 16%);
+  --subtle: oklch(0.6 0.015 262);
+
+  --card: var(--surface-1);
+  --card-foreground: var(--foreground);
+  --popover: oklch(1 0 0);
+  --popover-foreground: var(--foreground);
+  --primary: oklch(0.24 0.02 262);
+  --primary-foreground: oklch(0.98 0.003 260);
+  --secondary: oklch(0.955 0.006 260);
+  --secondary-foreground: oklch(0.24 0.02 262);
+  --muted: oklch(0.955 0.006 260);
+  --muted-foreground: oklch(0.5 0.018 262);
+  --accent: oklch(0.945 0.008 260);
+  --accent-foreground: oklch(0.22 0.02 262);
+  --destructive: oklch(0.56 0.2 25);
+  --border: var(--hairline);
+  --input: oklch(0.25 0.03 262 / 14%);
+  --ring: oklch(0.55 0.12 175);
+
+  --profit: oklch(0.56 0.14 155);
+  --loss: oklch(0.56 0.19 25);
+  --warning: oklch(0.66 0.14 70);
+  --danger: oklch(0.56 0.2 25);
+  --info: oklch(0.56 0.14 250);
+  --ai: oklch(0.52 0.18 292);
+  --human: oklch(0.55 0.12 172);
+
+  --chart-1: var(--human);
+  --chart-2: var(--ai);
+  --chart-3: var(--info);
+  --chart-4: var(--warning);
+  --chart-5: var(--loss);
+  --sidebar: var(--surface-1);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--human);
+  --sidebar-primary-foreground: oklch(0.98 0 0);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--foreground);
+  --sidebar-border: var(--hairline);
+  --sidebar-ring: var(--ring);
+}
+
+/* Dark theme (default) */
+.dark {
+  --background: oklch(0.16 0.01 260);
+  --foreground: oklch(0.95 0.006 260);
+  --surface-1: oklch(0.185 0.012 260);
+  --surface-2: oklch(0.21 0.013 260);
+  --surface-3: oklch(0.24 0.015 260);
+  --hairline: oklch(1 0 0 / 7%);
+  --hairline-strong: oklch(1 0 0 / 13%);
+  --subtle: oklch(0.55 0.015 260);
+
+  --card: var(--surface-1);
+  --card-foreground: var(--foreground);
+  --popover: oklch(0.2 0.013 260);
+  --popover-foreground: var(--foreground);
+  --primary: oklch(0.93 0.008 260);
+  --primary-foreground: oklch(0.18 0.012 260);
+  --secondary: oklch(0.24 0.014 260);
+  --secondary-foreground: var(--foreground);
+  --muted: oklch(0.23 0.013 260);
+  --muted-foreground: oklch(0.7 0.014 260);
+  --accent: oklch(0.25 0.015 260);
+  --accent-foreground: var(--foreground);
+  --destructive: oklch(0.66 0.2 25);
+  --border: var(--hairline);
+  --input: oklch(1 0 0 / 11%);
+  --ring: oklch(0.72 0.12 172);
+
+  --profit: oklch(0.77 0.16 155);
+  --loss: oklch(0.69 0.19 24);
+  --warning: oklch(0.82 0.14 78);
+  --danger: oklch(0.66 0.21 25);
+  --info: oklch(0.74 0.12 245);
+  --ai: oklch(0.72 0.15 292);
+  --human: oklch(0.79 0.13 168);
+
+  --sidebar: var(--surface-1);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--human);
+  --sidebar-primary-foreground: oklch(0.18 0.01 260);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--foreground);
+  --sidebar-border: var(--hairline);
+  --sidebar-ring: var(--ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+    color-scheme: dark;
+    -webkit-tap-highlight-color: transparent;
+  }
+  html:not(.dark) {
+    color-scheme: light;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "ss01", "cv11";
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: color-mix(in oklch, var(--human) 30%, transparent);
+  }
+}
+
+@layer utilities {
+  /* Numbers are always tabular and slashed-zero-free for alignment. */
+  .num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+    letter-spacing: -0.01em;
+  }
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+  .unit {
+    color: var(--subtle);
+    font-weight: 400;
+  }
+  .hairline {
+    border: 1px solid var(--hairline);
+  }
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+  }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--hairline-strong) transparent;
+  }
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .pb-safe {
+    padding-bottom: max(env(safe-area-inset-bottom), 0px);
+  }
+  .pt-safe {
+    padding-top: env(safe-area-inset-top);
+  }
+  .grid-bg {
+    background-image:
+      linear-gradient(var(--hairline) 1px, transparent 1px),
+      linear-gradient(90deg, var(--hairline) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+}
+
+/* Price flash. Two keyframe copies per direction so a new tick restarts the
+   animation by swapping the name, without remounting the cell. */
+@keyframes flash-up-0 {
+  0% { background-color: color-mix(in oklch, var(--profit) 28%, transparent); color: var(--profit); }
+  100% { background-color: transparent; }
+}
+@keyframes flash-up-1 {
+  0% { background-color: color-mix(in oklch, var(--profit) 28%, transparent); color: var(--profit); }
+  100% { background-color: transparent; }
+}
+@keyframes flash-down-0 {
+  0% { background-color: color-mix(in oklch, var(--loss) 28%, transparent); color: var(--loss); }
+  100% { background-color: transparent; }
+}
+@keyframes flash-down-1 {
+  0% { background-color: color-mix(in oklch, var(--loss) 28%, transparent); color: var(--loss); }
+  100% { background-color: transparent; }
+}
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 color-mix(in oklch, currentColor 45%, transparent); }
+  70% { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* NumberFlow inherits tabular digits from its parent. */
+number-flow-react {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Touch devices: every interactive control gets at least a 44 px target. */
+@media (pointer: coarse) {
+  [data-slot="button"],
+  [data-slot="input-group-button"],
+  [data-slot="select-trigger"],
+  [data-slot="tabs-trigger"],
+  [role="tab"] {
+    min-height: 44px;
+  }
+  [data-slot="button"]:has(> svg:only-child) {
+    min-width: 44px;
+  }
+}
+
+/* Auth pages: large, calm form fields (44 px tall) that read well in both themes. */
+@layer components {
+  .auth-input {
+    height: 2.75rem;
+    width: 100%;
+    min-width: 0;
+    border-radius: 10px;
+    border: 1px solid var(--hairline-strong);
+    background: color-mix(in srgb, var(--surface-2) 72%, transparent);
+    padding: 0 0.875rem;
+    font-size: 15px;
+    color: var(--foreground);
+    outline: none;
+    transition:
+      border-color 150ms,
+      box-shadow 150ms,
+      background-color 150ms;
+  }
+  .auth-input::placeholder {
+    color: var(--subtle);
+  }
+  .auth-input:hover {
+    border-color: color-mix(in oklch, var(--foreground) 22%, transparent);
+  }
+  .auth-input:focus-visible {
+    outline: none;
+    border-color: var(--human);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--human) 22%, transparent);
+  }
+  .auth-input[aria-invalid="true"] {
+    border-color: var(--danger);
+  }
+  .auth-input[aria-invalid="true"]:focus-visible {
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--danger) 22%, transparent);
+  }
+  .auth-input:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+}
+
+/* Auth backdrop: a slow light travelling along the signature ribbon. */
+.auth-spark {
+  stroke-dasharray: 36 964;
+  animation: auth-spark 9s linear infinite;
+}
+@keyframes auth-spark {
+  from {
+    stroke-dashoffset: 1000;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .auth-spark {
+    display: none;
+  }
+}
