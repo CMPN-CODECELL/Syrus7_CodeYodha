@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { ChartCandlestick, Grid3x3, List } from "lucide-react";
-import { ReplayBadge } from "@/components/shell/status-indicators";
+import { MarketSourceBadge, useMarketSource } from "@/components/shell/status-indicators";
 import { LiveChange, LivePrice } from "@/components/ui/live-price";
 import { PageContainer, PageHeader, Panel } from "@/components/ui/panel";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -105,13 +105,14 @@ function OptionChainPanel() {
 }
 
 export function MarketView() {
+  const source = useMarketSource();
   return (
     <PageContainer wide>
       <PageHeader
         icon={ChartCandlestick}
         title="Market"
-        description="Live ticks stream over one shared connection. Prices flash on every tick; stale data is struck through."
-        actions={<ReplayBadge />}
+        description={`${source.title}. Ticks arrive over one shared connection; prices flash on every tick and stale data is struck through.`}
+        actions={<MarketSourceBadge />}
       />
       <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
         <Panel title="Watchlist" icon={List} className="lg:sticky lg:top-0 lg:self-start" bodyClassName="max-h-[70dvh] overflow-y-auto scrollbar-thin">

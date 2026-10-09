@@ -24,19 +24,55 @@ import type { ProposalStatus } from "@/lib/types";
 import { NAV } from "./nav";
 import { useSignOut } from "./use-sign-out";
 
+export interface PromptLevel {
+  level: "L1" | "L2" | "L3" | "L4";
+  title: string;
+  hint: string;
+  /** read: answered from the read-only gateway. draft: becomes a proposal that waits for your countersignature. */
+  mode: "read" | "draft";
+  items: string[];
+}
+
+/** The official 021-01 examples, by level. */
+export const PROMPT_LEVELS: PromptLevel[] = [
+  {
+    level: "L1",
+    title: "Ask",
+    hint: "Read only: your account and the market",
+    mode: "read",
+    items: [
+      "What's my P&L today?",
+      "Which positions are down more than 5%?",
+      "What did I pay on average for INFY?",
+      "Show NIFTY options near the money for this expiry",
+    ],
+  },
+  {
+    level: "L2",
+    title: "Place, modify, cancel",
+    hint: "Drafted exactly, sent only after you countersign",
+    mode: "draft",
+    items: ["Buy 10 Reliance at market", "Sell half my TCS", "Move my stop-loss on HDFC Bank up to 1640"],
+  },
+  {
+    level: "L3",
+    title: "Standing instructions",
+    hint: "Watched against live prices, fire once",
+    mode: "draft",
+    items: ["If Reliance drops below 2800, buy 10", "Tell me when any holding falls 3% in a day"],
+  },
+  {
+    level: "L4",
+    title: "Plans",
+    hint: "Several orders, one signature, each result reported",
+    mode: "draft",
+    items: ["Exit all my losing intraday positions", "Rebalance so no single stock is more than 20% of my portfolio"],
+  },
+];
+
 export const SUGGESTED_PROMPTS = {
-  read: [
-    "What is my P&L today?",
-    "Which positions are down more than 5%?",
-    "What is my average purchase price for Reliance?",
-    "Show NIFTY options near the money",
-  ],
-  propose: [
-    "Buy 10 RELIANCE at 2800",
-    "Alert me if TATAMOTORS falls more than 5%",
-    "Sell 20 INFY and buy 5 TCS",
-    "Buy 100 TATAMOTORS if price falls below 900",
-  ],
+  read: PROMPT_LEVELS.filter((l) => l.mode === "read").flatMap((l) => l.items),
+  propose: PROMPT_LEVELS.filter((l) => l.mode === "draft").flatMap((l) => l.items),
 };
 
 /** Global Cmd/Ctrl+K palette: navigation, copilot prompts and demo actions. */
@@ -99,40 +135,25 @@ export function CommandPalette() {
           ))}
         </CommandGroup>
         <CommandSeparator />
-        <CommandGroup heading="Ask the copilot (read only)">
-          {SUGGESTED_PROMPTS.read.map((p) => (
-            <CommandItem
-              key={p}
-              value={`ask ${p}`}
-              onSelect={() =>
-                run(() => {
-                  router.push("/copilot");
-                  requestComposer(p, { send: true });
-                })
-              }
-            >
-              <MessageSquare className="text-ai" />
-              {p}
-            </CommandItem>
-          ))}
-        </CommandGroup>
-        <CommandGroup heading="Draft for countersignature">
-          {SUGGESTED_PROMPTS.propose.map((p) => (
-            <CommandItem
-              key={p}
-              value={`draft ${p}`}
-              onSelect={() =>
-                run(() => {
-                  router.push("/copilot");
-                  requestComposer(p, { send: true });
-                })
-              }
-            >
-              <PenLine className="text-human" />
-              {p}
-            </CommandItem>
-          ))}
-        </CommandGroup>
+        {PROMPT_LEVELS.map((lvl) => (
+          <CommandGroup key={lvl.level} heading={`${lvl.level} · ${lvl.title}${lvl.mode === "read" ? " (read only)" : " (drafted for countersignature)"}`}>
+            {lvl.items.map((p) => (
+              <CommandItem
+                key={p}
+                value={`${lvl.mode === "read" ? "ask" : "draft"} ${lvl.level} ${p}`}
+                onSelect={() =>
+                  run(() => {
+                    router.push("/copilot");
+                    requestComposer(p, { send: true });
+                  })
+                }
+              >
+                {lvl.mode === "read" ? <MessageSquare className="text-ai" /> : <PenLine className="text-human" />}
+                {p}
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        ))}
         <CommandSeparator />
         <CommandGroup heading="Demo">
           <CommandItem value="show blocked proposal misread 100 1000" onSelect={() => run(() => void showProposal("BLOCKED", "Here is the most recent proposal the verifier blocked:"))}>

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { PriceChart } from "@/components/market/price-chart";
 import { Watchlist } from "@/components/market/watchlist";
 import { OutcomeFeed } from "@/components/outcomes/outcome-feed";
+import { MarketSourceBadge } from "@/components/shell/status-indicators";
 import { Kpi } from "@/components/ui/kpi";
 import { LivePrice } from "@/components/ui/live-price";
 import { ErrorState, SkeletonRows } from "@/components/ui/states";
@@ -75,8 +76,9 @@ function MarketTab() {
   return (
     <div className="flex flex-col">
       <div className="border-b border-hairline p-3">
-        <div className="mb-1 flex items-baseline justify-between">
+        <div className="mb-1 flex items-center justify-between gap-2">
           <span className="text-sm font-semibold">{symbol}</span>
+          <MarketSourceBadge className="mr-auto h-5 px-2 text-[10px]" />
           <LivePrice instrumentId={id} className="text-sm font-semibold" />
         </div>
         <PriceChart key={symbol} symbol={symbol} instrumentId={id} height={180} />

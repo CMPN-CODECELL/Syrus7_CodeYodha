@@ -6,7 +6,7 @@ import { Message, MessageContent, MessageResponse } from "@/components/ai-elemen
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { CardRenderer } from "@/components/cards/cards";
 import { engineLabel } from "@/components/approval/approval-card";
-import { SUGGESTED_PROMPTS } from "@/components/shell/command-palette";
+import { PROMPT_LEVELS } from "@/components/shell/command-palette";
 import { Chip } from "@/components/ui/chip";
 import { time } from "@/lib/format";
 import { useChatStore, type ChatMessage, type ChatPart, type ToolActivity } from "@/lib/store";
@@ -142,61 +142,61 @@ export function MessageItem({ m, isLast }: { m: ChatMessage; isLast: boolean }) 
   );
 }
 
+// Index of each level's first prompt, for a staggered entrance across all groups.
+const PROMPT_OFFSETS = PROMPT_LEVELS.map((_, i) => PROMPT_LEVELS.slice(0, i).reduce((a, l) => a + l.items.length, 0));
+
 export function SuggestedPrompts() {
   const send = useChatStore((s) => s.send);
   const streaming = useChatStore((s) => s.streaming);
   const reduce = useReducedMotion();
-  const groups = [
-    {
-      title: "Ask (read only)",
-      hint: "The copilot reads your account and the market",
-      icon: MessageSquare,
-      tone: "text-ai",
-      ring: "hover:ring-ai/45",
-      items: SUGGESTED_PROMPTS.read,
-    },
-    {
-      title: "Draft for your countersignature",
-      hint: "Nothing executes until you sign",
-      icon: PenLine,
-      tone: "text-human",
-      ring: "hover:ring-human/45",
-      items: SUGGESTED_PROMPTS.propose,
-    },
-  ];
   return (
-    <div className="grid w-full gap-4 md:grid-cols-2">
-      {groups.map((g, gi) => (
-        <div key={g.title} className="space-y-2">
-          <div className="flex items-center gap-2">
-            <g.icon className={cn("size-3.5 shrink-0", g.tone)} />
-            <span className="shrink-0 text-xs font-semibold">{g.title}</span>
-            <span className="hidden truncate text-[11px] text-subtle sm:inline">{g.hint}</span>
-          </div>
-          <div className="grid gap-1.5">
-            {g.items.map((p, i) => (
-              <motion.button
-                key={p}
-                type="button"
-                disabled={streaming}
-                initial={reduce ? false : { opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: 0.05 * (gi * 4 + i), duration: 0.2 }}
-                onClick={() => void send(p)}
+    <div className="grid w-full gap-x-4 gap-y-5 md:grid-cols-2">
+      {PROMPT_LEVELS.map((g, gi) => {
+        const read = g.mode === "read";
+        const Icon = read ? MessageSquare : PenLine;
+        return (
+          <div key={g.level} className="space-y-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <span
                 className={cn(
-                  "group flex min-h-11 items-center justify-between gap-3 rounded-lg bg-surface-1 px-3.5 text-left text-[13.5px] ring-1 ring-hairline transition-colors disabled:opacity-50",
-                  g.ring,
+                  "num inline-flex h-5 shrink-0 items-center rounded px-1.5 text-[10.5px] font-semibold ring-1 ring-inset",
+                  read ? "bg-ai/10 text-ai ring-ai/30" : "bg-human/10 text-human ring-human/30",
                 )}
               >
-                <span>{p}</span>
-                <span className="text-subtle opacity-0 transition-opacity group-hover:opacity-100" aria-hidden>
-                  Enter
-                </span>
-              </motion.button>
-            ))}
+                {g.level}
+              </span>
+              <Icon className={cn("size-3.5 shrink-0", read ? "text-ai" : "text-human")} aria-hidden />
+              <span className="shrink-0 text-xs font-semibold">{g.title}</span>
+              <span className="hidden truncate text-[11px] text-subtle sm:inline">{g.hint}</span>
+            </div>
+            <div className="grid gap-1.5">
+              {g.items.map((p, i) => {
+                const delay = 0.04 * (PROMPT_OFFSETS[gi] + i);
+                return (
+                  <motion.button
+                    key={p}
+                    type="button"
+                    disabled={streaming}
+                    initial={reduce ? false : { opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay, duration: 0.2 }}
+                    onClick={() => void send(p)}
+                    className={cn(
+                      "group flex min-h-11 items-center justify-between gap-3 rounded-lg bg-surface-1 px-3.5 text-left text-[13.5px] ring-1 ring-hairline transition-colors disabled:opacity-50",
+                      read ? "hover:ring-ai/45" : "hover:ring-human/45",
+                    )}
+                  >
+                    <span>{p}</span>
+                    <span className="text-subtle opacity-0 transition-opacity group-hover:opacity-100" aria-hidden>
+                      Enter
+                    </span>
+                  </motion.button>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
