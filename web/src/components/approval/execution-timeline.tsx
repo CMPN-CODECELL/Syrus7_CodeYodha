@@ -3,7 +3,8 @@
 import { motion, useReducedMotion } from "motion/react";
 import { Check, Circle, CircleDashed, X } from "lucide-react";
 import { qty, price, shortHash, time } from "@/lib/format";
-import type { Proposal, ProposalStep } from "@/lib/types";
+import { useBrokerKindFor } from "@/lib/queries";
+import type { BrokerKind, ExecutionOutboxRow, Proposal, ProposalStep } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type ItemState = "done" | "active" | "pending" | "failed" | "warn";
@@ -16,11 +17,42 @@ interface Item {
   at?: string | null;
 }
 
-const EXECUTED: Proposal["status"][] = ["APPROVED", "EXECUTING", "COMPLETED", "PARTIALLY_COMPLETED", "FAILED", "ACTIVE"];
+const EXECUTED: Proposal["status"][] = ["APPROVED", "EXECUTING", "COMPLETED", "PARTIALLY_COMPLETED", "FAILED", "ACTIVE", "NEEDS_REVIEW"];
 
-function fillItem(step: ProposalStep | undefined): Item {
+/** How the executor identifies an order at this broker: a client tag (paper broker) or the order's details (021). */
+type Matching = "tag" | "details" | "unknown";
+
+function matchingFor(kind: BrokerKind | null, ob: ExecutionOutboxRow | undefined): Matching {
+  if (kind === "021") return "details";
+  if (kind === "paper" || ob?.client_order_id) return "tag";
+  return "unknown";
+}
+
+/** Step outcome as one of the two states that need special wording, from the step or its outbox row. */
+export function deliveryState(step: ProposalStep | undefined, ob: ExecutionOutboxRow | undefined): "NOT_PLACED" | "AMBIGUOUS" | null {
+  const states = [step?.state, ob?.state];
+  if (states.includes("NOT_PLACED")) return "NOT_PLACED";
+  if (states.includes("NEEDS_REVIEW") || states.includes("AMBIGUOUS")) return "AMBIGUOUS";
+  return null;
+}
+
+export function notPlacedText(kind: BrokerKind | null): string {
+  return kind === "021"
+    ? "The broker returned 503 and the order is not in the 021 order book. Nothing was sent twice. Countersign again to resend."
+    : "The broker did not accept the order and it is not in the broker's order book. Nothing was sent twice. Countersign again to resend.";
+}
+
+export function ambiguousText(kind: BrokerKind | null): string {
+  return kind === "021"
+    ? "021 did not confirm this order and the executor could not match it in the 021 order book. Countersign did not resend it. Check the order book before you place it again."
+    : "The broker did not confirm this order and the executor could not find it in the order book. Countersign did not resend it. Check the order book before you place it again.";
+}
+
+function fillItem(step: ProposalStep | undefined, delivery: "NOT_PLACED" | "AMBIGUOUS" | null): Item {
   const st = step?.state;
   const q = step?.canonical.quantity ?? 0;
+  if (delivery === "NOT_PLACED") return { key: "fill", title: "Nothing filled", state: "pending", detail: "No order exists at the broker, so nothing can fill." };
+  if (delivery === "AMBIGUOUS") return { key: "fill", title: "Fill unknown", state: "pending", detail: "Shown here once the order is matched in the broker's order book." };
   if (st === "FILLED")
     return {
       key: "fill",
@@ -43,7 +75,7 @@ function fillItem(step: ProposalStep | undefined): Item {
   return { key: "fill", title: "Fill", state: "pending" };
 }
 
-export function buildTimeline(p: Proposal, stepNo = 1): Item[] {
+export function buildTimeline(p: Proposal, stepNo = 1, kind: BrokerKind | null = null): Item[] {
   const a = p.approval;
   const ex = p.execution;
   const step = p.steps.find((s) => s.step_no === stepNo) ?? p.steps[0];
@@ -51,6 +83,49 @@ export function buildTimeline(p: Proposal, stepNo = 1): Item[] {
   const verified = a?.status === "VERIFIED";
   const halted = ex?.status === "HALTED" || (ex?.status === "REJECTED" && !ob);
   const methodText = a ? (a.method === "webauthn" ? "Passkey assertion" : a.method === "pin" ? "App PIN" : "Authenticator code") : "";
+  const matching = matchingFor(kind, ob);
+  const delivery = deliveryState(step, ob);
+  const brokerOrderId = ob?.broker_order_id ?? step?.broker_order_id ?? null;
+
+  const sendItem: Item = {
+    key: "send",
+    title: matching === "tag" ? "Sent to broker with unique tag" : matching === "details" ? "Sent to the 021 sandbox" : "Sent to broker",
+    state: ob ? "done" : ex?.status === "RUNNING" ? "active" : halted ? "failed" : "pending",
+    detail: ob ? (
+      matching === "tag" ? (
+        <>
+          Client tag <span className="num">{ob.client_order_id}</span>, attempt {ob.attempts}
+        </>
+      ) : (
+        <>
+          Recorded in the outbox before sending, attempt {ob.attempts}.
+          {matching === "details" ? " 021 has no client order tag, so the executor matches the order's details in the 021 order book." : ""}
+        </>
+      )
+    ) : undefined,
+  };
+
+  let ackItem: Item;
+  if (delivery === "NOT_PLACED") {
+    ackItem = { key: "ack", title: "Not placed", state: "failed", detail: step?.reason || notPlacedText(kind) };
+  } else if (delivery === "AMBIGUOUS") {
+    ackItem = { key: "ack", title: "Needs your review", state: "warn", detail: step?.reason || ambiguousText(kind) };
+  } else {
+    const found = matching === "details" ? "matched it in the 021 order book" : "found the order by its tag";
+    ackItem = {
+      key: "ack",
+      title: ob?.reconciled ? "Reconciled, not retried" : "Broker acknowledged",
+      state: brokerOrderId ? "done" : ob && ob.state === "FAILED" ? "failed" : ob ? "active" : "pending",
+      detail: brokerOrderId ? (
+        <>
+          Broker order <span className="num">{brokerOrderId}</span>
+          {ob?.reconciled ? `. The acknowledgement was lost; the executor ${found} and did not resend it.` : ""}
+        </>
+      ) : ob?.reconciled ? (
+        matching === "details" ? "Reconciled against the 021 order book: no matching order. Not retried automatically." : "Reconciled by tag: no order at the broker. Not retried automatically."
+      ) : undefined,
+    };
+  }
 
   return [
     {
@@ -78,30 +153,9 @@ export function buildTimeline(p: Proposal, stepNo = 1): Item[] {
       state: halted ? "failed" : ex && ex.status !== "PENDING" && ex.status !== "HELD" ? "done" : p.status === "APPROVED" || ex ? "active" : "pending",
       detail: halted ? (ex?.reason ?? "Executor refused the capability.") : "Recomputed the RFC 8785 hash and checked expiry and the live price against your signed band.",
     },
-    {
-      key: "send",
-      title: "Sent to broker with unique tag",
-      state: ob ? "done" : ex?.status === "RUNNING" ? "active" : halted ? "failed" : "pending",
-      detail: ob ? (
-        <>
-          Client tag <span className="num">{ob.client_order_id}</span>, attempt {ob.attempts}
-        </>
-      ) : undefined,
-    },
-    {
-      key: "ack",
-      title: ob?.reconciled ? "Reconciled, not retried" : "Broker acknowledged",
-      state: ob?.broker_order_id ? "done" : ob && ob.state === "FAILED" ? "failed" : ob ? "active" : "pending",
-      detail: ob?.broker_order_id ? (
-        <>
-          Broker order <span className="num">{ob.broker_order_id}</span>
-          {ob.reconciled ? ". The acknowledgement was lost; the executor found the order by its tag and did not resend it." : ""}
-        </>
-      ) : ob?.reconciled ? (
-        "Reconciled by tag: no order at the broker. Not retried automatically."
-      ) : undefined,
-    },
-    fillItem(step),
+    sendItem,
+    ackItem,
+    fillItem(step, delivery),
   ];
 }
 
@@ -114,7 +168,9 @@ const ICON: Record<ItemState, React.ReactNode> = {
 };
 
 export function ExecutionTimeline({ proposal, stepNo, className }: { proposal: Proposal; stepNo?: number; className?: string }) {
-  const items = buildTimeline(proposal, stepNo);
+  const step = proposal.steps.find((s) => s.step_no === stepNo) ?? proposal.steps[0];
+  const kind = useBrokerKindFor(step?.canonical.account_id);
+  const items = buildTimeline(proposal, stepNo, kind);
   const reduce = useReducedMotion();
   return (
     <ol className={cn("relative space-y-0", className)} aria-label="Execution timeline">

@@ -8,7 +8,7 @@ import { EmptyState, ErrorState, SkeletonRows } from "@/components/ui/states";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { pct, time } from "@/lib/format";
 import type { OrdersFilter } from "@/lib/api";
-import { useAccountSummary, useHoldings, useOrders, usePositions } from "@/lib/queries";
+import { useAccountSummary, useActiveBroker, useHoldings, useOrders, usePositions } from "@/lib/queries";
 import { HoldingsTable, OrdersTable, PositionsTable } from "./tables";
 
 function KpiStrip() {
@@ -30,11 +30,16 @@ function KpiStrip() {
 function OrdersPanel() {
   const [filter, setFilter] = useState<OrdersFilter>("open");
   const orders = useOrders(filter);
+  const broker = useActiveBroker();
   return (
     <Panel
       title="Orders"
       icon={ListOrdered}
-      subtitle="Every order carries the executor's unique client tag"
+      subtitle={
+        broker.kind === "021"
+          ? "021 has no client order tag: Countersign matches its orders by their details, and marks orders placed elsewhere"
+          : "Every order carries the executor's unique client tag"
+      }
       actions={
         <Tabs value={filter} onValueChange={(v) => setFilter(v as OrdersFilter)}>
           <TabsList className="h-7">

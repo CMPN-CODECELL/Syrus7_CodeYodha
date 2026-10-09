@@ -1,12 +1,12 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { TrendingDown } from "lucide-react";
+import { BookCopy, TrendingDown } from "lucide-react";
 import { Chip, LookChip, SideBadge } from "@/components/ui/chip";
 import { InstrumentCell, SortTh, TableShell, Td, Th } from "@/components/ui/data-table";
 import { flashClass } from "@/components/ui/live-price";
 import { inr, pct, pnl, price, qty, time, toneClass } from "@/lib/format";
-import { ORDER_STATUS } from "@/lib/status";
+import { orderLook } from "@/lib/status";
 import { useTick, useTickMeta } from "@/lib/store";
 import type { BrokerOrder, Holding, Position } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -180,12 +180,13 @@ export function OrdersTable({ data, maxHeight, compact }: { data: BrokerOrder[];
           <Th align="right">Qty</Th>
           <Th align="right">Price</Th>
           <Th>Status</Th>
-          {!compact && <Th>Client tag</Th>}
+          {!compact && <Th>Client tag · order id</Th>}
         </tr>
       </thead>
       <tbody>
         {data.map((o) => {
-          const look = ORDER_STATUS[o.status];
+          const look = orderLook(o.status);
+          const external = o.origin === "external";
           const px = o.avg_fill_price_paise ?? o.limit_price_paise ?? o.protection_price_paise;
           return (
             <tr key={o.broker_order_id} className="align-top hover:bg-foreground/[0.03]">
@@ -216,7 +217,19 @@ export function OrdersTable({ data, maxHeight, compact }: { data: BrokerOrder[];
                 {o.avg_fill_price_paise && <div className="text-[10px] text-subtle">avg fill</div>}
               </Td>
               <Td className="whitespace-normal">
-                <LookChip look={look} size="xs" />
+                <div className="flex flex-wrap items-center gap-1">
+                  <LookChip look={look} size="xs" />
+                  {external && (
+                    <Chip
+                      tone="muted"
+                      size="xs"
+                      icon={BookCopy}
+                      title="Placed outside Countersign, for example in the 021 web app. Shown for information only: Countersign did not place it."
+                    >
+                      outside Countersign
+                    </Chip>
+                  )}
+                </div>
                 {o.reject_reason && <p className="mt-1 max-w-[280px] text-[11px] leading-snug text-loss">{o.reject_reason}</p>}
               </Td>
               {!compact && (

@@ -13,6 +13,7 @@ import { Hash } from "@/components/ui/hash";
 import { SideBadge } from "@/components/ui/chip";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, IS_MOCK } from "@/lib/api";
+import { displayAccountId } from "@/lib/broker";
 import { ApiError, APPROVAL_ERROR_COPY, errorMessage, isApiError } from "@/lib/errors";
 import { chunkHash } from "@/lib/format";
 import { MOCK_TOTP } from "@/lib/mock";
@@ -266,7 +267,7 @@ function CountersignFlow({ proposal, onClose }: { proposal: Proposal; onClose: (
                 <span>
                   {proposal.kind === "PLAN" ? "Plan" : "Order"} ID <span className="num text-foreground">{proposal.short_hash}</span>
                 </span>
-                <span>Account {proposal.steps[0]?.canonical.account_id ?? me?.account_id}</span>
+                <span>Account {displayAccountId(proposal.steps[0]?.canonical.account_id ?? me?.account_id)}</span>
                 {proposal.kind === "PLAN" && <span className="text-human">One signature binds all {proposal.steps.length} steps</span>}
               </div>
             </div>

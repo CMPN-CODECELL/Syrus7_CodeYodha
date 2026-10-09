@@ -1,14 +1,40 @@
 "use client";
 
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { Radio } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { ArrowUpRight, Radio } from "lucide-react";
 import { TONE_CHIP } from "@/components/ui/chip";
 import { EmptyState } from "@/components/ui/states";
 import { ago, time } from "@/lib/format";
 import { OUTCOME_KIND, SEVERITY_TONE } from "@/lib/status";
+import { useChatStore } from "@/lib/store";
 import type { OutcomeEvent } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useNow } from "@/hooks/use-now";
+
+/** For an order that was not placed or needs review: open its card in the Copilot, where it can be drafted again. */
+function OpenOrderAction({ o }: { o: OutcomeEvent }) {
+  const router = useRouter();
+  const inject = useChatStore((s) => s.inject);
+  const pid = o.proposal_id;
+  if (!pid || (o.kind !== "ORDER_NOT_PLACED" && o.kind !== "ORDER_NEEDS_REVIEW")) return null;
+  const notPlaced = o.kind === "ORDER_NOT_PLACED";
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        router.push("/copilot");
+        inject(
+          [{ type: "card", card: { kind: "proposal", proposal_id: pid, status: notPlaced ? "FAILED" : "NEEDS_REVIEW" }, key: "" }],
+          notPlaced ? "This order was not placed. You can draft it again from its card; nothing is sent until you countersign." : "This order needs your review:",
+        );
+      }}
+      className="inline-flex items-center gap-0.5 font-semibold tracking-wide text-foreground/80 uppercase underline-offset-2 hover:text-foreground hover:underline"
+    >
+      Open the order <ArrowUpRight className="size-3" aria-hidden />
+    </button>
+  );
+}
 
 export function OutcomeItem({ o, now, dense }: { o: OutcomeEvent; now: number; dense?: boolean }) {
   const k = OUTCOME_KIND[o.kind] ?? OUTCOME_KIND.ORDER_ACCEPTED;
@@ -32,6 +58,9 @@ export function OutcomeItem({ o, now, dense }: { o: OutcomeEvent; now: number; d
           <span className="font-semibold tracking-wide uppercase">{k.label}</span>
           {o.broker_order_id && <span className="num">· {o.broker_order_id}</span>}
           {o.proposal_id && <span className="num">· {o.proposal_id.slice(0, 14)}</span>}
+          <span className="ml-auto">
+            <OpenOrderAction o={o} />
+          </span>
         </div>
       </div>
     </div>

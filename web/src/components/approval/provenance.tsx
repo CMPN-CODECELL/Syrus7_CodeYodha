@@ -3,12 +3,13 @@
 import { TriangleAlert } from "lucide-react";
 import { TONE_CHIP } from "@/components/ui/chip";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { maskUccsIn } from "@/lib/broker";
 import { SOURCE } from "@/lib/status";
 import type { FieldRow, Proposal, Source } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 export function ProvenanceChip({ source, compact }: { source: Source; compact?: boolean }) {
-  const s = SOURCE[source];
+  const s = SOURCE[source] ?? SOURCE.system_default;
   return (
     <Tooltip>
       <TooltipTrigger
@@ -68,9 +69,9 @@ export function FieldRows({
                   "num min-w-0 flex-1 truncate text-[13px] font-semibold",
                   f.flagged && (severe ? "text-danger" : "text-warning"),
                 )}
-                title={f.display}
+                title={maskUccsIn(f.display)}
               >
-                {f.display}
+                {maskUccsIn(f.display)}
               </dd>
               <ProvenanceChip source={f.source} />
             </div>

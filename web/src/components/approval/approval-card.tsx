@@ -6,17 +6,18 @@ import { Chip, LookChip, SideBadge } from "@/components/ui/chip";
 import { Hash } from "@/components/ui/hash";
 import { Eyebrow } from "@/components/ui/panel";
 import { time } from "@/lib/format";
-import { PROPOSAL_STATUS } from "@/lib/status";
+import { proposalLook } from "@/lib/status";
 import type { Proposal } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { ExecutionTimeline } from "./execution-timeline";
+import { DeliveryNotice } from "./delivery-notice";
+import { deliveryState, ExecutionTimeline } from "./execution-timeline";
 import { IssuesList } from "./issues";
 import { PriceBandMeter } from "./price-band";
 import { ProposalActions } from "./proposal-actions";
 import { FieldRows } from "./provenance";
 import { WalletPreview } from "./wallet-preview";
 
-const POST_APPROVAL: Proposal["status"][] = ["APPROVED", "EXECUTING", "COMPLETED", "PARTIALLY_COMPLETED", "FAILED"];
+const POST_APPROVAL: Proposal["status"][] = ["APPROVED", "EXECUTING", "COMPLETED", "PARTIALLY_COMPLETED", "FAILED", "NEEDS_REVIEW"];
 
 /**
  * Readable engine label. Accepts "deterministic", "compromised-model", "provider:model" and
@@ -63,10 +64,12 @@ export function ApprovalCard({ proposal, className }: { proposal: Proposal; clas
   const step = proposal.steps[0];
   if (!step) return null;
   const c = step.canonical;
-  const look = PROPOSAL_STATUS[proposal.status];
+  const look = proposalLook(proposal.status);
   const blocked = proposal.status === "BLOCKED";
   const awaiting = proposal.status === "AWAITING_APPROVAL";
   const executed = POST_APPROVAL.includes(proposal.status);
+  const delivery = deliveryState(step, proposal.execution?.outbox.find((o) => o.step_no === step.step_no));
+  const review = proposal.status === "NEEDS_REVIEW" || delivery === "AMBIGUOUS";
 
   return (
     <motion.article
@@ -90,9 +93,11 @@ export function ApprovalCard({ proposal, className }: { proposal: Proposal; clas
               ? "bg-[linear-gradient(90deg,var(--ai),var(--human)_45%,var(--human))]"
               : proposal.status === "COMPLETED"
                 ? "bg-profit"
-                : proposal.status === "FAILED"
+                : proposal.status === "FAILED" || delivery === "NOT_PLACED"
                   ? "bg-danger"
-                  : "bg-info",
+                  : review || proposal.status === "PARTIALLY_COMPLETED"
+                    ? "bg-warning"
+                    : "bg-info",
         )}
         aria-hidden
       />
@@ -160,6 +165,7 @@ export function ApprovalCard({ proposal, className }: { proposal: Proposal; clas
             {proposal.execution && <span className="num text-[11px] text-subtle">job {proposal.execution.job_id}</span>}
           </div>
           <ExecutionTimeline proposal={proposal} />
+          {delivery && <DeliveryNotice proposal={proposal} step={step} className="mt-3" />}
         </div>
       )}
 
