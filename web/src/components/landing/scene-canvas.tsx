@@ -74,6 +74,8 @@ export function SceneCanvas({
       raf = 0;
     };
     const sync = () => {
+      // A hidden tab may come back with the mouse elsewhere: let the scene spring back until it moves.
+      if (document.hidden) pointer.inside = false;
       const run = onScreen && !document.hidden && !reduced;
       if (run && !raf) {
         last = 0;
@@ -107,17 +109,46 @@ export function SceneCanvas({
     document.addEventListener("visibilitychange", sync);
 
     const host = pointerTarget ? (canvas.closest<HTMLElement>("[data-scene-host]") ?? canvas.parentElement) : null;
-    const onMove = (e: PointerEvent) => {
+    // Last known mouse position anywhere on the page (false while the pointer is touch or out of the window).
+    let clientX = 0;
+    let clientY = 0;
+    let mouse = false;
+    const place = () => {
       const rect = canvas.getBoundingClientRect();
-      pointer.x = e.clientX - rect.left;
-      pointer.y = e.clientY - rect.top;
-      pointer.inside = e.pointerType === "mouse";
+      pointer.x = clientX - rect.left;
+      pointer.y = clientY - rect.top;
+    };
+    const track = (e: PointerEvent) => {
+      clientX = e.clientX;
+      clientY = e.clientY;
+      mouse = e.pointerType === "mouse";
+    };
+    const onOut = (e: PointerEvent) => {
+      if (!e.relatedTarget) mouse = false;
+    };
+    const onMove = (e: PointerEvent) => {
+      track(e);
+      place();
+      pointer.inside = mouse;
     };
     const onLeave = () => {
       pointer.inside = false;
     };
+    // Scrolling under a resting mouse fires no pointermove: check what the mouse rests on now, so the
+    // scene lets go when the host scrolls away and picks the pointer up again when it scrolls back.
+    const onScroll = () => {
+      if (!host || !mouse) return;
+      const el = document.elementFromPoint(clientX, clientY);
+      pointer.inside = !!el && host.contains(el);
+      if (pointer.inside) place();
+    };
     host?.addEventListener("pointermove", onMove, { passive: true });
     host?.addEventListener("pointerleave", onLeave);
+    if (host) {
+      window.addEventListener("pointermove", track, { passive: true });
+      window.addEventListener("pointerout", onOut, { passive: true });
+      window.addEventListener("scroll", onScroll, { passive: true });
+    }
 
     return () => {
       stop();
@@ -126,6 +157,9 @@ export function SceneCanvas({
       document.removeEventListener("visibilitychange", sync);
       host?.removeEventListener("pointermove", onMove);
       host?.removeEventListener("pointerleave", onLeave);
+      window.removeEventListener("pointermove", track);
+      window.removeEventListener("pointerout", onOut);
+      window.removeEventListener("scroll", onScroll);
     };
   }, [factory, dark, reduced, staticTime, pointerTarget]);
 
