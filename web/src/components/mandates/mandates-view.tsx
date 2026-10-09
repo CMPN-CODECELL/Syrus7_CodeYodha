@@ -71,7 +71,7 @@ export function MandatesView() {
           <EmptyState
             icon={Crosshair}
             title={filter === "live" ? "No active standing instructions" : filter === "review" ? "Nothing needs review" : "No mandate history yet"}
-            description='Ask the copilot something like "If Reliance drops below 2800, buy 10" or "Tell me when any holding falls 3% in a day", then countersign to arm it.'
+            description='Ask the copilot something like "If Reliance drops below 2800, buy 10" or "Tell me when any holding falls 3% in a day". If the condition is already true at the live price, the copilot asks you first; otherwise countersign to arm it.'
           />
         </div>
       ) : (
