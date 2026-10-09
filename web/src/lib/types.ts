@@ -130,6 +130,9 @@ export interface BrokerAccountStatus {
   last_error: string | null;
 }
 
+/** Who linked a 021 account: the trader in the Security Center ("self") or the operator's allow-list. Null for paper. */
+export type BrokerLinkedBy = "self" | "operator" | null;
+
 /** GET /api/broker/accounts row. For a 021 account the id is the UCC, which the UI always masks. */
 export interface BrokerAccount {
   account_id: string;
@@ -137,6 +140,42 @@ export interface BrokerAccount {
   label: string;
   active: boolean;
   status: BrokerAccountStatus;
+  /** The id as it may be shown ("ABCD***E" for a 021 UCC). Optional so an older backend's rows still render. */
+  masked_id?: string;
+  linked_by?: BrokerLinkedBy;
+}
+
+/** GET /api/broker/status: whether the 021 gateway runs on this installation, plus its health. */
+export interface BrokerStatus {
+  active_kind: BrokerKind;
+  gateway021_enabled: boolean;
+  gateway021: ({ up: boolean } & Record<string, unknown>) | null;
+}
+
+/** GET /api/broker/021/link-key: the 021 gateway's RSA public key and a single-use nonce for one link attempt. */
+export interface Link021Key {
+  /** Standard base64 of the SPKI DER RSA-2048 public key. */
+  public_key: string;
+  alg: "RSA-OAEP-256" | string;
+  nonce: string;
+  user_id: string;
+  expires_at: ISO;
+  max_plaintext_bytes: number;
+}
+
+/** POST /api/broker/021/link: the trader's own 021 account is linked and is now the active account. */
+export interface Link021Result {
+  masked_ucc: string;
+  account: BrokerAccount;
+  accounts: BrokerAccount[];
+  active_account_id: string;
+}
+
+/** DELETE /api/broker/021/link: the stored 021 password is deleted and the trader is back on paper. */
+export interface Unlink021Result {
+  ok: true;
+  active_account_id: string;
+  accounts: BrokerAccount[];
 }
 
 export interface OptionLeg {

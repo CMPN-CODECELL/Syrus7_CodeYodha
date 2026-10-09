@@ -12,6 +12,7 @@ import type {
   BrokerAccount,
   BrokerFault,
   BrokerKind,
+  BrokerStatus,
   FeedScenario,
   Proposal,
   ProposalKind,
@@ -45,6 +46,7 @@ export const qk = {
   scoreboard: ["attack-lab", "scoreboard"] as const,
   demo: ["demo", "state"] as const,
   brokerAccounts: ["broker", "accounts"] as const,
+  brokerStatus: ["broker", "status"] as const,
 };
 
 export const ACTIVE_STATUSES: ProposalStatus[] = ["APPROVED", "EXECUTING"];
@@ -191,9 +193,10 @@ export function useDemoMode(): boolean {
  * GET /api/broker/accounts. Resolves to null when this server has no such endpoint yet (404), so callers can fall
  * back to the paper account from /api/me instead of showing an error.
  */
-export function useBrokerAccounts() {
+export function useBrokerAccounts(enabled = true) {
   return useQuery({
     queryKey: qk.brokerAccounts,
+    enabled,
     queryFn: async (): Promise<BrokerAccount[] | null> => {
       try {
         return await api.brokerAccounts();
@@ -243,6 +246,27 @@ export function useActiveBroker(): ActiveBroker {
   };
 }
 
+/**
+ * GET /api/broker/status. Resolves to null when this server has no such endpoint (404), which the UI treats as
+ * "the 021 gateway is not running here".
+ */
+export function useBrokerStatus(enabled = true) {
+  return useQuery({
+    queryKey: qk.brokerStatus,
+    queryFn: async (): Promise<BrokerStatus | null> => {
+      try {
+        return await api.brokerStatus();
+      } catch (e) {
+        if (isApiError(e) && (e.status === 404 || e.status === 405)) return null;
+        throw e;
+      }
+    },
+    retry: (count, err) => !(isApiError(err) && err.status < 500) && count < 1,
+    staleTime: 30_000,
+    enabled,
+  });
+}
+
 /** Broker kind for an account id (a proposal's canonical account), or null when unknown. */
 export function useBrokerKindFor(accountId: string | null | undefined): BrokerKind | null {
   const q = useBrokerAccounts();
@@ -263,6 +287,19 @@ export function useSetActiveBroker() {
     mutationFn: (account_id: string) => api.setActiveBroker(account_id),
     onSuccess: () => {
       // Portfolio, orders, market data source and status all depend on the active account.
+      void qc.invalidateQueries();
+    },
+  });
+}
+
+/** Disconnects the trader's own 021 account: the API deletes the stored password and switches back to paper. */
+export function useUnlink021() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (account_id: string) => api.unlink021(account_id),
+    onSuccess: (res) => {
+      if (Array.isArray(res?.accounts)) qc.setQueryData(qk.brokerAccounts, res.accounts);
+      // Like switching accounts: portfolio, orders, prices and /api/me all follow the active account.
       void qc.invalidateQueries();
     },
   });

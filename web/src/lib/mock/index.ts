@@ -3,12 +3,14 @@
 import type { CountersignApi } from "../api";
 import { EMAIL_RE, PASSWORD_MAX, PASSWORD_MIN, weakPinReason } from "../auth";
 import { ApiError } from "../errors";
-import type { HistoryPoint, Me, OptionChain, PublicStatus, Quote } from "../types";
+import { link021Codec } from "../link021";
+import type { HistoryPoint, Link021Key, Me, OptionChain, PublicStatus, Quote, StepUpMethod } from "../types";
 import { chatHistory, simulateChat } from "./chat";
 import { MOCK_TOTP, engine, sleep } from "./engine";
 import {
   EXPIRIES,
   INSTRUMENTS,
+  MOCK_UCC,
   OPTION_POSITION,
   SCENARIOS,
   WATCHLIST,
@@ -52,6 +54,33 @@ function me(): Me {
     onboarding: { pin_set: s.hasPin, passkeys, totp: s.hasTotp, complete: s.hasPin },
     demo_mode: true,
   };
+}
+
+// Self-service 021 linking. The mock plays the 021 gateway: its own RSA-OAEP key pair (in memory only), single-use
+// nonces, and a fresh step-up before linking or unlinking. It never stores or checks a real 021 password.
+let mockLinkKeys: Promise<CryptoKeyPair> | null = null;
+const linkNonces = new Map<string, number>();
+let stepUpUntil = 0;
+
+function linkKeys(): Promise<CryptoKeyPair> {
+  mockLinkKeys ??= crypto.subtle.generateKey(
+    { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["encrypt", "decrypt"],
+  );
+  return mockLinkKeys;
+}
+
+function requireFreshStepUp() {
+  const s = engine.s;
+  const methods: StepUpMethod[] = [
+    ...(s.devices.some((d) => !d.revoked && !d.is_virtual) ? (["webauthn"] as const) : []),
+    ...(s.hasPin ? (["pin"] as const) : []),
+    ...(s.hasTotp ? (["totp"] as const) : []),
+  ];
+  if (methods.length && Date.now() > stepUpUntil) {
+    throw new ApiError(403, "STEP_UP_REQUIRED", "Confirm it is you with a method you already have, then try again.", undefined, { methods });
+  }
 }
 
 // Failed sign-ins per email: 5 free attempts, then 30 s doubling up to 15 min (mirrors the API).
@@ -287,7 +316,8 @@ export const mockApi: CountersignApi = {
     authed(() => {
       if (method === "pin" && pin !== engine.s.pin) throw new ApiError(401, "PIN_INVALID", "Wrong PIN. Try again.");
       if (method === "totp" && code !== MOCK_TOTP) throw new ApiError(401, "TOTP_INVALID", "That authenticator code is not valid.");
-      return { ok: true as const, method, expires_at: new Date(Date.now() + 10 * 60_000).toISOString() };
+      stepUpUntil = Date.now() + 10 * 60_000;
+      return { ok: true as const, method, expires_at: new Date(stepUpUntil).toISOString() };
     }),
   totpSetup: () =>
     authed(() => ({
@@ -345,6 +375,52 @@ export const mockApi: CountersignApi = {
     }),
   brokerAccounts: () => authed(() => engine.brokerAccounts(), [60, 140]),
   setActiveBroker: (account_id) => authed(() => engine.setActiveBroker(account_id), [250, 450]),
+  brokerStatus: () =>
+    authed(() => ({ active_kind: engine.s.activeBroker, gateway021_enabled: true, gateway021: { up: true } }), [50, 120]),
+  link021Key: () =>
+    authed(async (): Promise<Link021Key> => {
+      const pair = await linkKeys();
+      const spki = new Uint8Array(await crypto.subtle.exportKey("spki", pair.publicKey));
+      const nonce = `lnk_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+      const expires = Date.now() + 5 * 60_000;
+      linkNonces.set(nonce, expires);
+      return {
+        public_key: link021Codec.bytesToBase64(spki),
+        alg: "RSA-OAEP-256",
+        nonce,
+        user_id: me().user.id,
+        expires_at: new Date(expires).toISOString(),
+        max_plaintext_bytes: 190,
+      };
+    }, [80, 180]),
+  link021: (ciphertext) =>
+    authed(async () => {
+      requireFreshStepUp();
+      let payload: Record<string, unknown>;
+      try {
+        const plain = await crypto.subtle.decrypt({ name: "RSA-OAEP" }, (await linkKeys()).privateKey, link021Codec.base64ToBytes(ciphertext));
+        payload = JSON.parse(new TextDecoder().decode(plain)) as Record<string, unknown>;
+      } catch {
+        throw new ApiError(422, "INVALID_INPUT", "The encrypted credentials could not be read. Fetch a new key and try again.");
+      }
+      const nonce = typeof payload.nonce === "string" ? payload.nonce : "";
+      const expires = linkNonces.get(nonce);
+      linkNonces.delete(nonce);
+      if (!expires || expires < Date.now() || payload.user_id !== me().user.id) {
+        throw new ApiError(400, "LINK_NONCE_INVALID", "This link key expired or was already used. Fetch a new one and try again.");
+      }
+      const ucc = typeof payload.ucc === "string" ? payload.ucc : "";
+      if (!/^[A-Z0-9]{4,16}$/.test(ucc)) throw new ApiError(422, "UCC_INVALID", "A 021 UCC has 4 to 16 letters and digits.");
+      if (typeof payload.password !== "string" || !payload.password) throw new ApiError(422, "INVALID_INPUT", "Enter your 021 password.");
+      if (payload.password === "wrong") throw new ApiError(401, "LINK_WRONG_CREDENTIALS", "Wrong UCC or password");
+      if (ucc === MOCK_UCC) throw new ApiError(409, "UCC_LINKED_ELSEWHERE", "This 021 account is already linked to another Countersign user.");
+      return engine.linkSelf021(ucc);
+    }, [700, 1200]),
+  unlink021: (account_id) =>
+    authed(() => {
+      requireFreshStepUp();
+      return engine.unlinkSelf021(account_id);
+    }, [250, 450]),
 
   instruments: (q) =>
     authed(() => {

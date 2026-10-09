@@ -25,6 +25,7 @@ import type {
   BrokerAccount,
   BrokerFault,
   BrokerOrder,
+  BrokerStatus,
   ChatEvent,
   ChatHistoryItem,
   ChatRequest,
@@ -34,6 +35,8 @@ import type {
   HistoryPoint,
   Holding,
   InstrumentHandle,
+  Link021Key,
+  Link021Result,
   LoginBody,
   MandateView,
   Me,
@@ -55,6 +58,7 @@ import type {
   SignupBody,
   StepUpBody,
   StepUpResult,
+  Unlink021Result,
 } from "./types";
 
 export { ApiError, errorMessage, isApiError } from "./errors";
@@ -105,6 +109,11 @@ export interface CountersignApi {
   // Broker accounts: which broker this trader's orders go to. Never carries a broker token.
   brokerAccounts(): Promise<BrokerAccount[]>;
   setActiveBroker(account_id: string): Promise<unknown>;
+  brokerStatus(): Promise<BrokerStatus>;
+  /** Self-service 021 linking: the browser encrypts the UCC and password for the gateway; the API relays ciphertext only. */
+  link021Key(): Promise<Link021Key>;
+  link021(ciphertext: string): Promise<Link021Result>;
+  unlink021(account_id: string): Promise<Unlink021Result>;
   // Market
   instruments(q: string): Promise<InstrumentHandle[]>;
   quote(symbol: string): Promise<Quote>;
@@ -289,6 +298,10 @@ export const realApi: CountersignApi = {
   orders: (status) => request("GET", `/api/account/orders${qs({ status })}`),
   brokerAccounts: () => request("GET", "/api/broker/accounts"),
   setActiveBroker: (account_id) => request("POST", "/api/broker/active", { account_id }),
+  brokerStatus: () => request("GET", "/api/broker/status"),
+  link021Key: () => request("GET", "/api/broker/021/link-key"),
+  link021: (ciphertext) => request("POST", "/api/broker/021/link", { ciphertext }),
+  unlink021: (account_id) => request("DELETE", "/api/broker/021/link", { account_id }),
 
   instruments: (q) => request("GET", `/api/market/instruments${qs({ q })}`),
   quote: (symbol) => request("GET", `/api/market/quote/${enc(symbol)}`),

@@ -133,6 +133,15 @@ interface State {
   pendingDeviceLabel: string;
   /** Which linked broker account is active: the simulated 021 Sandbox or the paper account. */
   activeBroker: BrokerKind;
+  /** The trader's own 021 UCC, linked in the Security Center (self-service). Never a password. */
+  selfUcc?: string | null;
+  /** Which 021 account is active when activeBroker is "021": the self-linked UCC, or null for the operator's. */
+  active021?: string | null;
+}
+
+/** Same shape as the API's mask: "ABCD***E". */
+export function maskUcc021(ucc: string): string {
+  return ucc.length > 5 ? `${ucc.slice(0, 4)}***${ucc.slice(-1)}` : "***";
 }
 
 const LOGIN_KEY = "cs_mock_logged_in";
@@ -417,6 +426,8 @@ function initialState(): State {
     runs: [],
     pendingDeviceLabel: "This device",
     activeBroker: "021",
+    selfUcc: null,
+    active021: null,
   };
   s.proposals = seedProposals(s);
   s.runs = [makeRun(SCENARIOS.map((sc) => sc.id), Date.now() - 2 * HOUR, s.scoreboard)];
@@ -720,36 +731,90 @@ class MockEngine {
 
   /** Account id that new proposals are drafted for: the mock UCC or the user's paper account. */
   activeAccountId(): string {
-    return this.s.activeBroker === "021" ? MOCK_UCC : (findUser(this.s.userId)?.account_id ?? ACCOUNT_ID);
+    if (this.s.activeBroker !== "021") return findUser(this.s.userId)?.account_id ?? ACCOUNT_ID;
+    return this.s.selfUcc && this.s.active021 === this.s.selfUcc ? this.s.selfUcc : MOCK_UCC;
+  }
+
+  /** True for any simulated 021 account id (the operator's or the trader's own). */
+  is021Account(accountId: string): boolean {
+    return accountId === MOCK_UCC || (!!this.s.selfUcc && accountId === this.s.selfUcc);
   }
 
   brokerAccounts(): BrokerAccount[] {
     const paperId = findUser(this.s.userId)?.account_id ?? ACCOUNT_ID;
-    return [
+    const active = this.activeAccountId();
+    const rows: BrokerAccount[] = [
       {
         account_id: MOCK_UCC,
         kind: "021",
         label: "021 Sandbox",
-        active: this.s.activeBroker === "021",
+        active: active === MOCK_UCC,
         status: { connected: true, token_expires_at: next5amIst(), market_data: "live", last_error: null },
-      },
-      {
-        account_id: paperId,
-        kind: "paper",
-        label: "Paper trading account",
-        active: this.s.activeBroker !== "021",
-        status: { connected: true, token_expires_at: null, market_data: "replay", last_error: null },
+        masked_id: maskUcc021(MOCK_UCC),
+        linked_by: "operator",
       },
     ];
+    if (this.s.selfUcc) {
+      rows.push({
+        account_id: this.s.selfUcc,
+        kind: "021",
+        label: `021 account ${maskUcc021(this.s.selfUcc)}`,
+        active: active === this.s.selfUcc,
+        status: { connected: true, token_expires_at: next5amIst(), market_data: "live", last_error: null },
+        masked_id: maskUcc021(this.s.selfUcc),
+        linked_by: "self",
+      });
+    }
+    rows.push({
+      account_id: paperId,
+      kind: "paper",
+      label: "Paper trading account",
+      active: this.s.activeBroker !== "021",
+      status: { connected: true, token_expires_at: null, market_data: "replay", last_error: null },
+      masked_id: paperId,
+      linked_by: null,
+    });
+    return rows;
   }
 
   setActiveBroker(accountId: string) {
     const acc = this.brokerAccounts().find((a) => a.account_id === accountId);
     if (!acc) throw new ApiError(404, "ACCOUNT_NOT_FOUND", "That broker account is not linked to your Countersign account.");
     this.s.activeBroker = acc.kind;
+    this.s.active021 = acc.kind === "021" && acc.linked_by === "self" ? acc.account_id : null;
     this.audit(`user:${this.s.userId ?? "demo"}`, "BROKER_ACCOUNT_SWITCHED", "account", acc.kind);
     this.scheduleSave();
     return { ok: true as const, account_id: acc.account_id };
+  }
+
+  /** Self-service link of the trader's own 021 account; it becomes the active account. The mock keeps no password. */
+  linkSelf021(ucc: string) {
+    this.s.selfUcc = ucc;
+    this.s.activeBroker = "021";
+    this.s.active021 = ucc;
+    this.securityEvent("info", "ACCOUNT_LINKED_021", `Your own 021 account ${maskUcc021(ucc)} was connected.`, {});
+    this.audit(`user:${this.s.userId ?? "demo"}`, "ACCOUNT_LINKED_021", "account", maskUcc021(ucc));
+    this.scheduleSave();
+    const accounts = this.brokerAccounts();
+    return { masked_ucc: maskUcc021(ucc), account: accounts.find((a) => a.account_id === ucc)!, accounts, active_account_id: ucc };
+  }
+
+  /** Disconnects the self-linked 021 account and puts the trader back on paper. */
+  unlinkSelf021(accountId: string) {
+    if (accountId === MOCK_UCC) {
+      throw new ApiError(409, "LINK_OPERATOR_MANAGED", "The operator linked this 021 account, so it cannot be disconnected here.");
+    }
+    if (!this.s.selfUcc || accountId !== this.s.selfUcc) {
+      throw new ApiError(404, "ACCOUNT_NOT_FOUND", "You have no 021 account with that id.");
+    }
+    const masked = maskUcc021(this.s.selfUcc);
+    this.s.selfUcc = null;
+    this.s.active021 = null;
+    this.s.activeBroker = "paper";
+    this.securityEvent("info", "ACCOUNT_UNLINKED_021", `Your own 021 account ${masked} was disconnected and its stored password deleted.`, {});
+    this.audit(`user:${this.s.userId ?? "demo"}`, "ACCOUNT_UNLINKED_021", "account", masked);
+    this.scheduleSave();
+    return { ok: true as const, active_account_id: this.activeAccountId(), accounts: this.brokerAccounts() };
   }
 
   addProposal(p0: Proposal) {
@@ -981,7 +1046,7 @@ class MockEngine {
         results.push("SKIPPED");
         continue;
       }
-      const on021 = st.canonical.account_id === MOCK_UCC;
+      const on021 = this.is021Account(st.canonical.account_id);
       // 021 has no client order tag: the outbox id stays inside Countersign and is never sent to the broker.
       const tag = `CS-${p0.short_hash}-${st.step_no}`;
       this.setStep(id, st.step_no, { state: "SUBMITTED", client_order_id: on021 ? null : tag }, { client_order_id: tag, state: "SUBMITTED", attempts: 1 });

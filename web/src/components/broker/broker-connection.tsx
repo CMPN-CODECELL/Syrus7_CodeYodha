@@ -12,6 +12,7 @@ import { brokerName, displayAccountId } from "@/lib/broker";
 import { errorMessage } from "@/lib/errors";
 import { dateTime, until } from "@/lib/format";
 import { useActiveBroker, useSecurityStatus, useSetActiveBroker } from "@/lib/queries";
+import { Disconnect021, Link021Card, maskedOf } from "./link-021";
 import type { Tone } from "@/lib/status";
 import type { BrokerAccount, BrokerKind, Me } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -69,6 +70,8 @@ function AccountCard({
   const Icon = KIND_ICON[a.kind] ?? FlaskConical;
   const label = safeLabel(a);
   const exp = a.status.token_expires_at;
+  // The trader's own 021 account (linked in this panel) can be disconnected here; operator-linked ones cannot.
+  const own021 = a.kind === "021" && a.linked_by === "self";
   return (
     <li className={cn("rounded-lg p-3 ring-1", a.active ? "bg-human/[0.05] ring-human/35" : "bg-surface-2/50 ring-hairline")}>
       <div className="flex flex-wrap items-start gap-3">
@@ -84,8 +87,13 @@ function AccountCard({
           <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px] font-semibold">
             {brokerName(a.kind)}
             <span className="num text-xs font-normal text-muted-foreground" title={a.kind === "021" ? "Your 021 UCC, masked" : "Paper account id"}>
-              {displayAccountId(a.account_id, a.kind)}
+              {own021 ? maskedOf(a) : displayAccountId(a.account_id, a.kind)}
             </span>
+            {own021 && (
+              <Chip tone="info" size="xs">
+                your account
+              </Chip>
+            )}
             {a.active && (
               <Chip tone="human" size="xs">
                 active
@@ -130,6 +138,12 @@ function AccountCard({
           <CircleAlert className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="min-w-0 break-words">{a.status.last_error}</span>
         </p>
+      )}
+
+      {own021 && !confirming && (
+        <div className="mt-3">
+          <Disconnect021 account={a} />
+        </div>
       )}
 
       {confirming && (
@@ -235,13 +249,14 @@ export function BrokerConnectionPanel({ me }: { me: Me }) {
               )}
             </ul>
           )}
+          <Link021Card />
           <div className="flex items-start gap-2 rounded-lg bg-surface-2/50 px-3 py-2.5 text-[11.5px] leading-relaxed text-muted-foreground ring-1 ring-hairline">
             <Info className="mt-0.5 size-3.5 shrink-0 text-info" aria-hidden />
             <p>
-              For the hackathon the operator links the 021 Sandbox account to an allow-list of owner emails; linking your own 021
-              account yourself is future scope. New accounts trade on the local paper broker, and the Attack Lab always runs on its own
-              paper sandboxes, never on a 021 account. The 021 access token stays on the server: your browser only sees when it
-              expires. Everything on 021 is virtual money on a simulated exchange.
+              You can connect your own 021 account above, and the operator can also link a 021 account to listed owner emails. New
+              accounts trade on the local paper broker, and the Attack Lab always runs on its own paper sandboxes, never on a 021
+              account. The 021 access token stays on the server: your browser only sees when it expires. Everything on 021 is virtual
+              money on a simulated exchange.
             </p>
           </div>
         </div>

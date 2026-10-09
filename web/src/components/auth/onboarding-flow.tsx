@@ -18,14 +18,15 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { needsStepUp, PinSlots, StepUpInline, TotpSetupInline, usePinChoice, useRegisterPasskey } from "@/components/approval/setup-inline";
+import { LINK021_TITLE, Link021Connected, Link021Form } from "@/components/broker/link-021";
 import { Button } from "@/components/ui/button";
 import { ErrorState } from "@/components/ui/states";
 import { api } from "@/lib/api";
 import { accountId, activePasskeys, DEFAULT_AFTER_SIGNIN, onboardingComplete, safeNext } from "@/lib/auth";
 import { errorMessage, isApiError } from "@/lib/errors";
-import { qk, useMe } from "@/lib/queries";
+import { qk, useBrokerAccounts, useBrokerStatus, useMe } from "@/lib/queries";
 import { useChatStore } from "@/lib/store";
 import type { Me } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -33,7 +34,7 @@ import { suggestDeviceLabel } from "@/lib/webauthn";
 import { usePasskeysSupported } from "@/hooks/use-passkeys-supported";
 import { AuthAlert, AuthCard } from "./auth-ui";
 
-type StepId = "pin" | "passkey" | "totp" | "done";
+type StepId = "pin" | "passkey" | "totp" | "link021" | "done";
 
 // The step in progress survives a reload of this tab, so a refresh after saving the PIN resumes the guided setup.
 const STEP_KEY = "cs_onboarding_step";
@@ -41,7 +42,7 @@ const STEP_KEY = "cs_onboarding_step";
 function savedStep(): StepId | null {
   try {
     const v = sessionStorage.getItem(STEP_KEY);
-    return v === "passkey" || v === "totp" || v === "done" ? v : null;
+    return v === "passkey" || v === "totp" || v === "link021" || v === "done" ? v : null;
   } catch {
     return null;
   }
@@ -61,14 +62,22 @@ function appTarget(next: string): string {
   return next === "/" ? DEFAULT_AFTER_SIGNIN : next;
 }
 
-const STEPS: { id: StepId; label: string; tag: string }[] = [
+type StepMeta = { id: StepId; label: string; tag: string };
+
+const ALL_STEPS: StepMeta[] = [
   { id: "pin", label: "App PIN", tag: "Required" },
   { id: "passkey", label: "Passkey", tag: "Recommended" },
   { id: "totp", label: "Authenticator", tag: "Optional" },
+  { id: "link021", label: "021 account", tag: "Optional" },
   { id: "done", label: "Done", tag: "" },
 ];
 
+// The 021 step only exists when the 021 gateway runs on this installation.
+const BASE_STEPS = ALL_STEPS.filter((s) => s.id !== "link021");
+const StepsContext = createContext<StepMeta[]>(BASE_STEPS);
+
 function Stepper({ current }: { current: StepId }) {
+  const STEPS = useContext(StepsContext);
   const idx = STEPS.findIndex((s) => s.id === current);
   return (
     <ol className="flex items-center gap-1.5" aria-label="Setup progress">
@@ -99,7 +108,8 @@ function Stepper({ current }: { current: StepId }) {
 
 function StepFrame({ step, title, description, children }: { step: StepId; title: string; description: ReactNode; children: ReactNode }) {
   const reduce = useReducedMotion();
-  const meta = STEPS.find((s) => s.id === step)!;
+  const STEPS = useContext(StepsContext);
+  const meta = STEPS.find((s) => s.id === step) ?? ALL_STEPS.find((s) => s.id === step)!;
   const n = STEPS.findIndex((s) => s.id === step) + 1;
   return (
     <motion.section
@@ -317,6 +327,36 @@ function TotpStep({ me, onDone }: { me: Me; onDone: () => void }) {
   );
 }
 
+function Link021Step({ onDone }: { onDone: () => void }) {
+  const [masked, setMasked] = useState<string | null>(null);
+  return (
+    <StepFrame
+      step="link021"
+      title={LINK021_TITLE}
+      description="Optional. Trade on your own 021 account instead of the paper broker. Enter your 021 client code (UCC) and 021 password. Every order still needs your countersignature. You can also do this later in the Security Center."
+    >
+      {masked ? (
+        <>
+          <Link021Connected masked={masked} />
+          <Button className={cn(primaryBtn, "w-full sm:w-auto")} onClick={() => onDone()} autoFocus>
+            Continue <ArrowRight aria-hidden />
+          </Button>
+        </>
+      ) : (
+        <Link021Form
+          variant="onboarding"
+          onLinked={(res) => setMasked(res.masked_ucc)}
+          secondary={
+            <Button type="button" variant="ghost" className="h-11 px-4 text-sm" onClick={() => onDone()}>
+              Skip for now
+            </Button>
+          }
+        />
+      )}
+    </StepFrame>
+  );
+}
+
 function SummaryRow({ icon: Icon, label, value, good }: { icon: LucideIcon; label: string; value: string; good: boolean }) {
   return (
     <li className="flex items-center gap-3 py-2.5">
@@ -411,6 +451,13 @@ export function OnboardingFlow() {
   const next = safeNext(params.get("next"));
   const router = useRouter();
   const me = useMe();
+  const brokerStatus = useBrokerStatus(me.isSuccess);
+  const brokerAccounts = useBrokerAccounts(me.isSuccess);
+  // Offer the 021 step only when the gateway runs and no operator-linked 021 account is already on this user.
+  const offer021 =
+    brokerStatus.data?.gateway021_enabled === true &&
+    !(brokerAccounts.data ?? []).some((a) => a.kind === "021" && a.linked_by !== "self");
+  const steps = offer021 ? ALL_STEPS : BASE_STEPS;
   // Decided once, from the first /api/me: a finished account sees "already set up" instead of the steps.
   const [start, setStart] = useState<"steps" | "already" | null>(null);
   const [step, setStep] = useState<StepId>("pin");
@@ -489,18 +536,23 @@ export function OnboardingFlow() {
     );
   }
 
+  // A resumed 021 step falls through to the summary once the gateway turns out to be off.
+  const shown: StepId = step === "link021" && !offer021 && !brokerStatus.isPending ? "done" : step;
   return (
-    <div className="w-full max-w-[560px] rounded-2xl border border-hairline-strong bg-surface-1/85 p-5 shadow-2xl shadow-black/10 backdrop-blur-xl sm:p-8 dark:shadow-black/40">
-      <SignedInAs me={data} />
-      <Stepper current={step} />
-      <div className="mt-6">
-        <AnimatePresence mode="wait" initial={false}>
-          {step === "pin" && <PinStep key="pin" onDone={() => go("passkey")} />}
-          {step === "passkey" && <PasskeyStep key="passkey" me={data} onDone={() => go("totp")} />}
-          {step === "totp" && <TotpStep key="totp" me={data} onDone={() => go("done")} />}
-          {step === "done" && <DoneStep key="done" me={data} next={next} />}
-        </AnimatePresence>
+    <StepsContext.Provider value={steps}>
+      <div className="w-full max-w-[560px] rounded-2xl border border-hairline-strong bg-surface-1/85 p-5 shadow-2xl shadow-black/10 backdrop-blur-xl sm:p-8 dark:shadow-black/40">
+        <SignedInAs me={data} />
+        <Stepper current={shown} />
+        <div className="mt-6">
+          <AnimatePresence mode="wait" initial={false}>
+            {shown === "pin" && <PinStep key="pin" onDone={() => go("passkey")} />}
+            {shown === "passkey" && <PasskeyStep key="passkey" me={data} onDone={() => go("totp")} />}
+            {shown === "totp" && <TotpStep key="totp" me={data} onDone={() => go(offer021 ? "link021" : "done")} />}
+            {shown === "link021" && <Link021Step key="link021" onDone={() => go("done")} />}
+            {shown === "done" && <DoneStep key="done" me={data} next={next} />}
+          </AnimatePresence>
+        </div>
       </div>
-    </div>
+    </StepsContext.Provider>
   );
 }

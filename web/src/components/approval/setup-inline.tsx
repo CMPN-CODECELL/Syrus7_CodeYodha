@@ -40,7 +40,18 @@ async function confirmWithPasskey() {
  * Re-confirm with an approval method you already have (passkey, app PIN or authenticator code) before adding or
  * replacing one. A password or a signed-in session alone cannot do that. On success `onVerified` retries the action.
  */
-export function StepUpInline({ error, onVerified, className }: { error?: unknown; onVerified: () => void; className?: string }) {
+export function StepUpInline({
+  error,
+  onVerified,
+  className,
+  description,
+}: {
+  error?: unknown;
+  onVerified: () => void;
+  className?: string;
+  /** Why the confirmation is needed; defaults to the copy for adding or replacing an approval method. */
+  description?: string;
+}) {
   const me = useMe().data;
   const fromError = isApiError(error) && Array.isArray(error.extra.methods) ? (error.extra.methods as StepUpMethod[]) : null;
   const methods = (fromError ?? [
@@ -67,8 +78,8 @@ export function StepUpInline({ error, onVerified, className }: { error?: unknown
         <div className="space-y-1">
           <p className="text-sm font-medium">Confirm it is you first</p>
           <p className="text-xs text-muted-foreground">
-            Adding or replacing a way to countersign needs one you already have. Being signed in is not enough. This confirms who you are;
-            it approves no trade.
+            {description ??
+              "Adding or replacing a way to countersign needs one you already have. Being signed in is not enough. This confirms who you are; it approves no trade."}
           </p>
         </div>
       </div>
