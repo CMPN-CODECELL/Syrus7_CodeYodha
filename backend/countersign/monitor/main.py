@@ -238,10 +238,10 @@ class Monitor:
 
         try:
             h = httpx.get("http://127.0.0.1:8000/api/health", timeout=2.0, verify=_tls()).json()
-            api_ok = h.get("holds_write_key") is False
-            checks.append({"name": "API / AI process holds no broker write key", "ok": api_ok, "detail": "The API process reports no write credential." if api_ok else "API process reports a write key!", "checked": 1})
+            api_ok = h.get("holds_write_key") is False and h.get("holds_021_credentials") is not True
+            checks.append({"name": "API / AI process holds no broker write key", "ok": api_ok, "detail": "The API process reports no write key and no 021 credential." if api_ok else "API process reports a write key or a 021 credential!", "checked": 1})
             if not api_ok:
-                self._violation("api-key", "CREDENTIAL_ZONE_VIOLATION", "The API process holds a broker write key.", {})
+                self._violation("api-key", "CREDENTIAL_ZONE_VIOLATION", "The API process holds a broker write key or a 021 credential.", {})
         except Exception:  # noqa: BLE001
             checks.append({"name": "API / AI process holds no broker write key", "ok": True, "detail": "API not reachable right now (it cannot trade either way).", "checked": 0})
 
