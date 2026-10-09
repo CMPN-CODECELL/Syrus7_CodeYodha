@@ -168,19 +168,33 @@ class Gateway:
         return order
 
     def _late_match(self, rows: list[dict], tags: dict[str, dict]) -> None:
-        late = store.late_candidates(self.account_id, self.cfg.late_match_window_s)
-        if not late:
+        if not store.late_candidates(self.account_id, self.cfg.late_match_window_s):
             return
-        unmapped = [r for r in rows if str(r.get("orderId")) not in tags]
+        # Under the placement lock: a placement that just got its orderId records it before this runs, so its order
+        # is never claimed for an older attempt. A busy lock only postpones the match to the next poll.
+        if not self._place_lock.acquire(timeout=0.5):
+            return
+        try:
+            self._late_match_locked(rows)
+        finally:
+            self._place_lock.release()
+
+    def _late_match_locked(self, rows: list[dict]) -> None:
+        late = store.late_candidates(self.account_id, self.cfg.late_match_window_s)
+        mapped = store.mapped_order_ids(self.account_id)
+        inflight = store.sending(self.account_id)
+        unmapped = [r for r in rows if str(r.get("orderId")) not in mapped]
         for att in late:
             fp = self._fp_fields(att["order_021"])
             hits = [r for r in unmapped if mapping.matches(r, fp, self._not_before(att))]
             if len(hits) == 1:
                 oid = str(hits[0].get("orderId"))
-                twins = [a for a in late if a is not att and mapping.matches(hits[0], self._fp_fields(a["order_021"]), self._not_before(a))]
+                twins = [a for a in [*late, *inflight] if a is not att and mapping.matches(hits[0], self._fp_fields(a["order_021"]), self._not_before(a))]
                 if twins:
-                    continue  # two unresolved placements could own it: never guess
-                store.update(att["tag"], state="REJECTED" if hits[0].get("status") == "Rejected" else "ACCEPTED", order_id=oid, note=f"Late: 021 showed this order after it was reported {att['state']}. It was not resent.")
+                    continue  # another unresolved or in-flight placement could own it: never guess
+                # 021 has no client tag, so this is the only order matching every field: the most likely match, not a
+                # proof (an identical order placed outside Countersign in the same minutes would look the same).
+                store.update(att["tag"], state="REJECTED" if hits[0].get("status") == "Rejected" else "ACCEPTED", order_id=oid, note=f"Late: 021 showed a matching order after this one was reported {att['state']} (the only order with the same instrument, side, quantity, price and product; 021 has no client tag). It was not resent.")
                 self._seen.pop(oid, None)  # republish it, now carrying its tag
                 unmapped = [r for r in unmapped if str(r.get("orderId")) != oid]
 
@@ -370,11 +384,12 @@ class Gateway:
             store.create(tag, self.account_id, fp, dict(body), o21)
             res = self.client.write("POST", "/orders", o21)
             store.update(tag, sent_at=res.sent_at or time.time(), http_status=res.status)
+            oid = str((res.data or {}).get("orderId") or "").strip() if res.kind == "ok" else ""
+            if oid:
+                store.update(tag, state="ACCEPTED", order_id=oid)  # inside the lock: the late matcher never sees it unmapped
         self.invalidate()
         if res.kind == "ok":
-            oid = str((res.data or {}).get("orderId") or "").strip()
             if oid:
-                store.update(tag, state="ACCEPTED", order_id=oid)
                 return self._accepted_order(tag, oid, o21)
             res.error = "021 answered success without an orderId."
         if res.kind == "not_sent":

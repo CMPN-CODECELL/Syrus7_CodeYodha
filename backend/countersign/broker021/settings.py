@@ -33,7 +33,7 @@ class GatewaySettings(BaseSettings):
     tick_median: int = 5  # publish the median of the last N updates per instrument (1 = raw); see marketdata.py
     market_ws: bool = True
     orders_ws: bool = True
-    test_faults: bool = False  # enables the drop-after-accept drill switch on /admin/faults (off by default)
+    test_faults: bool = False  # enables the two gateway drills on /admin/faults (fail_before_send, drop_after_accept); off by default (off by default)
     instruments_cache: str = str(REPO_ROOT / "backend" / ".cache" / "021_instruments.csv.gz")
 
     @property

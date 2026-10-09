@@ -7,7 +7,7 @@ Credential zones are enforced at process launch: each process receives only the 
   monitor  : AUDIT (read-all) key only
   feed     : no keys
   gateway021 (only when CS_021_UCC and CS_021_PASSWORD are set in .env): the 021 sandbox adapter. It verifies the
-             read / write / admin / audit keys like the paper broker and is the ONLY process that holds the 021 UCC,
+             read / write / admin / audit keys like the paper broker and is the ONLY process that loads the 021 UCC,
              password and access token (it reads them from .env itself; they are stripped from every other process).
 Usage:  uv run --project backend python scripts/dev.py [--no-web] [--no-docker] [--no-021]"""
 

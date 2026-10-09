@@ -142,6 +142,13 @@ def late_candidates(account_id: str, window_s: float) -> list[dict]:
         return [as_dict(a) for a in rows if a.note != NEVER_SENT]
 
 
+def sending(account_id: str) -> list[dict]:
+    """Placements still in flight (sent, answer not yet resolved)."""
+    with _sf()() as s:
+        rows = s.execute(select(Attempt).where(Attempt.account_id == account_id, Attempt.state == "SENDING")).scalars().all()
+        return [as_dict(a) for a in rows]
+
+
 def stale_sending(account_id: str, older_than_s: float) -> list[dict]:
     """Placements left SENDING by a crash of the gateway itself; they are reconciled on startup."""
     before = time.time() - older_than_s
