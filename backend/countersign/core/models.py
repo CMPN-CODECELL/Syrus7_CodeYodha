@@ -53,6 +53,7 @@ class User(Base):
     totp_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     totp_last_counter: Mapped[int | None] = mapped_column(BigInteger)
     is_lab_user: Mapped[bool] = mapped_column(Boolean, default=False)
+    active_account_id: Mapped[str | None] = mapped_column(String(32))  # the account this trader is acting on now
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
@@ -105,6 +106,17 @@ class Account(Base):
     label: Mapped[str] = mapped_column(String(64))
     segments: Mapped[list] = mapped_column(JSONB, default=list)
     trading_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    broker_kind: Mapped[str] = mapped_column(String(8), default="paper", server_default="paper")  # paper | 021
+    __table_args__ = (CheckConstraint("broker_kind in ('paper','021')", name="ck_account_broker_kind"),)
+
+
+class AccountMember(Base):
+    """Extra traders allowed to operate an account (the shared 021 sandbox account). The owner is accounts.user_id."""
+
+    __tablename__ = "account_members"
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
 
 
 class Instrument(Base):
@@ -130,6 +142,30 @@ class Instrument(Base):
     aliases: Mapped[list] = mapped_column(JSONB, default=list)
     flags: Mapped[list] = mapped_column(JSONB, default=list)
     source: Mapped[str] = mapped_column(String(32), default="seed")
+    token_021: Mapped[int | None] = mapped_column(Integer)  # 021 instrument token (NULL: not tradable on 021)
+    exchange_021: Mapped[str | None] = mapped_column(String(8))  # 021 response exchange name, e.g. NSECM
+
+
+class Instrument021(Base):
+    """Compact copy of the 021 instrument file (about 1,05,000 rows), loaded daily by the gateway so any process can
+    resolve symbols without a 021 credential. Prices are paise; expiry is 021's integer timestamp (Unix seconds)."""
+
+    __tablename__ = "instruments_021"
+    exchange: Mapped[str] = mapped_column(String(8), primary_key=True)
+    token: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(64), index=True)
+    instrument_type: Mapped[str] = mapped_column(String(8))
+    lot: Mapped[int] = mapped_column(Integer)
+    tick: Mapped[int] = mapped_column(Integer)
+    freeze: Mapped[int] = mapped_column(Integer)
+    lower_circuit: Mapped[int] = mapped_column(BigInteger)
+    upper_circuit: Mapped[int] = mapped_column(BigInteger)
+    expiry: Mapped[int] = mapped_column(BigInteger)
+    strike: Mapped[int] = mapped_column(BigInteger)
+    option_type: Mapped[str] = mapped_column(String(4))
+    isin: Mapped[str] = mapped_column(String(16))
+    underlying_token: Mapped[int] = mapped_column(Integer)
+    underlying_exchange: Mapped[str] = mapped_column(String(8))
 
 
 class MarketSnapshot(Base):
@@ -254,7 +290,8 @@ class PlanStep(Base):
     updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=func.now())
     __table_args__ = (
         CheckConstraint(
-            "state in ('PENDING','SUBMITTED','OPEN','PARTIALLY_FILLED','FILLED','REJECTED','CANCELLED','FAILED','SKIPPED','BLOCKED')",
+            "state in ('PENDING','SUBMITTED','OPEN','PARTIALLY_FILLED','FILLED','REJECTED','CANCELLED','FAILED','SKIPPED','BLOCKED',"
+            "'NOT_PLACED','NEEDS_REVIEW')",
             name="ck_step_state",
         ),
     )
@@ -340,7 +377,8 @@ class OutboxEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(TS, server_default=func.now(), onupdate=func.now())
     __table_args__ = (
         CheckConstraint(
-            "state in ('PREPARED','SENDING','ACKED','UNKNOWN','RECONCILED_FOUND','RECONCILED_ABSENT','REJECTED_BY_BROKER','FAILED')",
+            "state in ('PREPARED','SENDING','ACKED','UNKNOWN','RECONCILED_FOUND','RECONCILED_ABSENT','REJECTED_BY_BROKER','FAILED',"
+            "'NOT_PLACED','NEEDS_REVIEW')",
             name="ck_outbox_state",
         ),
         UniqueConstraint("capability_id", "step_no", name="uq_outbox_capability_step"),
@@ -470,6 +508,27 @@ MIGRATIONS = [
     ("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='sessions' AND column_name='step_up_at'", "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS step_up_at timestamptz"),
     ("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='sessions' AND column_name='step_up_method'", "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS step_up_method varchar(16)"),
     ("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='security_events' AND column_name='account_id'", "ALTER TABLE security_events ADD COLUMN IF NOT EXISTS account_id varchar(32)"),
+    # 021 integration: broker kind per account, the trader's active account, 021 tokens on instruments, and the
+    # NOT_PLACED / NEEDS_REVIEW execution states (021 orders are never retried automatically).
+    (
+        "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='accounts' AND column_name='broker_kind'",
+        "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS broker_kind varchar(8) NOT NULL DEFAULT 'paper'; "
+        "ALTER TABLE accounts ADD CONSTRAINT ck_account_broker_kind CHECK (broker_kind in ('paper','021'))",
+    ),
+    ("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='users' AND column_name='active_account_id'", "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_account_id varchar(32)"),
+    ("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='instruments' AND column_name='token_021'", "ALTER TABLE instruments ADD COLUMN IF NOT EXISTS token_021 integer"),
+    ("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='instruments' AND column_name='exchange_021'", "ALTER TABLE instruments ADD COLUMN IF NOT EXISTS exchange_021 varchar(8)"),
+    (
+        "SELECT 1 FROM pg_constraint WHERE conname='ck_outbox_state' AND position('NOT_PLACED' in pg_get_constraintdef(oid)) > 0",
+        "ALTER TABLE outbox DROP CONSTRAINT IF EXISTS ck_outbox_state; ALTER TABLE outbox ADD CONSTRAINT ck_outbox_state CHECK (state in "
+        "('PREPARED','SENDING','ACKED','UNKNOWN','RECONCILED_FOUND','RECONCILED_ABSENT','REJECTED_BY_BROKER','FAILED','NOT_PLACED','NEEDS_REVIEW'))",
+    ),
+    (
+        "SELECT 1 FROM pg_constraint WHERE conname='ck_step_state' AND position('NOT_PLACED' in pg_get_constraintdef(oid)) > 0",
+        "ALTER TABLE plan_steps DROP CONSTRAINT IF EXISTS ck_step_state; ALTER TABLE plan_steps ADD CONSTRAINT ck_step_state CHECK (state in "
+        "('PENDING','SUBMITTED','OPEN','PARTIALLY_FILLED','FILLED','REJECTED','CANCELLED','FAILED','SKIPPED','BLOCKED','NOT_PLACED','NEEDS_REVIEW'))",
+    ),
+    ("SELECT 1 FROM pg_indexes WHERE schemaname=current_schema() AND indexname='ix_instruments_token_021'", "CREATE INDEX IF NOT EXISTS ix_instruments_token_021 ON instruments (exchange_021, token_021)"),
 ]
 
 

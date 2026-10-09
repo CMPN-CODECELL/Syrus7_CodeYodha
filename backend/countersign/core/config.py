@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -65,6 +66,19 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-20b"
     llm_timeout_s: float = 45.0
+
+    # 021 sandbox. The UCC, password and access token live ONLY in the gateway021 process (broker021/settings.py);
+    # every other process reaches 021 through the gateway's /v1 interface with its usual broker key.
+    gateway021_enabled: bool = False  # set by scripts/dev.py when the gateway is started
+    gateway021_url: str = "http://127.0.0.1:8200"
+    owner_emails_021: str = Field("", validation_alias=AliasChoices("CS_021_OWNER_EMAILS"))
+    strict_monitor_021: bool = Field(False, validation_alias=AliasChoices("CS_021_STRICT_MONITOR"))
+    executor_021_timeout_s: float = 45.0
+    funds_021_daily_paise: int = 10_00_000_00  # virtual funds 021 tops up every trading day (no funds API exists)
+
+    @property
+    def owners_021(self) -> set[str]:
+        return {e.strip().lower() for e in self.owner_emails_021.split(",") if e.strip()}
 
     @property
     def allowed_origins(self) -> list[str]:

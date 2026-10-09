@@ -5,6 +5,7 @@
 __pycache__/
 *.pyc
 backend/.venv/
+backend/.cache/
 backend/.pytest_cache/
 backend/.hypothesis/
 web/node_modules/
