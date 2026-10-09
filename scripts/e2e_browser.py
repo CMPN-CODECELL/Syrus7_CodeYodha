@@ -4,10 +4,17 @@ app), a read-only question, a passkey countersign, a PIN countersign, the Attack
 switch engage and release, sign out, sign in with the password, sign in with the passkey, the signed-out redirect,
 and API checks for the seeded paper account and cross-user isolation. Passkeys come from a Chrome virtual
 authenticator (CDP). Fails on page errors and on any unexpected 4xx/5xx API response. Cleans up after itself: the
-passkey it registered is revoked.
+passkey it registered is revoked. Order prices come from the live quote, so the journey works on the replay feed and
+on live 021 prices alike.
+
+--broker 021 signs in instead as an existing user linked to the 021 sandbox account (email, password and PIN read
+from --login-file, never printed): L1 questions on the live account, the official standing-instruction example (its
+condition is already true at real prices, so the copilot must ask), and a 1-share order countersigned with the PIN
+and then cancelled through the copilot. The order is checked in the 021 order book through the gateway. The 021
+sandbox may fill an order before the cancellation arrives; that is reported, not hidden.
 
 Needs Python Playwright once: pip install playwright httpx && playwright install chromium
-Run: python scripts/e2e_browser.py [--headed] [--device "Pixel 7"]"""
+Run: python scripts/e2e_browser.py [--headed] [--device "Pixel 7"] [--base URL] [--broker 021 --login-file FILE]"""
 
 from __future__ import annotations
 
@@ -107,6 +114,9 @@ class Journey:
             return
         # Signed out, /api/me answering 401 is how the app knows; queries cut off by sign-out may 401 too.
         if r.status == 401 and not self.signed_in and r.request.method == "GET":
+            return
+        # A backend without the 021 gateway endpoints answers 404 there; the UI falls back to the paper account.
+        if r.status == 404 and path.startswith("/api/broker/") and r.request.method == "GET":
             return
         self.failed_calls.append(f"{r.status} {r.request.method} {path}")
 
@@ -322,9 +332,12 @@ class Journey:
         # Drafts use the deterministic engine so the journey never depends on a hosted model's answer (a model may
         # ask a clarifying question instead of drafting). The countersign path after the draft is identical.
         self.use_engine("Deterministic")
+        st, q = self.api_get("/api/market/quote/RELIANCE")
+        assert st == 200, q
+        price = (q["tick"]["ltp_paise"] + 99) // 100  # whole rupees at or just above the live price (on the tick grid)
         t = time.time()
         before = self.dones()
-        self.draft("Buy 10 RELIANCE at 2800", re.compile(r"BUY 10 RELIANCE"))
+        self.draft(f"Buy 10 RELIANCE at {price}", re.compile(r"BUY 10 RELIANCE"))
         dialog = p.get_by_role("dialog")
         dialog.get_by_role("tab", name=re.compile("Passkey")).first.click()
         btn = dialog.get_by_role("button", name=re.compile("Authenticate with passkey"))
@@ -333,7 +346,7 @@ class Journey:
         self.wait_more_dones(before)
         self.shot("09_passkey_execution")
         p.keyboard.press("Escape")
-        return f"{time.time() - t:.1f}s"
+        return f"RELIANCE at ₹{price}, {time.time() - t:.1f}s"
 
     def pin_countersign(self) -> str:
         p = self.page
@@ -437,6 +450,124 @@ class Journey:
         assert st == 200 and me["email"] == self.email, (st, me.get("email") if isinstance(me, dict) else me)
         return "discoverable passkey, no email typed"
 
+    # ------------------------------------------------------------------ 021 journey (--broker 021)
+
+    def sign_in_021(self) -> str:
+        p = self.page
+        p.goto(BASE + "/signin", wait_until="networkidle")
+        p.locator("#signin-email").fill(self.email)
+        p.locator("#signin-password").fill(self.password)
+        with p.expect_response(lambda r: urlparse(r.url).path == "/api/auth/login", timeout=30000) as info:
+            p.get_by_role("button", name="Sign in", exact=True).click()
+        assert info.value.status == 200, info.value.status
+        self.signed_in = True
+        self.wait_copilot()
+        st, me = self.api_get("/api/me")
+        acct = (me or {}).get("account") or {}
+        assert st == 200 and acct.get("kind") == "021", f"active account is {acct.get('kind')!r}, not the 021 sandbox account"
+        st, accts = self.api_get("/api/broker/accounts")
+        live = [a for a in accts if a["kind"] == "021"] if st == 200 else []
+        assert live and live[0]["status"]["connected"], f"021 account not connected: {live}"
+        self.shot("21_021_signed_in")
+        return f"landed on '{acct.get('label')}' (gateway connected, token until {live[0]['status']['token_expires_at']})"
+
+    def read_021(self) -> str:
+        conv = self.conversation()
+        out = []
+        # Patterns match only the copilot's answers (never the question bubble), and each answer finishes streaming
+        # before the next question is sent.
+        for q, pattern in (
+            ("What's my P&L today?", r"P&L is [-+]?₹"),
+            ("What did I pay on average for INFY?", r"You paid ₹[\d,.]+ on average for INFY"),
+            ("Show NIFTY options near the money for this expiry", r"NIFTY spot is ₹|option chain is not available"),
+        ):
+            t = time.time()
+            self.send(q)
+            conv.get_by_text(re.compile(pattern)).first.wait_for(timeout=90000)
+            expect(self.page.get_by_label("Message the copilot")).to_be_editable(timeout=30000)
+            self.page.wait_for_timeout(1200)
+            out.append(f"{q} {time.time() - t:.1f}s")
+        self.page.wait_for_timeout(400)
+        self.shot("22_021_read")
+        return "; ".join(out)
+
+    def already_true_021(self) -> str:
+        conv = self.conversation()
+        self.use_engine("Deterministic")
+        self.send("If Reliance drops below 2800, buy 10")
+        conv.get_by_text(re.compile(r"already true")).first.wait_for(timeout=60000)
+        opt_now = conv.get_by_role("button", name=re.compile(r"^Buy 10 RELIANCE now at limit")).first
+        opt_trig = conv.get_by_role("button", name=re.compile(r"^If RELIANCE drops below")).first
+        opt_now.wait_for(timeout=10000)
+        opt_trig.wait_for(timeout=10000)
+        self.shot("23_021_already_true")
+        return f"asked instead of arming; options '{opt_now.inner_text().strip()}' / '{opt_trig.inner_text().strip()}'"
+
+    def _orders_021(self) -> list[dict]:
+        st, rows = self.api_get("/api/account/orders?status=all")
+        return rows if st == 200 and isinstance(rows, list) else []
+
+    def _pin_in_dialog(self) -> None:
+        p = self.page
+        dialog = p.get_by_role("dialog")
+        dialog.get_by_role("tab", name=re.compile("PIN")).first.click()
+        dialog.get_by_label("App PIN", exact=True).click()
+        p.keyboard.type(self.pin)
+        # The PIN slots submit on the fourth digit; the button is only a fallback.
+        p.wait_for_timeout(500)
+        submit = dialog.get_by_role("button", name=re.compile("Countersign with PIN"))
+        if submit.count() and submit.first.is_visible() and submit.first.is_enabled():
+            submit.first.click()
+
+    def order_and_cancel_021(self) -> str:
+        p = self.page
+        conv = self.conversation()
+        st, q = self.api_get("/api/market/quote/ITC")
+        assert st == 200, q
+        limit = (q["tick"]["ltp_paise"] * 92 // 100) // 5 * 5  # about 8% below the market, on the 5 paise grid
+        known = {o["broker_order_id"] for o in self._orders_021()}
+        text = f"Buy 1 ITC at {limit // 100}.{limit % 100:02d} delivery"
+        before = self.dones()
+        self.draft(text, re.compile(r"BUY 1 ITC"))
+        self._pin_in_dialog()
+        self.wait_more_dones(before, timeout=90)
+        p.keyboard.press("Escape")
+        order = None
+        end = time.time() + 30
+        while time.time() < end and order is None:
+            order = next((o for o in self._orders_021() if o["broker_order_id"] not in known and o.get("symbol") == "ITC"), None)
+            p.wait_for_timeout(500)
+        assert order is not None, "the order did not appear in the 021 order book"
+        oid = order["broker_order_id"]
+        assert order.get("price_021_paise") == limit and order.get("origin") == "countersign", {k: order.get(k) for k in ("price_021_paise", "origin", "status_021")}
+        self.shot("24_021_placed")
+        exact = f"{text}: order {oid} in 021's book at exactly ₹{limit / 100:.2f}"
+        if order["status"] not in ("OPEN", "TRIGGER_PENDING", "PARTIALLY_FILLED"):
+            return f"{exact}; 021 filled it ({order.get('status_021')}) before a cancellation could be sent"
+        self.send("Cancel my ITC order")
+        conv.get_by_text(re.compile(r"CANCEL order|no open order|Which order")).first.wait_for(timeout=60000)
+        if conv.get_by_text(re.compile(r"no open order")).count():
+            return f"{exact}; 021 filled it before the cancellation was drafted"
+        btn = conv.get_by_role("button", name=re.compile(r"^Countersign")).last
+        expect(btn).to_be_enabled(timeout=30000)
+        before = self.dones()
+        btn.click()
+        p.get_by_role("dialog").get_by_role("button", name="Continue to authenticate").click()
+        p.wait_for_timeout(500)
+        self._pin_in_dialog()
+        self.wait_more_dones(before, timeout=90)
+        p.keyboard.press("Escape")
+        final = order
+        end = time.time() + 30
+        while time.time() < end:
+            final = next((o for o in self._orders_021() if o["broker_order_id"] == oid), final)
+            if final["status"] in ("CANCELLED", "COMPLETE"):
+                break
+            p.wait_for_timeout(1000)
+        self.shot("25_021_cancelled")
+        assert final["status"] in ("CANCELLED", "COMPLETE"), final.get("status_021")
+        return f"{exact}; cancel countersigned with the PIN; 021 now reports {final.get('status_021')}"
+
     def guard(self) -> str:
         p = self.page
         p.goto(BASE + "/copilot", wait_until="domcontentloaded")
@@ -506,7 +637,12 @@ def main() -> int:
     ap.add_argument("--headed", action="store_true", help="show the browser")
     ap.add_argument("--device", help='Playwright device descriptor run in Chromium, for example "Pixel 7" or "iPhone 15"')
     ap.add_argument("--base", help="web origin to test, for example https://countersign.example.com (default http://localhost:3000)")
+    ap.add_argument("--broker", choices=("paper", "021"), default="paper", help="paper (default): a new user on a paper account; 021: an existing user linked to the 021 sandbox")
+    ap.add_argument("--login-file", help="--broker 021: a file with 'Email: ...', 'Password: ...' and 'App PIN (countersign): ....' lines (never printed)")
     args = ap.parse_args()
+    if args.broker == "021" and not args.login_file:
+        print("--broker 021 needs --login-file")
+        return 2
     if args.base:
         global BASE
         BASE = args.base.rstrip("/")
@@ -527,8 +663,13 @@ def main() -> int:
         cdp = ctx.new_cdp_session(page)
         cdp.send("WebAuthn.enable")
         cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {"protocol": "ctap2", "transport": "internal", "hasResidentKey": True, "hasUserVerification": True, "isUserVerified": True, "automaticPresenceSimulation": True}})
-        j = Journey(page, ctx, prefix)
-        print(f"device: {args.device or 'desktop 1440x900'}; user {j.email}", flush=True)
+        j = Journey(page, ctx, prefix + ("-021" if args.broker == "021" else ""))
+        if args.broker == "021":
+            raw = Path(args.login_file).read_text(encoding="utf-8")
+            j.email = re.search(r"Email: (\S+)", raw).group(1)
+            j.password = re.search(r"Password: (\S+)", raw).group(1)
+            j.pin = re.search(r"PIN \(countersign\): (\d{4})", raw).group(1)
+        print(f"device: {args.device or 'desktop 1440x900'}; broker {args.broker}" + (f"; user {j.email}" if args.broker == "paper" else ""), flush=True)
 
         steps = [
             ("landing page", j.landing, True),
@@ -552,6 +693,17 @@ def main() -> int:
             ("sign out a third time", j.sign_out_to_landing, True),
             ("signed-out /copilot redirects to sign-in", j.guard, False),
         ]
+        if args.broker == "021":
+            steps = [
+                ("landing page", j.landing, True),
+                ("sign in as a linked 021 owner", j.sign_in_021, True),
+                ("decluttered header", j.header, False),
+                ("L1 questions on the live 021 account", j.read_021, False),
+                ("official standing-instruction example asks instead of arming", j.already_true_021, False),
+                ("1-share order on 021 with the PIN, then cancel via the copilot", j.order_and_cancel_021, False),
+                ("sign out", j.sign_out_to_landing, True),
+                ("signed-out /copilot redirects to sign-in", j.guard, False),
+            ]
         for name, fn, critical in steps:
             try:
                 check(name, True, fn() or "")
