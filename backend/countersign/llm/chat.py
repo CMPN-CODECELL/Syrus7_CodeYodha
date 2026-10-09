@@ -116,13 +116,80 @@ def _deterministic(deps: ChatDeps) -> str:
         return "The broker refused that request, so I cannot answer it right now. Nothing was changed."
 
 
+def _after_interruption(deps: ChatDeps) -> tuple[str, list[dict]]:
+    """When the model stops after drafting, the trader still gets the verifier's own words: what was drafted, why it is
+    blocked, and for a market order the AI chose on its own, the two complete answers to click."""
+    from countersign.core import market
+    from countersign.core.models import Proposal
+    from countersign.core.money import round_to_tick
+    from countersign.core.verifier import _rupees_text
+
+    lines: list[str] = []
+    cards: list[dict] = []
+    with session_scope() as s:
+        for pid in deps.proposal_ids:
+            p = s.get(Proposal, pid)
+            if p is None:
+                continue
+            blocks = [i for sv in (p.steps_view or []) for i in sv.get("issues", []) if i.get("severity") == "BLOCK"] + [i for i in (p.issues or []) if i.get("severity") == "BLOCK"]
+            if not blocks:
+                lines.append(f"Drafted: {p.summary}. It is ready for your countersignature.")
+                continue
+            lines.append(f"Drafted: {p.summary}. It is blocked: " + " ".join(dict.fromkeys(i.get("message", "") for i in blocks)))
+            c = p.canonical if isinstance(p.canonical, dict) else {}
+            inst = c.get("instrument") or {}
+            if p.kind == "ORDER" and any(i.get("code") == "ORDER_TYPE_NOT_STATED" for i in blocks) and c.get("order_type") == "MARKET" and inst.get("symbol"):
+                side, qty, sym = str(c.get("side", "")).capitalize(), c.get("quantity"), inst["symbol"]
+                opts = [f"{side} {qty} {sym} at market"]
+                t = market.latest(inst.get("instrument_id", ""))
+                if t is not None:
+                    px = round_to_tick(t.ltp_paise, int(inst.get("tick_size_paise") or 5), "up" if side == "Buy" else "down")
+                    opts.append(f"{side} {qty} {sym} at limit {_rupees_text(px)}")
+                cards.append({"kind": "clarify", "question": "Market or limit? You did not say, so this draft cannot be countersigned as it is.", "options": opts})
+    return " ".join(lines), cards
+
+
+def _dedupe_clarify(cards: list[dict]) -> list[dict]:
+    """A model sometimes asks the same question twice, or adds an empty question after the verifier already asked."""
+    seen: set[str] = set()
+    out = []
+    asked = any(c.get("kind") == "clarify" and c.get("options") for c in cards)
+    for c in cards:
+        if c.get("kind") == "clarify":
+            key = " ".join(str(c.get("question", "")).lower().split())
+            if key in seen or (asked and not c.get("options") and c is not next(x for x in cards if x.get("kind") == "clarify")):
+                continue
+            seen.add(key)
+        out.append(c)
+    return out
+
+
+def _tool_echo(text: str) -> bool:
+    """True when the model's whole reply is a tool result echoed back (for example {"status":"ASKED"})."""
+    t = text.strip()
+    if not (t.startswith("{") and t.endswith("}")):
+        return False
+    try:
+        import json
+
+        return isinstance(json.loads(t), dict)
+    except ValueError:
+        return False
+
+
 async def stream(user_id: str, account_id: str, conversation_id: str | None, message: str, engine: str = "auto") -> AsyncIterator[dict]:
     conversation_id = conversation_id or str(uuid.uuid4())
     message = message.strip()[:2000]
-    if (engine or "auto").lower() == "auto" and engine_label("auto") != "deterministic" and parse(message).kind == "query":
+    parsed = parse(message) if (engine or "auto").lower() == "auto" and engine_label("auto") != "deterministic" else None
+    if parsed is not None and parsed.kind == "query":
         # Read-only questions the deterministic interpreter recognises with certainty are answered on a fast
-        # path (sub-second, no model cost). Anything that drafts an action always goes through the AI chain.
+        # path (sub-second, no model cost).
         model, label = None, "deterministic (fast path for read-only query)"
+    elif parsed is not None and parsed.kind == "mandate":
+        # Standing instructions the deterministic parser fully understood ("If Reliance drops below 2800, buy 10",
+        # "Tell me when any holding falls 3% in a day") never go through a model: a model once turned the conditional
+        # buy into an alert and dropped "buy 10". The verifier and the countersignature are the same either way.
+        model, label = None, "deterministic (fast path for a standing instruction)"
     else:
         model, label = resolve_engine(engine)
     msg_id = str(uuid.uuid4())
@@ -139,6 +206,8 @@ async def stream(user_id: str, account_id: str, conversation_id: str | None, mes
     async def flush():
         while pending:
             c = pending.pop(0)
+            if _dedupe_clarify([*cards, c])[-1] is not c:
+                continue  # the same question was already shown in this turn
             cards.append(c)
             yield {"type": "card", "card": c}
 
@@ -208,7 +277,16 @@ async def stream(user_id: str, account_id: str, conversation_id: str | None, mes
             yield {"type": "text-delta", "delta": text}
         elif failed is not None:
             yield {"type": "card", "card": {"kind": "notice", "tone": "warning", "title": "AI response interrupted", "message": "The model stopped early. Anything it drafted is shown above and still requires your countersignature."}}
+            explain, extra = await asyncio.to_thread(_after_interruption, deps)
+            pending.extend(extra)
+            async for e in flush():
+                yield e
+            if explain and not "".join(text_parts).strip():
+                text_parts = [explain]
+                yield {"type": "text-delta", "delta": explain}
     final_text = "".join(text_parts).strip()
+    if _tool_echo(final_text):
+        final_text = ""  # never store a raw tool result as the assistant's words
     with session_scope() as s:
         s.add(ChatMessage(conversation_id=conversation_id, user_id=user_id, role="assistant", text=final_text, cards=cards, engine=label))
     yield {"type": "done"}

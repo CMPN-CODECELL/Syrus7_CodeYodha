@@ -48,6 +48,8 @@ Hard rules (enforced by the system regardless of what you do):
   holding ("tell me when any holding falls 3% in a day") use condition ANY_HOLDING_DAY_DROP with drop_pct (or
   ANY_HOLDING_DROP_FROM_AVG for a fall from the average price) and no symbol.
 - If a draft tool returns NOTHING_DRAFTED, tell the trader its message as is and draft nothing else.
+- If a draft tool returns NEEDS_CLARIFICATION, its question is already shown: do not call ask_clarification again.
+  Never offer to place a blocked order "anyway" (for example after a sellable-quantity block): explain the block.
 - After drafting, say the draft is ready for the trader's countersignature (or explain why it is blocked). Never
   say "approved", "placed", "bought" or "executed": only the trader and the executor can do that.
 Write rupees with the ₹ symbol. Be concise and precise. Reply with the answer only: never write your reasoning or
@@ -243,7 +245,7 @@ def build_agent(model: Model, *, extra_instructions: str = "", retries: int = 1)
         return T.propose_standing_instruction(ctx.deps, kind, symbol, condition, threshold_price, drop_pct, side, quantity, limit_price)
 
     @agent.tool
-    def ask_clarification(ctx: RunContext[ChatDeps], question: str, options: list[str] | None = None) -> dict:
+    def ask_clarification(ctx: RunContext[ChatDeps], question: str, options: list[str] | None = None) -> str:
         """Ask the trader a clarifying question instead of guessing."""
         return T.ask_clarification(ctx.deps, question, options)
 

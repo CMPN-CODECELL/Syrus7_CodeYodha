@@ -68,7 +68,8 @@ def get_account_summary(d: ChatDeps) -> dict:
     with session_scope() as s:
         data = portfolio.summary(s, d.gateway, d.account_id)
     d.emit({"kind": "account_summary", "data": data})
-    return {k: (inr(v) if k.endswith("_paise") else v) for k, v in data.items()}
+    # The account id never goes to a model provider (on 021 it is the trader's login code).
+    return {k: (inr(v) if k.endswith("_paise") else v) for k, v in data.items() if k != "account_id"}
 
 
 def get_holdings(d: ChatDeps, losers_below_pct: float | None = None, symbol: str | None = None, basis: str = "avg", emit: bool = True) -> dict:
@@ -415,9 +416,9 @@ def propose_standing_instruction(
         return _record(d, out)
 
 
-def ask_clarification(d: ChatDeps, question: str, options: list[str] | None = None) -> dict:
+def ask_clarification(d: ChatDeps, question: str, options: list[str] | None = None) -> str:
     d.emit({"kind": "clarify", "question": question, "options": options or []})
-    return {"status": "ASKED"}
+    return "The question is shown to the trader. Stop here and wait for their answer; do not repeat the question or this message."
 
 
 def _single_draft(fn):
