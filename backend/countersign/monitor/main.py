@@ -1,7 +1,13 @@
 """Independent invariant monitor (separate process, outside the model's control).
 
 It compares the broker's real order book with what was countersigned, every second. Any violation engages the
-kill switch, records a critical security event and an audit entry, and is shown in the Security Center."""
+kill switch, records a critical security event and an audit entry, and is shown in the Security Center.
+
+021 accounts are watched through the gateway's order book (audit key). Orders on the 021 account that Countersign did
+not place (placed in the 021 web app, RMS square-offs by 021, earlier probe orders) carry no tag: they are recorded
+once as informational "placed outside Countersign" events, without the kill switch, unless CS_021_STRICT_MONITOR=true.
+Every order that carries a Countersign tag must still map to a consumed, verified capability and match what was
+signed (including the exact price sent to 021), or the kill switch engages."""
 
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ from countersign.core.models import Approval, Capability, ExecJob, OutboxEntry, 
 from countersign.core.schemas import CanonicalOrder, CanonicalPlan
 
 REPORTED_KEY = "cs:monitor:reported"
+EXTERNAL_KEY = "cs:monitor:external021"
 
 
 def watched(o: dict) -> bool:
@@ -30,8 +37,12 @@ def watched(o: dict) -> bool:
 
 
 class Monitor:
-    def __init__(self, admin: BrokerAdmin | None = None) -> None:
+    def __init__(self, admin: BrokerAdmin | None = None, admin021: BrokerAdmin | None = None) -> None:
         self.admin = admin or BrokerAdmin(settings().broker_audit_key or settings().broker_admin_key)
+        self.admin021 = admin021
+        if self.admin021 is None and settings().gateway021_enabled:
+            self.admin021 = BrokerAdmin(settings().broker_audit_key or settings().broker_admin_key, base_url=settings().gateway021_url)
+        self.external_seen: set[str] = set()
         self.reported: set[str] = set()
         self.last_audit_check = 0.0
         self.audit_result = {"ok": True, "checked": 0, "detail": "not yet checked"}
@@ -49,6 +60,23 @@ class Monitor:
             audit.record(s, "monitor", "INVARIANT_VIOLATION", "invariant", kind, {"message": message, **data})
             if not state.kill_switch(s)["engaged"]:
                 state.set_kill_switch(s, True, f"Invariant monitor: {message}", "monitor")
+
+    def _external(self, o: dict) -> None:
+        """An order on the 021 account that Countersign did not place: recorded once, informational, no kill switch."""
+        key = o["broker_order_id"]
+        if key in self.external_seen:
+            return
+        self.external_seen.add(key)
+        if not events.client().sadd(EXTERNAL_KEY, key):
+            return
+        who = "021 RMS (automatic square-off)" if o.get("placed_by_021") == "RMS" or o.get("source") == "rms" else "outside Countersign (021 web app or another client)"
+        side = f"{o.get('side')} " if o.get("side_known", True) else ""
+        msg = f"021 order {key} ({side}{o.get('quantity')} {o.get('symbol')}, {o.get('status_021') or o.get('status')}) was placed {who}. Recorded for the audit trail; it was not countersigned and Countersign did not send it."
+        status = str(o.get("status_021") or o.get("status") or "").lower()
+        with session_scope() as s:
+            state.security_event(s, "info", "EXTERNAL_021_ORDER", msg, {"broker_order_id": key, "source": o.get("source"), "account_id": o.get("account_id")}, actor="monitor")
+            audit.record(s, "monitor", "EXTERNAL_ORDER_OBSERVED", "order", key, {"source": o.get("source"), "status_021": o.get("status_021")})
+            state.outcome(s, "EXTERNAL_ORDER", f"Order placed outside Countersign: {side}{o.get('quantity')} {o.get('symbol')}", f"Found in the 021 order book (order {key}, now {status}), placed {who}. Shown for information only: Countersign did not place it.", "info", broker_order_id=key, account_id=o.get("account_id") or "*")
 
     def _signed_order(self, s, ob: OutboxEntry) -> CanonicalOrder | None:
         job = s.get(ExecJob, ob.job_id)
@@ -71,6 +99,22 @@ class Monitor:
         except Exception as e:  # noqa: BLE001
             orders, broker_ok = [], False
             checks.append({"name": "Broker order book reachable", "ok": False, "detail": f"Cannot read broker order book: {e}", "checked": 0})
+        orders021: list[dict] = []
+        if self.admin021 is not None:
+            try:
+                orders021 = self.admin021.all_orders()
+                checks.append({"name": "021 order book reachable", "ok": True, "detail": "Read through the 021 gateway (audit key).", "checked": len(orders021)})
+            except Exception as e:  # noqa: BLE001
+                checks.append({"name": "021 order book reachable", "ok": False, "detail": f"Cannot read the 021 order book: {e}", "checked": 0})
+        strict = settings().strict_monitor_021
+        outside = [o for o in orders021 if not o.get("client_order_id")]
+        orders = orders + [o for o in orders021 if o.get("client_order_id") or strict]
+        if not strict:
+            external += len(outside)
+            for o in outside:
+                self._external(o)
+            if self.admin021 is not None:
+                checks.append({"name": "021 orders placed outside Countersign", "ok": True, "detail": f"{len(outside)} order(s) placed in the 021 app or by 021 RMS: recorded as informational, never countersigned or sent by Countersign." if outside else "None today.", "checked": len(orders021)})
 
         present: set[str] | None = None
 
@@ -81,7 +125,7 @@ class Monitor:
             nonlocal present
             if present is None:
                 try:
-                    present = {o["broker_order_id"] for o in self.admin.all_orders()}
+                    present = {o["broker_order_id"] for o in self.admin.all_orders()} | {o["broker_order_id"] for o in orders021}
                 except Exception:  # noqa: BLE001
                     return True
             return oid in present
@@ -92,10 +136,13 @@ class Monitor:
                 # Prices the trader countersigned for an order: the original plus every signed modification
                 # (including one in flight), so a countersigned modify can never be mistaken for tampering.
                 signed_mods: dict[str, set[int | None]] = {}
+                signed_qty: dict[str, set[int | None]] = {}
                 for mob in s.execute(select(OutboxEntry)).scalars():
                     req = mob.request or {}
                     if req.get("action") == "MODIFY" and req.get("target_broker_order_id"):
                         signed_mods.setdefault(req["target_broker_order_id"], set()).add(req.get("limit_price_paise"))
+                        signed_mods.setdefault(req["target_broker_order_id"], set()).add(req.get("protection_price_paise"))
+                        signed_qty.setdefault(req["target_broker_order_id"], set()).add(req.get("quantity"))
                 # Out-of-band orders already detected, halted and marked contained (Attack Lab drill on the LAB1
                 # sandbox) are still counted as external orders but no longer hold the check red.
                 contained = set(s.execute(text("SELECT data->>'broker_order_id' FROM security_events WHERE kind = 'UNAUTHORIZED_BROKER_ORDER' AND resolved AND data->>'source' = 'rogue'")).scalars())
@@ -129,12 +176,19 @@ class Monitor:
                             continue
                         raise
                     allowed_limits = {signed.limit_price_paise} | signed_mods.get(o["broker_order_id"], set())
+                    allowed_qty = {signed.quantity} | signed_qty.get(o["broker_order_id"], set())
                     fields_ok = (
                         signed.instrument.instrument_id == o["instrument_id"]
                         and signed.side.value == o["side"]
-                        and (signed.action != "PLACE" or signed.quantity == o["quantity"])
+                        and (signed.action != "PLACE" or o["quantity"] in allowed_qty)
                         and (signed.action != "PLACE" or (o.get("limit_price_paise") or None) in {(x or None) for x in allowed_limits})
                     )
+                    if fields_ok and o.get("broker") == "021" and signed.action == "PLACE":
+                        # The exact price sent to 021 must be the signed limit (or the signed protection price for a
+                        # market order), or a countersigned modification of it.
+                        sent = int(o.get("price_021_paise") or 0)
+                        allowed_sent = {int(x) for x in ({signed.limit_price_paise, signed.protection_price_paise} | signed_mods.get(o["broker_order_id"], set())) if x}
+                        fields_ok = sent in allowed_sent or (sent == 0 and not allowed_sent)
                     if not fields_ok:
                         unapproved += 1
                         bad_match.append(o)
