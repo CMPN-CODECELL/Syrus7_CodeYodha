@@ -13,7 +13,7 @@ from sqlalchemy import select
 
 from countersign.core.config import settings
 from countersign.core.db import session_scope
-from countersign.core.models import Account, SessionRow, User
+from countersign.core.models import SessionRow, User
 
 COOKIE = "cs_session"
 CSRF_COOKIE = "cs_csrf"
@@ -66,7 +66,9 @@ def resolve(request: Request, *, check_csrf: bool = True) -> Principal:
         if request.method in UNSAFE and origin and origin not in settings().allowed_origins:
             raise HTTPException(403, {"code": "ORIGIN_REJECTED", "message": f"Origin {origin} is not allowed."})
         user = s.get(User, row.user_id)
-        acct = s.execute(select(Account).where(Account.user_id == user.id).order_by(Account.id)).scalars().first()
+        from countersign.broker021.linking import active_account
+
+        acct = active_account(s, user)  # the trader's chosen account (paper or the linked 021 account), never a shared fallback
         if acct is None:
             # Never fall back to a shared account: a user without their own paper account cannot act at all.
             raise HTTPException(403, {"code": "NO_ACCOUNT", "message": "No trading account is linked to this user."})
