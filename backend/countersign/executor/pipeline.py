@@ -174,11 +174,12 @@ def preflight(job_id: str) -> dict:
             owner = s.get(Account, p.account_id)
             operates = owner is not None and (owner.user_id == a.user_id or s.get(AccountMember, (p.account_id, a.user_id)) is not None)
             if operates and owner.broker_kind == "021":
-                # The 021 account is operated only by users still listed in CS_021_OWNER_EMAILS.
+                # A 021 account is operated only by a trader who still holds a self-service link to it, or (the
+                # operator-linked .env account) whose email is still listed in CS_021_OWNER_EMAILS.
+                from countersign.broker021.linking import may_operate_021
                 from countersign.core.models import User
 
-                approver = s.get(User, a.user_id)
-                operates = approver is not None and bool(approver.email) and approver.email.strip().lower() in settings().owners_021
+                operates = may_operate_021(s, owner, s.get(User, a.user_id))
             if not operates or p.user_id != a.user_id:
                 raise Blocked("PAYLOAD_MISMATCH", "The approving trader does not own the account this order is for. Execution refused.", True)
             if canonical_hash(p.canonical) != cap.canonical_hash or cap.canonical_hash != a.payload["canonical_hash"] or p.canonical_hash != cap.canonical_hash:

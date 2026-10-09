@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import secrets
@@ -27,7 +28,7 @@ from countersign.auth import factors
 from countersign.auth.sessions import COOKIE, CSRF_COOKIE, Principal, check_origin, create, current, revoke_presented
 from countersign.core import audit, events, instruments, market, portfolio, state
 from countersign.core.approval_crypto import CountersignError, b64url
-from countersign.core.broker_client import BrokerAdmin, BrokerError, BrokerTimeout, BrokerUnavailable, ReadGateway, broker_kind, read_gateway
+from countersign.core.broker_client import BrokerAdmin, BrokerError, BrokerTimeout, BrokerUnavailable, ReadGateway, _kinds, broker_kind, read_gateway
 from countersign.core.config import rp_id_for, rp_id_from_credential, settings
 from countersign.core.db import session_scope
 from countersign.core.models import (
@@ -987,18 +988,34 @@ def _gateway_status() -> dict | None:
         return None
 
 
+def _gateway_account(gw: dict | None, account_id: str) -> dict | None:
+    """One account's session in the gateway heartbeat (keyed by a hash of the UCC; the heartbeat never holds a full
+    UCC). Falls back to the top-level fields for a gateway that predates per-account status."""
+    if not gw:
+        return None
+    per = gw.get("accounts")
+    if not isinstance(per, dict):
+        return {"logged_in": gw.get("logged_in"), "token_expires_at": gw.get("token_expires_at"), "last_error": (gw.get("http") or {}).get("last_error"), "account": gw.get("account")}
+    return per.get(hashlib.sha256(account_id.encode()).hexdigest()[:16])
+
+
 def _account_rows(s, u: User, active_id: str) -> list[dict]:
     """GET /api/broker/accounts rows. Display `label` (the 021 id is masked there); `account_id` is only for switching."""
     gw = _gateway_status()
     rows = []
     for a in linking.user_accounts(s, u):
-        row = linking.account_view(s, a, active_id)
+        row = linking.account_view(s, a, active_id, u.id)
         if a.broker_kind == "021":
             up = bool(gw) and time.time() - float(gw.get("ts") or 0) < 10
-            http = (gw or {}).get("http") or {}
-            row["status"] = {"connected": up and bool(gw.get("logged_in")), "token_expires_at": (gw or {}).get("token_expires_at"), "market_data": "live", "last_error": None if up else "The 021 gateway is not running."}
-            if up and http.get("last_error"):
-                row["status"]["last_error"] = str(http["last_error"])[:200]
+            sess = _gateway_account(gw, a.id) if up else None
+            err = None if up else "The 021 gateway is not running."
+            if up and sess is None:
+                err = "The 021 gateway holds no session for this account. Connect it again."
+            elif sess and sess.get("credentials_rejected"):
+                err = "021 refused the stored password. Disconnect and connect this account again with its current password."
+            elif sess and sess.get("last_error"):
+                err = str(sess["last_error"])[:200]
+            row["status"] = {"connected": bool(sess and sess.get("logged_in")), "token_expires_at": (sess or {}).get("token_expires_at"), "market_data": "live", "last_error": err}
         else:
             row["status"] = {"connected": True, "token_expires_at": None, "market_data": "live" if settings().gateway021_enabled else "replay", "last_error": None}
         rows.append(row)
@@ -1007,9 +1024,9 @@ def _account_rows(s, u: User, active_id: str) -> list[dict]:
 
 @app.get("/api/broker/accounts")
 def broker_accounts(p: Principal = Depends(current)):
-    """The caller's accounts (a JSON array): their paper account and, when linked, the 021 sandbox account.
-    Hackathon linking model: users listed in CS_021_OWNER_EMAILS are linked to the one 021 account the gateway serves;
-    self-service linking of any 021 UCC is future scope."""
+    """The caller's accounts (a JSON array): their paper account and every 021 account they may operate: the
+    operator-linked .env account (users listed in CS_021_OWNER_EMAILS) and accounts they connected themselves
+    (linked_by "self"). 021 ids are masked in `label` and `masked_id`."""
     with session_scope() as s:
         return _account_rows(s, s.get(User, p.user_id), p.account_id)
 
@@ -1030,6 +1047,144 @@ def broker_set_active(body: ActiveBody, p: Principal = Depends(current)):
         return {"active_account_id": body.account_id, "accounts": _account_rows(s, u, body.account_id)}
 
 
+# ------------------------------------------------------------------ self-service 021 linking (the API relays ciphertext only)
+
+LINK_PURPOSE = "LINK_021"
+LINK_NONCE_TTL = timedelta(minutes=5)
+# Link attempts that reach the gateway: per user and per client IP (the TCP peer; every browser behind the local
+# proxy shares one IP bucket). Each attempt that passes is one real 021 login, so the budget is small.
+LINK_LIMITS = (("user", 5, 900.0), ("ip", 10, 900.0))
+_LINK_KEY: dict = {"value": None, "at": 0.0}
+
+
+def _require_gateway() -> None:
+    if not settings().gateway021_enabled:
+        raise HTTPException(503, {"code": "GATEWAY021_OFF", "message": "The 021 gateway is not running on this installation, so a 021 account cannot be connected here."})
+
+
+def _require_fresh_step_up(s, u: User, p: Principal) -> None:
+    """Connecting or disconnecting a broker account always needs a fresh step-up with an approval method."""
+    methods = _factor_methods(s, u)
+    if not methods:
+        raise HTTPException(403, {"code": "STEP_UP_REQUIRED", "message": "Choose your app PIN first; connecting a 021 account needs a fresh confirmation with it.", "methods": []})
+    if not _step_up_fresh(s, p):
+        raise HTTPException(403, {"code": "STEP_UP_REQUIRED", "message": "Confirm it is you first with your passkey, app PIN or authenticator code. Being signed in is not enough to connect or disconnect a broker account.", "methods": methods})
+
+
+def _link_http(e: linking.LinkRefused) -> HTTPException:
+    return HTTPException(e.status, {"code": e.code, "message": e.message})
+
+
+@app.get("/api/broker/021/link-key")
+def broker_link_key(p: Principal = Depends(current)):
+    """The gateway's public key (SPKI, base64) and a single-use nonce for this user (5 minutes). The browser encrypts
+    {ucc, password, nonce, user_id} to the key with RSA-OAEP SHA-256; only gateway021 can decrypt it."""
+    _require_gateway()
+    if not _LINK_KEY["value"] or time.time() - _LINK_KEY["at"] > 600:
+        try:
+            _LINK_KEY.update(value=linking.gateway_link_key(), at=time.time())
+        except linking.LinkRefused as e:
+            raise _link_http(e) from None
+    key = _LINK_KEY["value"]
+    nonce = secrets.token_bytes(16)
+    now = datetime.now(UTC)
+    with session_scope() as s:
+        # Only the newest nonce is ever accepted: asking for a new key retires every earlier unused one.
+        s.execute(update(WebauthnChallenge).where(WebauthnChallenge.user_id == p.user_id, WebauthnChallenge.purpose == LINK_PURPOSE, WebauthnChallenge.used_at.is_(None)).values(used_at=now))
+        s.add(WebauthnChallenge(user_id=p.user_id, purpose=LINK_PURPOSE, challenge=nonce, expires_at=now + LINK_NONCE_TTL))
+    return {"public_key": key["public_key"], "alg": "RSA-OAEP-256", "nonce": b64url(nonce), "user_id": p.user_id, "expires_at": iso(now + LINK_NONCE_TTL), "max_plaintext_bytes": int(key.get("max_plaintext_bytes") or 190)}
+
+
+class LinkBody(BaseModel):
+    ciphertext: str
+
+
+@app.post("/api/broker/021/link")
+def broker_link(body: LinkBody, request: Request, p: Principal = Depends(current)):
+    """Connects the caller's own 021 account. The body is only the browser's ciphertext: this process never sees the
+    UCC or password in clear, and never logs or stores the ciphertext. The gateway decrypts it, checks the nonce and
+    user id issued here, verifies the password with one 021 login and stores it sealed; the account is then attached
+    to the caller and made active. Needs a fresh step-up; rate limited per user and per IP."""
+    _require_gateway()
+    if not 16 <= len(body.ciphertext) <= 2048:
+        raise HTTPException(422, {"code": "INVALID_INPUT", "field": "ciphertext", "message": "The encrypted credentials are malformed."})
+    with session_scope() as s:
+        _require_fresh_step_up(s, s.get(User, p.user_id), p)
+    now = time.time()
+    for kind, limit, window in LINK_LIMITS:
+        who = p.user_id if kind == "user" else client_ip(request)
+        wait = _over_limit(f"link021:{kind}:{who}", limit, window, now)
+        if wait:
+            raise HTTPException(429, {"code": "RATE_LIMITED", "message": f"Too many connection attempts. Wait {wait} s and try again.", "retry_after_s": wait}, headers={"Retry-After": str(wait)})
+    with session_scope() as s:
+        row = s.execute(select(WebauthnChallenge).where(WebauthnChallenge.user_id == p.user_id, WebauthnChallenge.purpose == LINK_PURPOSE, WebauthnChallenge.used_at.is_(None)).order_by(WebauthnChallenge.created_at.desc()).limit(1).with_for_update()).scalar_one_or_none()
+        nonce = None
+        if row is not None:
+            row.used_at = datetime.now(UTC)  # single use, whatever happens next
+            if row.expires_at > datetime.now(UTC):
+                nonce = b64url(row.challenge)
+    if nonce is None:
+        raise HTTPException(400, {"code": "LINK_NONCE_INVALID", "message": "This connection form expired or was already used. Try again."})
+    try:
+        res = linking.gateway_link(body.ciphertext, nonce, p.user_id)
+    except linking.LinkRefused as e:
+        with session_scope() as s:
+            audit.record(s, "trader", "ACCOUNT_LINK_021_REFUSED", "user", p.user_id, {"code": e.code})
+        raise _link_http(e) from None
+    ucc = str(res.get("account_id") or "")
+    try:
+        with session_scope() as s:
+            u = s.get(User, p.user_id, with_for_update=True)
+            linking.attach_self_link(s, u, ucc)
+            state.security_event(s, "info", "BROKER_021_LINKED", f"021 account {linking.mask(ucc)} connected. Its password is stored encrypted by the 021 gateway.", {"account": linking.mask(ucc), "user_id": p.user_id}, actor="trader", account_id=ucc)
+    except linking.LinkRefused as e:
+        try:
+            linking.gateway_unlink(ucc, p.user_id)  # the API refused it: the gateway must not keep this credential
+        except linking.LinkRefused:
+            pass
+        with session_scope() as s:
+            audit.record(s, "trader", "ACCOUNT_LINK_021_REFUSED", "user", p.user_id, {"code": e.code, "account": linking.mask(ucc)})
+        raise _link_http(e) from None
+    _kinds.pop(ucc, None)
+    with session_scope() as s:
+        rows = _account_rows(s, s.get(User, p.user_id), ucc)
+    return {"masked_ucc": linking.mask(ucc), "account": next((r for r in rows if r["account_id"] == ucc), None), "accounts": rows, "active_account_id": ucc}
+
+
+class UnlinkBody(BaseModel):
+    account_id: str
+
+
+@app.delete("/api/broker/021/link")
+def broker_unlink(body: UnlinkBody, p: Principal = Depends(current)):
+    """Disconnects a 021 account the caller connected themselves: the gateway deletes the stored credential (and drops
+    the session when no one else linked it; the .env account keeps its own), the link is removed and the caller is
+    moved back to their paper account. Needs a fresh step-up."""
+    with session_scope() as s:
+        u = s.get(User, p.user_id)
+        _require_fresh_step_up(s, u, p)
+        acct = s.get(Account, body.account_id)
+        if acct is None or acct.broker_kind != "021" or not linking.self_linked(s, body.account_id, u.id):
+            try:
+                linking.detach_self_link(s, u, body.account_id)  # raises the precise refusal
+            except linking.LinkRefused as e:
+                raise _link_http(e) from None
+    try:
+        linking.gateway_unlink(body.account_id, p.user_id)
+    except linking.LinkRefused as e:
+        raise HTTPException(503, {"code": "GATEWAY021_UNAVAILABLE", "message": f"The 021 gateway could not delete the stored password ({e.message}) Nothing was changed; try again."}) from None
+    with session_scope() as s:
+        u = s.get(User, p.user_id, with_for_update=True)
+        try:
+            linking.detach_self_link(s, u, body.account_id)
+        except linking.LinkRefused as e:
+            raise _link_http(e) from None
+        state.security_event(s, "info", "BROKER_021_UNLINKED", f"021 account {linking.mask(body.account_id)} disconnected. The gateway deleted its stored password.", {"account": linking.mask(body.account_id), "user_id": p.user_id}, actor="trader", account_id=body.account_id)
+        active = u.active_account_id
+    with session_scope() as s:
+        return {"ok": True, "active_account_id": active, "accounts": _account_rows(s, s.get(User, p.user_id), active)}
+
+
 @app.get("/api/broker/status")
 def broker_status(p: Principal = Depends(current)):
     """Health of the broker behind the caller's active account. For 021: the gateway's login, sockets, instrument
@@ -1039,8 +1194,11 @@ def broker_status(p: Principal = Depends(current)):
         acct = s.get(Account, p.account_id)
         kind = acct.broker_kind if acct is not None else "paper"
         # Gateway details (account label, token expiry, counters, last reconciliation) only for traders who can
-        # operate the 021 account; everyone else learns only whether the live feed is up.
-        operator = settings().gateway021_enabled and any(linking.can_operate(s, p.user_id, a) for a in s.execute(select(Account.id).where(Account.broker_kind == "021")).scalars())
+        # operate a 021 account; everyone else learns only whether the live feed is up. Login details are those of
+        # the caller's own 021 account (active, else the first one they may operate).
+        mine = [a for a in s.execute(select(Account.id).where(Account.broker_kind == "021")).scalars() if linking.can_operate(s, p.user_id, a)] if settings().gateway021_enabled else []
+        operator = bool(mine)
+        own021 = p.account_id if p.account_id in mine else (mine[0] if mine else None)
     out: dict = {"active_kind": kind, "gateway021_enabled": settings().gateway021_enabled, "gateway021": None}
     if settings().gateway021_enabled:
         st = _gateway_status()
@@ -1049,11 +1207,12 @@ def broker_status(p: Principal = Depends(current)):
         elif st is not None:
             m = st.get("market") or {}
             o = st.get("orders_socket") or {}
+            sess = _gateway_account(st, own021) or {}
             out["gateway021"] = {
                 "up": time.time() - float(st.get("ts") or 0) < 10,
-                "logged_in": st.get("logged_in"),
-                "token_expires_at": st.get("token_expires_at"),
-                "account": st.get("account"),
+                "logged_in": sess.get("logged_in"),
+                "token_expires_at": sess.get("token_expires_at"),
+                "account": sess.get("account"),
                 "instruments": {k: (st.get("instruments") or {}).get(k) for k in ("rows", "date", "stocks", "indices", "options")},
                 "market_socket": {k: m.get(k) for k in ("connections", "alive", "subscribed", "ticks_published", "reconnects")},
                 "orders_socket": {"connected": o.get("connected"), "events": o.get("events")},
@@ -1349,7 +1508,7 @@ def security_status(p: Principal = Depends(current)):
     if kind == "021":
         # The caller trades on 021: report the gateway (login and sockets), not the local paper broker.
         gw = _gateway_status()
-        ok = bool(gw) and time.time() - float(gw.get("ts") or 0) < 10 and bool(gw.get("logged_in"))
+        ok = bool(gw) and time.time() - float(gw.get("ts") or 0) < 10 and bool((_gateway_account(gw, p.account_id) or {}).get("logged_in"))
         lat = None
     label = engine_label("auto")
     return {

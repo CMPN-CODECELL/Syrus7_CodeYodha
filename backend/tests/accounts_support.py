@@ -67,6 +67,8 @@ def _cleanup_test_users() -> None:
         s.execute(text("TRUNCATE " + ", ".join(TRANSACTIONAL) + " CASCADE"))
         ids = list(s.execute(select(User.id).where(User.email.like(f"%@{TEST_DOMAIN}"))).scalars())
         if ids:
+            s.execute(text("DELETE FROM broker_links WHERE user_id = ANY(:ids) OR account_id IN (SELECT id FROM accounts WHERE user_id = ANY(:ids))"), {"ids": ids})
+            s.execute(text("DELETE FROM account_members WHERE user_id = ANY(:ids) OR account_id IN (SELECT id FROM accounts WHERE user_id = ANY(:ids))"), {"ids": ids})
             for tbl in ("sessions", "device_credentials", "webauthn_challenges", "accounts"):
                 s.execute(text(f"DELETE FROM {tbl} WHERE user_id = ANY(:ids)"), {"ids": ids})
             s.execute(text("DELETE FROM users WHERE id = ANY(:ids)"), {"ids": ids})

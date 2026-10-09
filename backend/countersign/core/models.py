@@ -107,6 +107,8 @@ class Account(Base):
     segments: Mapped[list] = mapped_column(JSONB, default=list)
     trading_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     broker_kind: Mapped[str] = mapped_column(String(8), default="paper", server_default="paper")  # paper | 021
+    # 021 accounts only: 'operator' (the .env account, operated by CS_021_OWNER_EMAILS) or 'self' (self-service link)
+    linked_via: Mapped[str | None] = mapped_column(String(16))
     __table_args__ = (CheckConstraint("broker_kind in ('paper','021')", name="ck_account_broker_kind"),)
 
 
@@ -114,6 +116,16 @@ class AccountMember(Base):
     """Extra traders allowed to operate an account (the shared 021 sandbox account). The owner is accounts.user_id."""
 
     __tablename__ = "account_members"
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+
+
+class BrokerLink(Base):
+    """A trader's self-service link to a 021 account: they proved its UCC and password through the gateway (which alone
+    keeps the sealed password). It grants operating that account until they disconnect."""
+
+    __tablename__ = "broker_links"
     account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
@@ -529,6 +541,8 @@ MIGRATIONS = [
         "('PENDING','SUBMITTED','OPEN','PARTIALLY_FILLED','FILLED','REJECTED','CANCELLED','FAILED','SKIPPED','BLOCKED','NOT_PLACED','NEEDS_REVIEW'))",
     ),
     ("SELECT 1 FROM pg_indexes WHERE schemaname=current_schema() AND indexname='ix_instruments_token_021'", "CREATE INDEX IF NOT EXISTS ix_instruments_token_021 ON instruments (exchange_021, token_021)"),
+    # Self-service 021 linking: how a 021 account was linked (the broker_links table is new, so create_all makes it).
+    ("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='accounts' AND column_name='linked_via'", "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS linked_via varchar(16)"),
 ]
 
 
@@ -544,6 +558,8 @@ BACKFILL = [
     "UPDATE security_events SET account_id = 'LAB1' WHERE account_id IS NULL AND kind = 'UNAUTHORIZED_BROKER_ORDER' AND data->>'source' = 'rogue'",
     "UPDATE security_events SET account_id = '' WHERE account_id IS NULL AND (data ? 'proposal_id' OR data ? 'approval_id' OR data ? 'job_id' OR data ? 'broker_order_id')",
     "UPDATE security_events SET resolved = true WHERE account_id = 'LAB1' AND NOT resolved AND kind <> 'UNAUTHORIZED_BROKER_ORDER'",
+    # 021 accounts created before self-service linking were all the operator-linked .env account.
+    "UPDATE accounts SET linked_via = 'operator' WHERE broker_kind = '021' AND linked_via IS NULL",
 ]
 
 
