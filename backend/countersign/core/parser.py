@@ -27,6 +27,9 @@ SYMBOL_STOP = {
     "MORE", "THAN", "BY", "PERCENT", "USE", "PROCEEDS", "PLACE", "NEW", "WITH", "SOME", "ALL", "MY", "OPEN", "PENDING",
     "PLEASE", "NOW", "ON", "RS", "INR", "AROUND", "ABOUT", "ROUGHLY", "APPROX", "UNDER", "OVER", "IOC", "DAY", "ONLY",
     "ONCE", "REACHES", "HITS", "DROPS", "HOLDING", "HOLDINGS", "POSITION", "S", "X", "SL", "STOP", "LOSS", "TRIGGER",
+    # instruction words aimed at the model, which are never instruments
+    "IGNORE", "RULE", "RULES", "YOUR", "SAFETY", "CHECK", "CHECKS", "INSTRUCTION", "INSTRUCTIONS", "PREVIOUS", "SYSTEM",
+    "JUST", "KINDLY", "IMMEDIATELY", "ASAP", "BYPASS", "OVERRIDE", "SKIP",
     # fraction words, stop-loss and modify phrasing, alert and question words
     "HALF", "THIRD", "THIRDS", "QUARTER", "QUARTERS", "FOURTH", "FOURTHS", "ONE", "TWO", "THREE", "ENTIRE", "WHOLE",
     "EVERYTHING", "FULL", "PER", "CENT", "STOP-LOSS", "STOPLOSS", "SL-M", "SLM", "MOVE", "UP", "DOWN", "RAISE",
@@ -463,7 +466,9 @@ def _pick_symbol(facts: Facts) -> str | None:
         kind = "CE" if opt.group(2).lower() in ("ce", "call") else "PE"
         return f"NIFTYOPT:{opt.group(1)}:{kind}"
     cands = [s for s in facts.symbols if not re.fullmatch(r"\d+", s)]
-    return cands[0] if cands else None
+    # A ticker written in capitals ("buy 500 RELIANCE") beats an ordinary capitalised word earlier in the sentence.
+    tickers = [s for s in cands if re.fullmatch(r"[A-Z][A-Z0-9&-]+", s)]
+    return (tickers or cands or [None])[0]
 
 
 def _parse_order(t: str, facts: Facts) -> Parsed:
