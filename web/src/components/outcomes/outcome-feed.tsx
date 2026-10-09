@@ -1,6 +1,7 @@
 "use client";
 
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import { realOrderId } from "@/lib/broker";
 import { useRouter } from "next/navigation";
 import { ArrowUpRight, Radio } from "lucide-react";
 import { TONE_CHIP } from "@/components/ui/chip";
@@ -56,7 +57,7 @@ export function OutcomeItem({ o, now, dense }: { o: OutcomeEvent; now: number; d
         <p className={cn("mt-0.5 text-xs leading-snug text-muted-foreground", dense && "line-clamp-2")}>{o.detail}</p>
         <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10.5px] text-subtle">
           <span className="font-semibold tracking-wide uppercase">{k.label}</span>
-          {o.broker_order_id && <span className="num">· {o.broker_order_id}</span>}
+          {realOrderId(o.broker_order_id) && <span className="num">· {o.broker_order_id}</span>}
           {o.proposal_id && <span className="num">· {o.proposal_id.slice(0, 14)}</span>}
           <span className="ml-auto">
             <OpenOrderAction o={o} />

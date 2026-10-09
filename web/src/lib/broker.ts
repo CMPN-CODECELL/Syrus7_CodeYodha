@@ -58,3 +58,9 @@ export function redraftText(c: CanonicalOrder, fallback: string): string {
   if (c.validity === "IOC") parts.push("IOC");
   return parts.join(" ");
 }
+
+/** A broker order id that names a real order. 021 reports "0" when it refused an order outright, so no order exists. */
+export function realOrderId(id: string | number | null | undefined): string | null {
+  const s = id == null ? "" : String(id).trim();
+  return s && s !== "0" ? s : null;
+}

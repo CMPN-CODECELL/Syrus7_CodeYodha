@@ -1,6 +1,7 @@
 "use client";
 
 import { motion, useReducedMotion } from "motion/react";
+import { realOrderId } from "@/lib/broker";
 import { Check, Circle, CircleDashed, X } from "lucide-react";
 import { qty, price, shortHash, time } from "@/lib/format";
 import { useBrokerKindFor } from "@/lib/queries";
@@ -85,7 +86,7 @@ export function buildTimeline(p: Proposal, stepNo = 1, kind: BrokerKind | null =
   const methodText = a ? (a.method === "webauthn" ? "Passkey assertion" : a.method === "pin" ? "App PIN" : "Authenticator code") : "";
   const matching = matchingFor(kind, ob);
   const delivery = deliveryState(step, ob);
-  const brokerOrderId = ob?.broker_order_id ?? step?.broker_order_id ?? null;
+  const brokerOrderId = realOrderId(ob?.broker_order_id ?? step?.broker_order_id);
 
   const sendItem: Item = {
     key: "send",

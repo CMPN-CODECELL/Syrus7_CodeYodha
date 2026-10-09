@@ -13,6 +13,7 @@ import { Chip, LookChip, SideBadge } from "@/components/ui/chip";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Hash } from "@/components/ui/hash";
 import { Eyebrow } from "@/components/ui/panel";
+import { realOrderId } from "@/lib/broker";
 import { inr, price, qty, time } from "@/lib/format";
 import { useBrokerKindFor } from "@/lib/queries";
 import { proposalLook, stepLook } from "@/lib/status";
@@ -70,7 +71,7 @@ function StepRow({ step, proposal, defaultOpen }: { step: ProposalStep; proposal
             {c.order_type} · {c.product} · {c.validity}
             {step.preview ? ` · value ${inr(step.preview.order_value_paise)}` : ""}
             {tagged ? ` · tag ${ob?.client_order_id}` : ""}
-            {step.broker_order_id ? ` · order ${step.broker_order_id}` : ""}
+            {realOrderId(step.broker_order_id) ? ` · order ${step.broker_order_id}` : ""}
           </p>
           {why && <p className="num mt-0.5 line-clamp-2 text-[11px] leading-snug text-muted-foreground">{why}</p>}
         </div>
