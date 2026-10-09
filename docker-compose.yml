@@ -1,0 +1,39 @@
+name: countersign
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: countersign
+      POSTGRES_PASSWORD: countersign_local
+      POSTGRES_DB: countersign
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./infra/postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U countersign -d countersign"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  valkey:
+    image: valkey/valkey:9
+    ports:
+      - "56379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: ["chaos"]
+    ports:
+      - "8474:8474"
+      - "18100:18100"
+
+volumes:
+  pgdata:
