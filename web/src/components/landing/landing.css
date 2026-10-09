@@ -1,0 +1,268 @@
+/*
+  Landing page styles. Plain CSS on top of the global tokens (no @apply), scoped under .landing
+  so nothing leaks into the signed-in app. Motion is opt-in per element and every animation
+  collapses to its final frame under prefers-reduced-motion (see the global rule in globals.css).
+*/
+
+.landing {
+  --lp-glow: color-mix(in oklch, var(--human) 16%, transparent);
+  --lp-glow-ai: color-mix(in oklch, var(--ai) 14%, transparent);
+  --lp-card: color-mix(in oklch, var(--surface-1) 72%, transparent);
+  --lp-card-strong: color-mix(in oklch, var(--surface-2) 80%, transparent);
+  --lp-ink-soft: color-mix(in oklch, var(--foreground) 62%, transparent);
+  --lp-nav-h: 64px;
+}
+
+/*
+  Small print on the landing (eyebrows, notes, footnotes) must reach 4.5:1 in both themes; the app's own --subtle is
+  tuned for dense tables, so the landing darkens it in light mode and lifts it in dark mode. Light mode also uses a
+  deeper mint so small mint chips stay readable on their tinted backgrounds.
+*/
+.landing {
+  --subtle: oklch(0.5 0.015 262);
+}
+.dark .landing {
+  --subtle: oklch(0.64 0.015 260);
+}
+:root:not(.dark) .landing {
+  --human: oklch(0.47 0.11 172);
+}
+
+.landing .font-display {
+  font-family: var(--font-display), ui-serif, Georgia, "Times New Roman", serif;
+  font-weight: 400;
+  letter-spacing: -0.012em;
+  font-feature-settings: "liga", "kern";
+}
+
+.landing section[id] {
+  scroll-margin-top: calc(var(--lp-nav-h) + 8px);
+}
+
+/* Card surface with the faint mint corner glow of the reference bento. */
+.lp-card {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  border: 1px solid var(--hairline);
+  border-radius: 20px;
+  background:
+    radial-gradient(120% 90% at 100% 100%, color-mix(in oklch, var(--human) 7%, transparent), transparent 60%),
+    var(--lp-card);
+  transition: border-color 300ms ease, transform 300ms ease;
+}
+.lp-card:hover {
+  border-color: var(--hairline-strong);
+}
+.lp-card-ai {
+  background:
+    radial-gradient(120% 90% at 100% 100%, color-mix(in oklch, var(--ai) 8%, transparent), transparent 60%),
+    var(--lp-card);
+}
+
+/* Hairline circuit decoration behind the hero. */
+.lp-circuit path,
+.lp-circuit rect {
+  fill: none;
+  stroke: var(--hairline-strong);
+  stroke-width: 1;
+}
+.lp-circuit circle {
+  fill: var(--background);
+  stroke: var(--hairline-strong);
+}
+
+/* Hand-drawn underline that draws itself in on load. */
+.lp-underline {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: lp-draw 1100ms cubic-bezier(0.65, 0, 0.35, 1) forwards;
+}
+.lp-underline-delay {
+  animation-delay: 650ms;
+}
+.lp-underline-slow {
+  animation-duration: 1700ms;
+}
+@keyframes lp-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Words of the hero headline rise in one after another. */
+.lp-rise {
+  opacity: 0;
+  transform: translateY(14px);
+  animation: lp-rise 900ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+@keyframes lp-rise {
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Scroll reveal, toggled by <Reveal>. */
+.lp-reveal {
+  opacity: 0;
+  transform: translateY(18px);
+  transition:
+    opacity 800ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 800ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition-delay: var(--lp-delay, 0ms);
+}
+.lp-reveal[data-shown="true"] {
+  opacity: 1;
+  transform: none;
+}
+
+/* Marquee of open standards. Two identical tracks, the second offset by its own width. */
+.lp-marquee {
+  mask-image: linear-gradient(90deg, transparent, #000 10%, #000 90%, transparent);
+}
+.lp-marquee-track {
+  animation: lp-marquee 48s linear infinite;
+}
+.lp-marquee:hover .lp-marquee-track,
+.lp-marquee:focus-within .lp-marquee-track {
+  animation-play-state: paused;
+}
+@keyframes lp-marquee {
+  to {
+    transform: translateX(-100%);
+  }
+}
+
+/* How-it-works tab progress underline. */
+.lp-progress {
+  transform-origin: left center;
+  transform: scaleX(0);
+  animation: lp-progress var(--lp-duration, 7000ms) linear forwards;
+}
+.lp-progress[data-paused="true"] {
+  animation-play-state: paused;
+}
+@keyframes lp-progress {
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* Radar sweep in the reconcile card. */
+.lp-radar-sweep {
+  background: conic-gradient(from 0deg, transparent 0deg, color-mix(in oklch, var(--human) 32%, transparent) 50deg, transparent 52deg);
+  animation: lp-spin 4.2s linear infinite;
+  mask-image: radial-gradient(circle, #000 0 69%, transparent 70%);
+}
+@keyframes lp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Soft expanding ring for live dots. */
+.lp-ping {
+  animation: lp-ping 2.2s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+@keyframes lp-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  80%,
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
+}
+
+/* Blinking caret for the typed hash. */
+.lp-caret {
+  animation: lp-caret 1s steps(1) infinite;
+}
+@keyframes lp-caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Fingerprint ridges light up one after another. */
+.lp-ridge {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: lp-ridge 3.6s ease-in-out infinite;
+  animation-delay: calc(var(--i, 0) * 120ms);
+}
+@keyframes lp-ridge {
+  0% {
+    stroke-dashoffset: 1;
+    opacity: 0.25;
+  }
+  35%,
+  70% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 0.25;
+  }
+}
+
+/* Signature stroke in the final call to action, drawn when it scrolls into view. */
+.lp-signature {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+}
+[data-shown="true"] .lp-signature {
+  animation: lp-draw 2400ms cubic-bezier(0.65, 0, 0.35, 1) 300ms forwards;
+}
+
+/* Animated dashed connector in the plan card. */
+.lp-flow {
+  stroke-dasharray: 3 5;
+  animation: lp-flow 1.2s linear infinite;
+}
+@keyframes lp-flow {
+  to {
+    stroke-dashoffset: -16;
+  }
+}
+
+/* Grid of dots used as a section texture. */
+.lp-dots {
+  background-image: radial-gradient(color-mix(in oklch, var(--foreground) 14%, transparent) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+/* Canvas fade-in when a scene mounts. */
+.lp-fade-in {
+  animation: lp-fade 700ms ease-out both;
+}
+@keyframes lp-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lp-rise,
+  .lp-reveal {
+    opacity: 1;
+    transform: none;
+  }
+  .lp-underline,
+  .lp-signature,
+  .lp-ridge {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+  .lp-marquee-track,
+  .lp-radar-sweep,
+  .lp-ping,
+  .lp-flow,
+  .lp-caret {
+    animation: none;
+  }
+}
