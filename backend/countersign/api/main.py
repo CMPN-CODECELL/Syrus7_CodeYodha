@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 import re
 import secrets
@@ -35,6 +34,7 @@ from countersign.core.models import (
     Account,
     Approval,
     AttackRunRow,
+    AuditEvent,
     BrokerOrderMirror,
     Capability,
     ChatMessage,
@@ -988,15 +988,28 @@ def _gateway_status() -> dict | None:
         return None
 
 
-def _gateway_account(gw: dict | None, account_id: str) -> dict | None:
-    """One account's session in the gateway heartbeat (keyed by a hash of the UCC; the heartbeat never holds a full
-    UCC). Falls back to the top-level fields for a gateway that predates per-account status."""
-    if not gw:
+_STATUS_KEYS: dict[str, str] = {}  # account id -> its name in the gateway heartbeat (an HMAC only the gateway can compute)
+
+
+def _status_key(account_id: str) -> str | None:
+    if account_id not in _STATUS_KEYS:
+        key = linking.gateway_status_key(account_id)
+        if not key:
+            return None  # not served (or the gateway is unreachable): never cached
+        _STATUS_KEYS[account_id] = key
+    return _STATUS_KEYS[account_id]
+
+
+def _gateway_account(gw: dict | None, account_id: str | None) -> dict | None:
+    """One account's session in the gateway heartbeat. The heartbeat never holds a UCC: each account is named by an
+    HMAC with a gateway-only key, which the gateway tells the API per account (GET /v1/account-key, read key)."""
+    if not gw or not account_id:
         return None
     per = gw.get("accounts")
     if not isinstance(per, dict):
-        return {"logged_in": gw.get("logged_in"), "token_expires_at": gw.get("token_expires_at"), "last_error": (gw.get("http") or {}).get("last_error"), "account": gw.get("account")}
-    return per.get(hashlib.sha256(account_id.encode()).hexdigest()[:16])
+        return None
+    key = _status_key(account_id)
+    return per.get(key) if key else None
 
 
 def _account_rows(s, u: User, active_id: str) -> list[dict]:
@@ -1051,9 +1064,13 @@ def broker_set_active(body: ActiveBody, p: Principal = Depends(current)):
 
 LINK_PURPOSE = "LINK_021"
 LINK_NONCE_TTL = timedelta(minutes=5)
-# Link attempts that reach the gateway: per user and per client IP (the TCP peer; every browser behind the local
-# proxy shares one IP bucket). Each attempt that passes is one real 021 login, so the budget is small.
-LINK_LIMITS = (("user", 5, 900.0), ("ip", 10, 900.0))
+# Link attempts (counted before the nonce is checked): per user 5 per 15 minutes and 10 per 24 hours, plus ONE global
+# safety cap shared by every user (60 per 15 minutes). There is deliberately no per-IP bucket: every browser reaches
+# this API from 127.0.0.1 through the Next.js proxy, and client-supplied forwarding headers are never trusted. These
+# counters live in this process (a restart resets them); the durable control is the gateway's per-UCC budget of failed
+# verification logins, which also covers the 021 account itself.
+LINK_LIMITS = (("user", 5, 900.0), ("user-day", 10, 86400.0), ("global", 60, 900.0))
+LINK_WRONG_ALERT_EVERY = 3  # a security event for the user at every 3rd wrong-credential refusal in 24 hours
 _LINK_KEY: dict = {"value": None, "at": 0.0}
 
 
@@ -1073,6 +1090,34 @@ def _require_fresh_step_up(s, u: User, p: Principal) -> None:
 
 def _link_http(e: linking.LinkRefused) -> HTTPException:
     return HTTPException(e.status, {"code": e.code, "message": e.message})
+
+
+def _paper_account_of(s, user_id: str) -> str | None:
+    return s.execute(select(Account.id).where(Account.user_id == user_id, Account.broker_kind == "paper")).scalars().first()
+
+
+def _audit_link_refusal(user_id: str, reason: str, **extra) -> None:
+    """Every refused link attempt is audited with its reason (stored under "reason": the audit scrubber redacts keys
+    named "code"). Repeated wrong-credential refusals for one user raise a security event for that user."""
+    with session_scope() as s:
+        audit.record(s, "trader", "ACCOUNT_LINK_021_REFUSED", "user", user_id, {"reason": reason, **extra})
+        if reason != "LINK_WRONG_CREDENTIALS":
+            return
+        since = datetime.now(UTC) - timedelta(hours=24)
+        n = s.execute(select(func.count()).select_from(AuditEvent).where(AuditEvent.event_type == "ACCOUNT_LINK_021_REFUSED", AuditEvent.subject_id == user_id, AuditEvent.data["reason"].astext == "LINK_WRONG_CREDENTIALS", AuditEvent.ts >= since)).scalar_one()
+        if n and n % LINK_WRONG_ALERT_EVERY == 0:
+            state.security_event(s, "warning", "BROKER_021_LINK_WRONG_CREDENTIALS", f"{n} attempts in 24 hours to connect a 021 account were refused for a wrong UCC or password. If this was not you, change your Countersign password.", {"user_id": user_id, "failures_24h": n}, actor="trader", account_id=_paper_account_of(s, user_id))
+
+
+def _undo_gateway_link(ucc: str, user_id: str, pending_only: bool) -> bool:
+    """Asks the gateway to delete the link it just verified (tried twice). False when both tries failed."""
+    for _ in range(2):
+        try:
+            linking.gateway_unlink(ucc, user_id, pending_only=pending_only)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
 
 
 @app.get("/api/broker/021/link-key")
@@ -1104,17 +1149,23 @@ def broker_link(body: LinkBody, request: Request, p: Principal = Depends(current
     """Connects the caller's own 021 account. The body is only the browser's ciphertext: this process never sees the
     UCC or password in clear, and never logs or stores the ciphertext. The gateway decrypts it, checks the nonce and
     user id issued here, verifies the password with one 021 login and stores it sealed; the account is then attached
-    to the caller and made active. Needs a fresh step-up; rate limited per user and per IP."""
+    to the caller and made active. Needs a fresh step-up; rate limited per user (and one global cap, see LINK_LIMITS)."""
     _require_gateway()
     if not 16 <= len(body.ciphertext) <= 2048:
+        _audit_link_refusal(p.user_id, "INVALID_INPUT")
         raise HTTPException(422, {"code": "INVALID_INPUT", "field": "ciphertext", "message": "The encrypted credentials are malformed."})
-    with session_scope() as s:
-        _require_fresh_step_up(s, s.get(User, p.user_id), p)
+    try:
+        with session_scope() as s:
+            _require_fresh_step_up(s, s.get(User, p.user_id), p)
+    except HTTPException as e:
+        _audit_link_refusal(p.user_id, str((e.detail or {}).get("code") if isinstance(e.detail, dict) else "STEP_UP_REQUIRED"))
+        raise
     now = time.time()
     for kind, limit, window in LINK_LIMITS:
-        who = p.user_id if kind == "user" else client_ip(request)
+        who = "all" if kind == "global" else p.user_id
         wait = _over_limit(f"link021:{kind}:{who}", limit, window, now)
         if wait:
+            _audit_link_refusal(p.user_id, "RATE_LIMITED", limit=kind)
             raise HTTPException(429, {"code": "RATE_LIMITED", "message": f"Too many connection attempts. Wait {wait} s and try again.", "retry_after_s": wait}, headers={"Retry-After": str(wait)})
     with session_scope() as s:
         row = s.execute(select(WebauthnChallenge).where(WebauthnChallenge.user_id == p.user_id, WebauthnChallenge.purpose == LINK_PURPOSE, WebauthnChallenge.used_at.is_(None)).order_by(WebauthnChallenge.created_at.desc()).limit(1).with_for_update()).scalar_one_or_none()
@@ -1124,27 +1175,49 @@ def broker_link(body: LinkBody, request: Request, p: Principal = Depends(current
             if row.expires_at > datetime.now(UTC):
                 nonce = b64url(row.challenge)
     if nonce is None:
+        _audit_link_refusal(p.user_id, "LINK_NONCE_INVALID")
         raise HTTPException(400, {"code": "LINK_NONCE_INVALID", "message": "This connection form expired or was already used. Try again."})
     try:
         res = linking.gateway_link(body.ciphertext, nonce, p.user_id)
     except linking.LinkRefused as e:
-        with session_scope() as s:
-            audit.record(s, "trader", "ACCOUNT_LINK_021_REFUSED", "user", p.user_id, {"code": e.code})
+        _audit_link_refusal(p.user_id, e.code)
         raise _link_http(e) from None
-    ucc = str(res.get("account_id") or "")
+    ucc = linking.norm_ucc(res.get("account_id"))
+    # The gateway holds the verified password as PENDING. Attach the account and confirm inside one transaction: if
+    # anything fails (a refusal, a race, a database error, the commit itself), the gateway is told to delete the link
+    # (tried twice), and it deletes any link it never got a confirmation for within two minutes anyway.
+    confirm_sent = False  # once the confirmation was sent, the gateway may hold a CONFIRMED password (answer lost)
     try:
         with session_scope() as s:
             u = s.get(User, p.user_id, with_for_update=True)
             linking.attach_self_link(s, u, ucc)
+            s.flush()
+            confirm_sent = True
+            linking.gateway_confirm(ucc, p.user_id)
             state.security_event(s, "info", "BROKER_021_LINKED", f"021 account {linking.mask(ucc)} connected. Its password is stored encrypted by the 021 gateway.", {"account": linking.mask(ucc), "user_id": p.user_id}, actor="trader", account_id=ucc)
-    except linking.LinkRefused as e:
-        try:
-            linking.gateway_unlink(ucc, p.user_id)  # the API refused it: the gateway must not keep this credential
-        except linking.LinkRefused:
-            pass
-        with session_scope() as s:
-            audit.record(s, "trader", "ACCOUNT_LINK_021_REFUSED", "user", p.user_id, {"code": e.code, "account": linking.mask(ucc)})
-        raise _link_http(e) from None
+    except Exception as e:  # noqa: BLE001
+        # LINK_EXPIRED is the gateway's definite answer that nothing was confirmed: an earlier password is kept then.
+        confirmed = confirm_sent and not (isinstance(e, linking.LinkRefused) and e.code == "LINK_EXPIRED")
+        removed = _undo_gateway_link(ucc, p.user_id, pending_only=not confirmed)
+        if removed and confirmed:
+            # The confirmed password is gone again, so an earlier link of this user to the account must go too.
+            try:
+                with session_scope() as s:
+                    u = s.get(User, p.user_id, with_for_update=True)
+                    if linking.self_linked(s, ucc, u.id):
+                        linking.detach_self_link(s, u, ucc)
+            except Exception:  # noqa: BLE001
+                removed = False
+        reason = e.code if isinstance(e, linking.LinkRefused) else "LINK_ATTACH_FAILED"
+        _audit_link_refusal(p.user_id, reason, account=linking.mask(ucc), gateway_link_removed=removed)
+        if not removed:
+            with session_scope() as s:
+                state.security_event(s, "warning", "BROKER_021_LINK_ROLLBACK_FAILED", f"Connecting 021 account {linking.mask(ucc)} failed and the 021 gateway could not delete the password it had just verified." + ("" if confirmed else " It deletes unconfirmed passwords on its own within two minutes."), {"account": linking.mask(ucc), "user_id": p.user_id}, actor="trader", account_id=_paper_account_of(s, p.user_id))
+            msg = "Connecting failed, and the 021 gateway could not delete the password it had just checked." + (" It deletes it on its own within two minutes. Try again after that." if not confirmed else " Disconnect this account in the Security Center, then try again.")
+            raise HTTPException(503, {"code": "LINK_ROLLBACK_FAILED", "message": msg}) from None
+        if isinstance(e, linking.LinkRefused):
+            raise _link_http(e) from None
+        raise HTTPException(500, {"code": "LINK_FAILED", "message": "Connecting failed on our side. Nothing was kept. Try again."}) from None
     _kinds.pop(ucc, None)
     with session_scope() as s:
         rows = _account_rows(s, s.get(User, p.user_id), ucc)
@@ -1169,10 +1242,20 @@ def broker_unlink(body: UnlinkBody, p: Principal = Depends(current)):
                 linking.detach_self_link(s, u, body.account_id)  # raises the precise refusal
             except linking.LinkRefused as e:
                 raise _link_http(e) from None
-    try:
-        linking.gateway_unlink(body.account_id, p.user_id)
-    except linking.LinkRefused as e:
-        raise HTTPException(503, {"code": "GATEWAY021_UNAVAILABLE", "message": f"The 021 gateway could not delete the stored password ({e.message}) Nothing was changed; try again."}) from None
+    # The gateway deletes the stored password first (tried twice). If it cannot, nothing is changed here either, so the
+    # link and the stored password stay consistent and the trader can simply try again.
+    failure: linking.LinkRefused | None = None
+    for _ in range(2):
+        try:
+            linking.gateway_unlink(body.account_id, p.user_id)
+            failure = None
+            break
+        except linking.LinkRefused as e:
+            failure = e
+    if failure is not None:
+        with session_scope() as s:
+            audit.record(s, "trader", "ACCOUNT_UNLINK_021_FAILED", "user", p.user_id, {"reason": failure.code, "account": linking.mask(body.account_id)})
+        raise HTTPException(503, {"code": "GATEWAY021_UNAVAILABLE", "message": "The 021 gateway could not delete the stored password. Nothing was changed and the account stays connected; try again."})
     with session_scope() as s:
         u = s.get(User, p.user_id, with_for_update=True)
         try:

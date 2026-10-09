@@ -4,11 +4,14 @@ Two ways to be linked:
   - operator model (the .env account): the 021 account id is its UCC, which only the gateway knows from configuration;
     the API learns it from the gateway's GET /v1/account with its read key (never the password or token). Users whose
     email is listed in CS_021_OWNER_EMAILS are linked on sign-up and sign-in and land on it (accounts.linked_via =
-    'operator'); the list is authoritative.
+    'operator'); the list is authoritative. An account counts as operator-linked ONLY while its id equals the
+    gateway's current .env UCC (normalized): a listed owner never operates any other 021 row, whatever its linked_via
+    says, and rows left as 'operator' by an earlier .env UCC are switched to 'self'.
   - self-service: a trader enters their own UCC and password, encrypted in the browser to the gateway's public key; the
     API relays only the ciphertext (with the nonce it issued and the user id) to the gateway, which verifies them with
     one 021 login and keeps the password sealed. The API then records a broker_links row (the grant) and attaches the
-    account (accounts.linked_via = 'self'). Disconnecting deletes the row and the gateway's stored credential.
+    account (accounts.linked_via = 'self') and confirms the link to the gateway, which deletes any link it does not
+    confirm within two minutes. Disconnecting deletes the row and the gateway's stored credential.
 A trader may operate a 021 account while linked to it (owner or member row) AND either holds a broker_links row for it
 or is a listed owner of the operator-linked account."""
 
@@ -16,7 +19,8 @@ from __future__ import annotations
 
 import time
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from countersign.core import audit
@@ -30,18 +34,28 @@ def mask(account_id: str) -> str:
     return (account_id[:4] + "***" + account_id[-1:]) if len(account_id) > 5 else "***"
 
 
+def norm_ucc(v: object) -> str:
+    """The one spelling of a UCC (same rule as the gateway's settings): trimmed and upper-case."""
+    return str(v or "").strip().upper()
+
+
 def gateway_account_id(refresh: bool = False) -> str | None:
     """The 021 account id served by the gateway (cached for 10 minutes), or None when the gateway is not running."""
     if not settings().gateway021_enabled:
         return None
     if not refresh and _ucc["value"] and time.time() - _ucc["at"] < 600:
         return _ucc["value"]
+    if not refresh and time.time() - _ucc.get("failed_at", 0.0) < 15:
+        return _ucc["value"]  # the gateway did not answer moments ago: owner checks do not wait on it again
     try:
         import httpx
 
-        r = httpx.get(settings().gateway021_url + "/v1/account", headers={"Authorization": f"Bearer {settings().broker_read_key}"}, timeout=3.0)
-        acct = r.json().get("account_id") if r.status_code == 200 else None
+        # Any broker key opens GET /v1/account: the API holds the read key, the executor only the write key.
+        key = settings().broker_read_key or settings().broker_write_key or settings().broker_admin_key
+        r = httpx.get(settings().gateway021_url + "/v1/account", headers={"Authorization": f"Bearer {key}"}, timeout=3.0)
+        acct = norm_ucc(r.json().get("account_id")) if r.status_code == 200 else None
     except Exception:  # noqa: BLE001
+        _ucc["failed_at"] = time.time()
         return _ucc["value"]
     if acct:
         _ucc.update(value=acct, at=time.time())
@@ -56,15 +70,31 @@ def self_linked(s: Session, account_id: str, user_id: str) -> bool:
     return s.get(BrokerLink, (account_id, user_id)) is not None
 
 
+def is_env_account(account_id: str) -> bool:
+    """True only for the gateway's CURRENT .env account (normalized ids); False when the gateway is not known."""
+    env = gateway_account_id()
+    return bool(env) and norm_ucc(account_id) == norm_ucc(env)
+
+
+def retire_stale_operator_rows(s: Session) -> int:
+    """021 rows marked operator-linked (or NULL) whose id is not the gateway's current .env UCC become 'self': the owner
+    list applies only to the current .env account. No-op while the gateway's account is unknown."""
+    env = gateway_account_id()
+    if not env:
+        return 0
+    res = s.execute(update(Account).where(Account.broker_kind == "021", (Account.linked_via.is_(None)) | (Account.linked_via != "self"), Account.id != norm_ucc(env)).values(linked_via="self"))
+    return int(res.rowcount or 0)
+
+
 def may_operate_021(s: Session, acct: Account, user: User | None) -> bool:
     """For a 021 account the trader is already linked to (owner or member row): their own self-service link, or (only
-    for the operator-linked .env account) an email STILL listed in CS_021_OWNER_EMAILS. Used by the API on every
-    request and by the executor before sending."""
+    for the gateway's current .env account) an email STILL listed in CS_021_OWNER_EMAILS. linked_via is never enough
+    on its own. Used by the API on every request and by the executor before sending."""
     if user is None:
         return False
     if self_linked(s, acct.id, user.id):
         return True
-    return acct.linked_via != "self" and is_owner(user)  # NULL (an older row) is the operator-linked account
+    return is_owner(user) and is_env_account(acct.id)
 
 
 def can_operate(s: Session, user_id: str, account_id: str) -> bool:
@@ -110,6 +140,7 @@ def link_on_sign_in(s: Session, user: User) -> str | None:
         ucc = gateway_account_id()
         if not ucc:
             return None
+        retire_stale_operator_rows(s)
         acct = s.get(Account, ucc)
         if acct is None:
             acct = Account(id=ucc, user_id=user.id, label="021 sandbox account", segments=["EQ", "FO"], trading_enabled=True, broker_kind="021", linked_via="operator")
@@ -199,35 +230,66 @@ def gateway_link_key() -> dict:
 
 
 def gateway_link(ciphertext: str, nonce: str, user_id: str) -> dict:
-    """Relays the browser's ciphertext (opaque here) with the nonce this API issued and the caller's user id."""
+    """Relays the browser's ciphertext (opaque here) with the nonce this API issued and the caller's user id. The
+    gateway answers with a PENDING link that confirm_link must confirm."""
     status, body = _gateway_call("POST", "/admin/link", settings().broker_admin_key, {"ciphertext": ciphertext, "nonce": nonce, "user_id": user_id})
     if status != 200:
-        raise LinkRefused(status if status in (400, 401, 403, 422, 503) else 502, str(body.get("code") or "LINK_FAILED"), str(body.get("message") or "The 021 gateway refused the link."))
+        raise LinkRefused(status if status in (400, 401, 403, 409, 422, 429, 503) else 502, str(body.get("code") or "LINK_FAILED"), str(body.get("message") or "The 021 gateway refused the link."))
     return body
 
 
-def gateway_unlink(account_id: str, user_id: str) -> dict:
-    status, body = _gateway_call("POST", "/admin/unlink", settings().broker_admin_key, {"account_id": account_id, "user_id": user_id})
+def gateway_confirm(account_id: str, user_id: str) -> dict:
+    """Tells the gateway the account is attached, so it keeps the verified password (it deletes unconfirmed ones)."""
+    status, body = _gateway_call("POST", "/admin/link/confirm", settings().broker_admin_key, {"account_id": account_id, "user_id": user_id})
+    if status != 200:
+        raise LinkRefused(409 if status == 409 else 503, str(body.get("code") or "LINK_CONFIRM_FAILED"), str(body.get("message") or "The 021 gateway could not complete the connection. Nothing was stored. Try again."))
+    return body
+
+
+def gateway_unlink(account_id: str, user_id: str, pending_only: bool = False) -> dict:
+    status, body = _gateway_call("POST", "/admin/unlink", settings().broker_admin_key, {"account_id": account_id, "user_id": user_id, "pending_only": pending_only})
     if status != 200:
         raise LinkRefused(503 if status >= 500 else status, str(body.get("code") or "UNLINK_FAILED"), str(body.get("message") or "The 021 gateway could not delete the stored credential."))
     return body
 
 
+def gateway_status_key(account_id: str) -> str | None:
+    """The gateway's name for this account in its status heartbeat (an HMAC with a gateway-only key), or None when the
+    gateway does not serve it or cannot be reached."""
+    import httpx
+
+    try:
+        with gateway_http() as c:
+            r = c.get("/v1/account-key", headers={"Authorization": f"Bearer {settings().broker_read_key}", "X-Account": account_id}, timeout=3.0)
+        key = r.json().get("key") if r.status_code == 200 else None
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return None
+    return str(key) if key else None
+
+
 def attach_self_link(s: Session, user: User, ucc: str) -> Account:
     """Records a verified self-service link and makes the account the trader's active one. Refuses a UCC that is
-    already linked to another Countersign user (the operator-linked .env account excepted: proving its password links
-    the trader as a member) and an id that belongs to a paper account."""
-    acct = s.get(Account, ucc, with_for_update=True)
-    if acct is not None and acct.broker_kind != "021":
+    already linked to another Countersign user (only the gateway's current .env account is excepted: proving its
+    password links the trader as a member) and an id that belongs to a paper account. The account row is created
+    race-safely (INSERT ... ON CONFLICT DO NOTHING, then SELECT ... FOR UPDATE), so two traders linking the same new UCC
+    at once get one link and one clean refusal."""
+    ucc = norm_ucc(ucc)
+    env = is_env_account(ucc)
+    created = s.execute(
+        pg_insert(Account)
+        .values(id=ucc, user_id=user.id, label="021 account", segments=["EQ", "FO"], trading_enabled=True, broker_kind="021", linked_via="operator" if env else "self")
+        .on_conflict_do_nothing(index_elements=[Account.id])
+        .returning(Account.id)
+    ).first() is not None
+    acct = s.execute(select(Account).where(Account.id == ucc).with_for_update().execution_options(populate_existing=True)).scalar_one()
+    if acct.broker_kind != "021":
         raise LinkRefused(409, "UCC_CONFLICT", "That UCC cannot be linked here.")
     others = [x for x in s.execute(select(BrokerLink.user_id).where(BrokerLink.account_id == ucc)).scalars() if x != user.id]
-    if acct is None:
-        acct = Account(id=ucc, user_id=user.id, label="021 account", segments=["EQ", "FO"], trading_enabled=True, broker_kind="021", linked_via="self")
-        s.add(acct)
-        s.flush()
-    elif acct.linked_via == "self" and others:
+    if not env and acct.linked_via != "self":
+        acct.linked_via = "self"  # not the current .env account: the owner list never applies to it
+    if not created and others and not env:
         raise LinkRefused(409, "UCC_LINKED_ELSEWHERE", "That 021 account is already connected to another Countersign user. Nothing was changed.")
-    elif acct.user_id != user.id:
+    if not created and acct.user_id != user.id:
         anchor = s.get(User, acct.user_id)
         if acct.linked_via == "self" and not (anchor is not None and self_linked(s, ucc, anchor.id)):
             # A self-linked account whose earlier trader disconnected: the new trader becomes its anchor.

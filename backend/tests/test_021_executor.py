@@ -127,6 +127,9 @@ def acct021(monkeypatch):
             s.add(Account(id=ACCT, user_id=lab_user_id(), label="021 test", segments=["EQ", "FO"], trading_enabled=True, broker_kind="021"))
         s.get(User, lab_user_id()).email = LAB_EMAIL
     monkeypatch.setattr(settings(), "owner_emails_021", LAB_EMAIL)
+    from countersign.broker021 import linking
+
+    monkeypatch.setattr(linking, "gateway_account_id", lambda refresh=False: ACCT)  # ACCT is the gateway's .env account
     _kinds.pop(ACCT, None)
     from countersign.core.verifier import AccountState
 
