@@ -7,13 +7,15 @@ import { BrandMark } from "@/components/shell/brand";
 import { Sheet, SheetClose, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 import { IstClock, ThemeToggle } from "./controls";
-import { useLandingSession, usePublicStatus, useReducedMotion } from "./hooks";
+import { useIsClient, useLandingSession, usePublicStatus, useReducedMotion } from "./hooks";
 import { arrowNudge } from "./styles";
 
 /** Where the public market data comes from, from the status feed. Hidden until the first answer. */
 function MarketPill({ className }: { className?: string }) {
   const { data } = usePublicStatus();
-  if (!data?.market) return null;
+  // The shared status poll can answer before the nav hydrates, so render only after hydration to match the server HTML.
+  const isClient = useIsClient();
+  if (!isClient || !data?.market) return null;
   return (
     <span className={cn("rounded-full border border-hairline-strong px-2 py-0.5 text-[10.5px] font-medium tracking-wide text-muted-foreground", className)}>
       {data.market.mode === "live" ? "021 sandbox feed" : "Replay market"}
