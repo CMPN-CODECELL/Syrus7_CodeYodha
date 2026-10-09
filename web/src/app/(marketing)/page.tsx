@@ -15,7 +15,7 @@ import { StandardsMarquee } from "@/components/landing/standards-marquee";
 export const metadata: Metadata = {
   title: { absolute: "Countersign: the AI proposes, you countersign" },
   description:
-    "An AI trading copilot for 021 Trade that cannot trade without your signature, running here on a paper account and a simulated market. The AI reads and drafts, a deterministic verifier checks, and you countersign the exact order with your passkey.",
+    "An AI trading copilot for 021 Trade that cannot trade without your signature. It works with the 021 Developer Sandbox, and with a local paper broker for the Attack Lab and offline demos. The AI reads and drafts, a deterministic verifier checks, and you countersign the exact order with your passkey.",
 };
 
 /** Public landing page. A server component composing small client islands. */

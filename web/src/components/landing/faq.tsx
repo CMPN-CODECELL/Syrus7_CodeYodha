@@ -10,7 +10,7 @@ import { container } from "./styles";
 const FAQS: { q: string; a: ReactNode }[] = [
   {
     q: "Is real money at risk?",
-    a: "No. This build trades on a simulated paper broker against a replayed NSE market. Your account is a paper account seeded with demo cash and holdings, and nothing is sent to a real exchange.",
+    a: "No. Countersign works with the 021 Developer Sandbox, where every account trades virtual money on 021's simulated exchange. New Countersign accounts start on a local paper broker seeded with demo cash and holdings; for the hackathon the operator links the 021 Sandbox account. The Attack Lab always runs on its own paper sandboxes. Nothing reaches a real exchange.",
   },
   {
     q: "What can the AI actually do?",
@@ -26,11 +26,11 @@ const FAQS: { q: string; a: ReactNode }[] = [
   },
   {
     q: "Do I need to install anything?",
-    a: "Everything except the optional AI model runs locally on free and open source software: Docker for PostgreSQL and Valkey, Python for the API, executor, paper broker, market replay and monitor, and Node for this web app. The AI can use the free tiers of Groq or Gemini (each needs a free account and API key) or a local Ollama model; with no key at all, a built-in deterministic engine answers. Nothing is paid. Once it is running, all you need is a browser: sign up, choose your PIN and register a passkey.",
+    a: "Everything except the optional AI model runs locally on free and open source software: Docker for PostgreSQL and Valkey, Python for the API, executor, paper broker, market replay and monitor, and Node for this web app. The AI can use the free tiers of Groq or Gemini (each needs a free account and API key) or a local Ollama model; with no key at all, a built-in deterministic engine answers. Trading on the 021 Developer Sandbox needs a free 021 developer account; without one, everything runs on the local paper broker. Nothing is paid. Once it is running, all you need is a browser: sign up, choose your PIN and register a passkey.",
   },
   {
     q: "What happens if the broker times out?",
-    a: "Every order carries a unique tag and is written to an outbox before it is sent. If the reply is lost, the executor looks the order up by its tag before doing anything else, and only retries once it has confirmed the order is not there. It never retries blindly, so one approval means at most one order.",
+    a: "Every order is written to an outbox before it is sent. If the reply is lost, the executor checks the broker's order book before doing anything else: on the local paper broker by the order's unique tag, on the 021 sandbox (which has no client order tag) by matching the order's details. It never resends on its own. If the order is not there it is marked not placed and you can countersign it again; if the executor cannot tell, the order waits for your review. One approval means at most one order.",
   },
 ];
 

@@ -7,8 +7,19 @@ import { BrandMark } from "@/components/shell/brand";
 import { Sheet, SheetClose, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 import { IstClock, ThemeToggle } from "./controls";
-import { useLandingSession, useReducedMotion } from "./hooks";
+import { useLandingSession, usePublicStatus, useReducedMotion } from "./hooks";
 import { arrowNudge } from "./styles";
+
+/** Where the public market data comes from, from the status feed. Hidden until the first answer. */
+function MarketPill({ className }: { className?: string }) {
+  const { data } = usePublicStatus();
+  if (!data?.market) return null;
+  return (
+    <span className={cn("rounded-full border border-hairline-strong px-2 py-0.5 text-[10.5px] font-medium tracking-wide text-muted-foreground", className)}>
+      {data.market.mode === "live" ? "021 sandbox feed" : "Replay market"}
+    </span>
+  );
+}
 
 export const NAV_LINKS = [
   { id: "product", label: "Product" },
@@ -114,9 +125,7 @@ export function SiteNav() {
         <div className="ml-auto flex items-stretch">
           <div className={cn(cell, "hidden gap-2.5 px-5 xl:flex")}>
             <IstClock />
-            <span className="rounded-full border border-hairline-strong px-2 py-0.5 text-[10.5px] font-medium tracking-wide text-muted-foreground">
-              Replay market
-            </span>
+            <MarketPill />
           </div>
           <div className={cn(cell, "px-1.5 sm:px-2")}>
             <ThemeToggle />
@@ -196,7 +205,7 @@ export function SiteNav() {
               <div className="mt-auto space-y-3 border-t border-hairline p-5">
                 <div className="flex items-center justify-between">
                   <IstClock />
-                  <span className="rounded-full border border-hairline-strong px-2 py-0.5 text-[10.5px] text-muted-foreground">Replay market</span>
+                  <MarketPill className="font-normal tracking-normal" />
                 </div>
                 {pending ? null : signedIn ? (
                   <SheetClose

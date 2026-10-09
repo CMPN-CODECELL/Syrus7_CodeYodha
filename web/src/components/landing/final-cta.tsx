@@ -26,7 +26,7 @@ export function FinalCta() {
             Ready to <span className="text-human">countersign?</span>
           </h2>
           <p className="mx-auto mt-6 max-w-xl text-[17px] leading-relaxed text-muted-foreground">
-            Create an account, choose your PIN, register your passkey and place a trade on the simulated market. Nothing here
+            Create an account, choose your PIN, register your passkey and place a trade on the local paper broker. Nothing here
             touches real money.
           </p>
           <div className="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row">

@@ -4,7 +4,7 @@ import { ExploreButton } from "./cta";
 import { HERO_SIGNATURE_POINT } from "./scenes/hero-ribbons";
 import { btnSecondary } from "./styles";
 
-const TRUST = ["Open source stack", "Paper account, simulated market", "No paid APIs", "Works without an AI key"];
+const TRUST = ["Open source stack", "021 Developer Sandbox, virtual money", "No paid APIs", "Works without an AI key"];
 
 /** Hairline "circuit" shapes behind the hero, after the reference's faint rounded outlines. */
 function Circuit() {
@@ -89,9 +89,9 @@ export function Hero() {
         </h1>
 
         <p className="lp-rise mt-8 max-w-[620px] text-[17px] leading-relaxed text-muted-foreground sm:text-[19px]" style={{ animationDelay: "380ms" }}>
-          Countersign is an AI trading copilot for 021 Trade, running here on a paper account and a simulated market. Ask in plain
-          English and the AI reads your portfolio and drafts the order; a deterministic verifier checks every field, and nothing
-          reaches the broker until you sign that exact order on your own device.
+          Countersign is an AI trading copilot for 021 Trade. It works with the 021 Developer Sandbox, and with a local paper broker
+          for the Attack Lab and offline demos. Ask in plain English and the AI reads your portfolio and drafts the order; a
+          deterministic verifier checks every field, and nothing reaches the broker until you sign that exact order on your own device.
         </p>
 
         <div className="lp-rise mt-10 flex flex-col gap-3 sm:flex-row sm:items-center" style={{ animationDelay: "500ms" }}>

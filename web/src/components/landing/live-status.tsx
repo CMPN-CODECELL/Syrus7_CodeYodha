@@ -109,7 +109,7 @@ function Market({ data }: { data: LandingStatus }) {
     <div className="flex flex-wrap items-center justify-between gap-4">
       <div>
         <p className="text-[12px] text-muted-foreground">
-          NIFTY 50 <span className="text-subtle">· replayed market</span>
+          NIFTY 50 <span className="text-subtle">· {data.market?.mode === "live" ? "live from the 021 sandbox" : "replayed market"}</span>
         </p>
         <p className="num mt-1 text-[20px] font-semibold">
           {price(nifty.ltp_paise)}{" "}

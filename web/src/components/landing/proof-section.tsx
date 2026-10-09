@@ -48,8 +48,8 @@ export function ProofSection() {
             <GlobeCanvas className="absolute inset-0" />
           </div>
           <p className="mt-2 text-center text-[12px] text-subtle">
-            Runs on one laptop: every service, the paper broker and the replayed market are local (the AI model can be a free cloud
-            tier or a local one).
+            Runs on one laptop: every service, the paper broker and the market replay are local. The only outside services are the
+            021 Developer Sandbox and, if you choose one, a free cloud AI model.
           </p>
         </div>
       </div>

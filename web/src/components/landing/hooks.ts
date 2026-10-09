@@ -140,7 +140,7 @@ export interface PublicStatus {
   attacks_blocked: number;
   last_attack_run_at: string | null;
   audit_events: number;
-  market: { mode: "replay"; nifty: { ltp_paise: number; change_bps: number } | null };
+  market: { mode: "replay" | "live"; nifty: { ltp_paise: number; change_bps: number } | null };
   generated_at: string;
 }
 
