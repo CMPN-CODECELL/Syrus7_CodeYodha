@@ -83,12 +83,12 @@ def main() -> None:
 
     if "--no-docker" not in args:
         print("starting postgres + valkey (docker compose)...")
-        subprocess.run(["docker", "compose", "up", "-d", "postgres", "valkey"], cwd=ROOT, check=True)
+        subprocess.run(["docker", "compose", "up", "-d", "postgres", "valkey"], cwd=ROOT, check=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         wait_port(55432)
         wait_port(56379)
         time.sleep(1.0)
     print("bootstrapping schema + seed...")
-    subprocess.run([py(), "-m", "countersign.core.bootstrap"], cwd=BACKEND, env=base, check=True)
+    subprocess.run([py(), "-m", "countersign.core.bootstrap"], cwd=BACKEND, env=base, check=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
     plan = [
         ("broker", ["-m", "countersign.broker.app"], {"CS_BROKER_READ_KEY": k["read"], "CS_BROKER_WRITE_KEY": k["write"], "CS_BROKER_ADMIN_KEY": k["admin"], "CS_BROKER_NAIVE_KEY": k["naive"], "CS_BROKER_AUDIT_KEY": k["audit"]}, 8100),
@@ -103,7 +103,8 @@ def main() -> None:
         ("monitor", ["-m", "countersign.monitor.main"], {"CS_BROKER_AUDIT_KEY": k["audit"]}, None),
     ]
     procs: list[tuple[str, subprocess.Popen]] = []
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    # Windows: no console window for any child (the stack runs hidden; nothing pops up on the screen).
+    flags = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0
     for name, argv, env_extra, port in plan:
         log = open(LOGS / f"{name}.log", "w", encoding="utf-8")
         p = subprocess.Popen([py(), *argv], cwd=BACKEND, env={**base, **env_extra}, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
