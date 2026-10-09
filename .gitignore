@@ -1,0 +1,15 @@
+.env
+.env.local
+.secrets/
+.logs/
+__pycache__/
+*.pyc
+backend/.venv/
+backend/.pytest_cache/
+backend/.hypothesis/
+web/node_modules/
+web/.next/
+web/.env*.local
+formal/*.jar
+formal/states/
+.DS_Store
