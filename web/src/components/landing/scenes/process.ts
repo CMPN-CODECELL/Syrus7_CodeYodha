@@ -1,8 +1,9 @@
-import { clamp01, lerp, quad, rand, rgba, type SceneFactory } from "./util";
+import { clamp01, combLine, combQuad, createComb, lerp, quad, rand, rgba, type SceneFactory } from "./util";
 
 // One scene per "How it works" step. Each is a calm, looping line drawing in the step's color:
 // 01 Ask (violet, the AI's color), 02 Verify (blue to mint), 03 Countersign (mint, the human's
 // color), 04 Execute (violet field with a single mint path that is sent exactly once).
+// In all four the pointer combs the lines apart while each scene's origin stays pinned.
 
 type RGB = readonly [number, number, number];
 
@@ -34,6 +35,9 @@ function dot(ctx: CanvasRenderingContext2D, x: number, y: number, r: number) {
   ctx.fill();
 }
 
+/** The same comb in every step, a little tighter than the hero's to suit the smaller panel. */
+const stepComb = () => createComb({ radius: 140, strength: 54, core: 14 });
+
 /** 01 Ask: a fan of possible readings radiating from your words, swaying as the AI drafts. */
 export const askScene: SceneFactory = (ctx, { dark }) => {
   const C = palette(dark);
@@ -44,14 +48,17 @@ export const askScene: SceneFactory = (ctx, { dark }) => {
     const a = Math.sign(r - 0.5) * Math.pow(Math.abs(r - 0.5) * 2, 1.25) * 1.42;
     return { a, len: 0.35 + rand(i + 40) * 0.62, ph: rand(i + 80) * Math.PI * 2, sp: 0.4 + rand(i + 120) * 0.5 };
   });
+  const comb = stepComb();
   let w = 0;
   let h = 0;
   return {
     resize(s) {
       w = s.w;
       h = s.h;
+      comb.pin(w / 2, h + 6, 110);
     },
-    frame(t) {
+    frame(t, dt, pointer) {
+      comb.update(pointer, dt);
       ctx.clearRect(0, 0, w, h);
       ctx.globalCompositeOperation = C.mode;
       const ox = w / 2;
@@ -75,11 +82,11 @@ export const askScene: SceneFactory = (ctx, { dark }) => {
         const y = oy - Math.cos(a) * len;
         ctx.globalAlpha = 0.55;
         ctx.beginPath();
-        ctx.moveTo(ox, oy);
-        ctx.lineTo(x, y);
+        combLine(ctx, comb, ox, oy, x, y);
         ctx.stroke();
         ctx.globalAlpha = 0.9;
-        dot(ctx, x, y, 1.6);
+        const p = comb.apply(x, y);
+        dot(ctx, p[0], p[1], 1.6);
       }
       ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = "source-over";
@@ -90,6 +97,7 @@ export const askScene: SceneFactory = (ctx, { dark }) => {
 /** 02 Verify: a wave of stems; a scan sweeps across and every stem it has checked turns mint. */
 export const verifyScene: SceneFactory = (ctx, { dark }) => {
   const C = palette(dark);
+  const comb = stepComb();
   let w = 0;
   let h = 0;
   return {
@@ -97,7 +105,8 @@ export const verifyScene: SceneFactory = (ctx, { dark }) => {
       w = s.w;
       h = s.h;
     },
-    frame(t) {
+    frame(t, dt, pointer) {
+      comb.update(pointer, dt);
       ctx.clearRect(0, 0, w, h);
       ctx.globalCompositeOperation = C.mode;
       const margin = w * 0.08;
@@ -128,11 +137,11 @@ export const verifyScene: SceneFactory = (ctx, { dark }) => {
         const checked = x <= scan;
         ctx.strokeStyle = checked ? okStroke : pendingStroke;
         ctx.beginPath();
-        ctx.moveTo(x, base);
-        ctx.lineTo(x, top);
+        combLine(ctx, comb, x, base, x, top);
         ctx.stroke();
         ctx.fillStyle = rgba(checked ? C.mint : C.violet, checked ? 1 : 0.7);
-        dot(ctx, x, top, checked ? 1.8 : 1.4);
+        const p = comb.apply(x, top);
+        dot(ctx, p[0], p[1], checked ? 1.8 : 1.4);
       }
       // The scan line itself.
       if (scan < w - margin) {
@@ -158,14 +167,17 @@ export const countersignScene: SceneFactory = (ctx, { dark }) => {
     const a = (r - 0.5) * 2.95;
     return { a, len: 0.45 + rand(i + 33) * 0.55, bend: 0.45 + rand(i + 66) * 0.25, ph: rand(i + 99) * 6.28 };
   });
+  const comb = stepComb();
   let w = 0;
   let h = 0;
   return {
     resize(s) {
       w = s.w;
       h = s.h;
+      comb.pin(w / 2, h - 4, 110);
     },
-    frame(t) {
+    frame(t, dt, pointer) {
+      comb.update(pointer, dt);
       ctx.clearRect(0, 0, w, h);
       ctx.globalCompositeOperation = C.mode;
       const ox = w / 2;
@@ -185,14 +197,11 @@ export const countersignScene: SceneFactory = (ctx, { dark }) => {
         const bright = Math.exp(-Math.pow((r.len - wave) * 5, 2));
         ctx.strokeStyle = rgba(C.mint, 0.28 + bright * 0.5);
         ctx.beginPath();
-        ctx.moveTo(ox, oy);
-        for (let i = 1; i <= 16; i++) {
-          const k = (i / 16) * end;
-          ctx.lineTo(quad(ox, cx, tx, k), quad(oy, cy, ty, k));
-        }
+        combQuad(ctx, comb, ox, oy, cx, cy, tx, ty, 16, end, 5);
         ctx.stroke();
         ctx.fillStyle = rgba(C.mint, 0.55 + bright * 0.45);
-        dot(ctx, quad(ox, cx, tx, end), quad(oy, cy, ty, end), 1.5);
+        const p = comb.apply(quad(ox, cx, tx, end), quad(oy, cy, ty, end));
+        dot(ctx, p[0], p[1], 1.5);
       }
       const glow = ctx.createRadialGradient(ox, oy, 0, ox, oy, 70);
       glow.addColorStop(0, rgba(C.white, dark ? 0.9 : 0.5));
@@ -211,6 +220,7 @@ export const executeScene: SceneFactory = (ctx, { dark }) => {
   const N = 60;
   const arcs = Array.from({ length: N }, (_, i) => ({ k: i / (N - 1), lift: rand(i + 5) * 0.18, ph: rand(i + 17) * 6.28 }));
   const motes = Array.from({ length: 40 }, (_, i) => ({ arc: Math.floor(rand(i * 9 + 2) * N), q: rand(i * 4 + 1), v: 0.08 + rand(i * 6 + 3) * 0.1 }));
+  const comb = stepComb();
   let w = 0;
   let h = 0;
   const geom = (i: number, t: number) => {
@@ -231,8 +241,10 @@ export const executeScene: SceneFactory = (ctx, { dark }) => {
     resize(s) {
       w = s.w;
       h = s.h;
+      comb.pin(w * 0.36, h * 0.2, 100);
     },
-    frame(t, dt) {
+    frame(t, dt, pointer) {
+      comb.update(pointer, dt);
       ctx.clearRect(0, 0, w, h);
       ctx.globalCompositeOperation = C.mode;
       const cycle = 5.5;
@@ -243,41 +255,43 @@ export const executeScene: SceneFactory = (ctx, { dark }) => {
         const g = geom(i, t);
         ctx.strokeStyle = rgba(i % 3 === 0 ? C.blue : C.violet, 0.22 + 0.18 * Math.sin(arcs[i].ph + t * 0.6) ** 2);
         ctx.beginPath();
-        ctx.moveTo(g.ox, g.oy);
-        ctx.quadraticCurveTo(g.mx, g.my, g.tx, g.ty);
+        if (comb.nearBox(Math.min(g.ox, g.mx, g.tx), g.my, Math.max(g.ox, g.mx, g.tx), Math.max(g.oy, g.ty))) {
+          combQuad(ctx, comb, g.ox, g.oy, g.mx, g.my, g.tx, g.ty, 32);
+        } else {
+          ctx.moveTo(g.ox, g.oy);
+          ctx.quadraticCurveTo(g.mx, g.my, g.tx, g.ty);
+        }
         ctx.stroke();
         ctx.fillStyle = rgba(C.violet, 0.5);
-        dot(ctx, g.tx, g.ty, 1.3);
+        const p = comb.apply(g.tx, g.ty);
+        dot(ctx, p[0], p[1], 1.3);
       }
       ctx.fillStyle = rgba(C.white, dark ? 0.75 : 0.5);
       for (const m of motes) {
         m.q += m.v * dt;
         if (m.q > 1) m.q -= 1;
         const g = geom(m.arc, t);
-        dot(ctx, quad(g.ox, g.mx, g.tx, m.q), quad(g.oy, g.my, g.ty, m.q), 1.1);
+        const p = comb.apply(quad(g.ox, g.mx, g.tx, m.q), quad(g.oy, g.my, g.ty, m.q));
+        dot(ctx, p[0], p[1], 1.1);
       }
       // The one countersigned order: drawn as it travels, then marked as filled.
       const g = geom(chosen, t);
       ctx.strokeStyle = rgba(C.mint, 0.95);
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.moveTo(g.ox, g.oy);
-      for (let i = 1; i <= 30; i++) {
-        const k = (i / 30) * progress;
-        ctx.lineTo(quad(g.ox, g.mx, g.tx, k), quad(g.oy, g.my, g.ty, k));
-      }
+      combQuad(ctx, comb, g.ox, g.oy, g.mx, g.my, g.tx, g.ty, 30, progress);
       ctx.stroke();
-      const hx = quad(g.ox, g.mx, g.tx, progress);
-      const hy = quad(g.oy, g.my, g.ty, progress);
+      const head = comb.apply(quad(g.ox, g.mx, g.tx, progress), quad(g.oy, g.my, g.ty, progress));
       ctx.fillStyle = rgba(C.mint, 1);
-      dot(ctx, hx, hy, 3);
+      dot(ctx, head[0], head[1], 3);
       if (progress >= 1) {
         const since = (t % cycle) - 3;
         const r = 4 + clamp01(since / 1.5) * 22;
+        const filled = comb.apply(g.tx, g.ty);
         ctx.strokeStyle = rgba(C.mint, 1 - clamp01(since / 1.5));
         ctx.lineWidth = 1.4;
         ctx.beginPath();
-        ctx.arc(g.tx, g.ty, r, 0, Math.PI * 2);
+        ctx.arc(filled[0], filled[1], r, 0, Math.PI * 2);
         ctx.stroke();
       }
       const glow = ctx.createRadialGradient(g.ox, g.oy, 0, g.ox, g.oy, 28);

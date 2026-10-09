@@ -201,7 +201,7 @@ export function HowItWorks() {
               aria-labelledby={`lp-step-tab-${step.key}`}
               className="grid lg:grid-cols-12"
             >
-              <div className="relative h-[280px] overflow-hidden sm:h-[380px] lg:col-span-7 lg:h-[460px]">
+              <div data-scene-host className="relative h-[280px] overflow-hidden sm:h-[380px] lg:col-span-7 lg:h-[460px]">
                 <div
                   aria-hidden
                   className="absolute inset-0 transition-[background] duration-700"
@@ -209,7 +209,7 @@ export function HowItWorks() {
                     background: `radial-gradient(70% 80% at 50% 100%, color-mix(in oklch, ${step.glow} 22%, transparent), transparent 70%)`,
                   }}
                 />
-                <SceneCanvas key={step.key} factory={step.scene} className="lp-fade-in absolute inset-0" staticTime={3} />
+                <SceneCanvas key={step.key} factory={step.scene} className="lp-fade-in absolute inset-0" staticTime={3} pointerTarget />
                 <span className="absolute top-4 left-4 rounded-full border border-hairline-strong bg-background/70 px-2.5 py-1 text-[11px] font-medium text-muted-foreground backdrop-blur">
                   Acting: <span className="text-foreground">{step.who}</span>
                 </span>
