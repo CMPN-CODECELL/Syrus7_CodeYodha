@@ -10,7 +10,11 @@ Placement (never retried):
      dropped connection, 429, 500, 503, 401, even a definite 4xx): reconcile against GET /orders before answering:
      orders placed at or after (send time - skew, on 021's clock) with the same fingerprint and not mapped to any
      other tag. Exactly one: mapped, reported with its real 021 status. None: NOT_PLACED with the original error (or
-     REJECTED when 021 refused it). More than one: AMBIGUOUS, never guessed. Order book unreadable: UNCONFIRMED."""
+     REJECTED when 021 refused it). More than one: AMBIGUOUS, never guessed. Order book unreadable: UNCONFIRMED.
+
+Circuit refusals ("Price X must be higher than the lower circuit limit Y", or the upper one) teach today's runtime limit
+for that instrument (core/circuits021.py): from placement answers, from Rejected rows in the order book, and at startup
+from the day's stored REJECTED attempts (backfill_circuits), so the verifier blocks the next such order before signing."""
 
 from __future__ import annotations
 
@@ -23,10 +27,30 @@ from countersign.broker021 import mapping, store
 from countersign.broker021.client import Api021Error, Api021Unavailable, Client021, LoginFailed
 from countersign.broker021.instruments021 import Lookup
 from countersign.broker021.settings import GatewaySettings
-from countersign.core import events
+from countersign.core import circuits021, events
 from countersign.core.config import settings
 
 OPEN_STATUSES = ("OPEN", "TRIGGER_PENDING", "PARTIALLY_FILLED")
+
+
+def learn_circuit(instrument_id: str | None, text: str | None, at: float | None, source: str, now: float | None = None) -> dict | None:
+    """Records the limit named in a 021 circuit refusal; never raises (learning must not disturb a placement)."""
+    try:
+        return circuits021.learn_from_refusal(instrument_id or "", text, at=at, source=source, now=now)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def backfill_circuits(now: float | None = None) -> dict[str, dict]:
+    """At gateway start: learns the circuit limits named by today's stored REJECTED attempts (every account), without
+    placing anything. Returns instrument_id -> stored limits for the ones learned."""
+    out: dict[str, dict] = {}
+    for att in store.rejected_since(circuits021.day_start(now)):
+        iid = (att.get("request") or {}).get("instrument_id")
+        got = learn_circuit(iid, att.get("error"), att.get("sent_at"), f"021 refusal of attempt {att['tag']}", now)
+        if got:
+            out[iid] = got
+    return out
 
 
 class GatewayError(Exception):
@@ -115,6 +139,21 @@ class Gateway:
         avg, side = self._fill_info(oid, traded)
         return mapping.order_json(row, account_id=self.account_id, instrument=inst, attempt=attempt, avg_fill=avg, side_hint=side)
 
+    def _learn_from_row(self, row: dict, attempt: dict | None = None) -> None:
+        """A Rejected row in 021's order book whose reason is a circuit refusal teaches that instrument's limit. Never
+        raises (it runs inside the poller and the placement reconciliation)."""
+        if not row.get("reason"):
+            return
+        try:
+            iid = ((attempt or {}).get("request") or {}).get("instrument_id")
+            if not iid:
+                iid = self.lookup.instrument_for(row.get("exchange") or "", int(row.get("token") or 0))["instrument_id"]
+            at = mapping.unix_ts(row.get("time")) or None
+            at = at - self.client.clock_offset_s if at else (attempt or {}).get("sent_at")
+        except Exception:  # noqa: BLE001
+            return
+        learn_circuit(iid, row.get("reason"), at, f"021 rejected order {row.get('orderId')}")
+
     # ------------------------------------------------------------------ order book
 
     def raw_orders(self, max_age: float = 0.0) -> list[dict]:
@@ -151,6 +190,8 @@ class Gateway:
             if not publish_all and self._seen.get(oid) == key:
                 continue
             self._seen[oid] = key
+            if row.get("status") == "Rejected":
+                self._learn_from_row(row)
             self.publish(self.to_order(row, tags.get(oid)))
             changed += 1
         return changed
@@ -195,6 +236,8 @@ class Gateway:
                     continue  # another unresolved or in-flight placement could own it: never guess
                 # 021 has no client tag, so this is the only order matching every field: the most likely match, not a
                 # proof (an identical order placed outside Countersign in the same minutes would look the same).
+                if hits[0].get("status") == "Rejected":
+                    self._learn_from_row(hits[0], att)
                 store.update(att["tag"], state="REJECTED" if hits[0].get("status") == "Rejected" else "ACCEPTED", order_id=oid, note=f"Late: 021 showed a matching order after this one was reported {att['state']} (the only order with the same instrument, side, quantity, price and product; 021 has no client tag). It was not resent.")
                 self._seen.pop(oid, None)  # republish it, now carrying its tag
                 unmapped = [r for r in unmapped if str(r.get("orderId")) != oid]
@@ -443,6 +486,9 @@ class Gateway:
             oid = str(row.get("orderId"))
             state = "REJECTED" if row.get("status") == "Rejected" else "ACCEPTED"
             store.update(tag, state=state, order_id=oid, error=res.error, note=f"Reconciled after: {res.error}")
+            if state == "REJECTED":
+                learn_circuit(att["request"].get("instrument_id"), res.error, att["sent_at"], f"021 refusal of attempt {tag}")
+                self._learn_from_row(row, att)
             self.last_reconciliation = summary | {"result": "FOUND", "broker_order_id": oid}
             return self.to_order(row, store.get(tag)) | {"reconciled": True, "original_error": res.error}
         if candidates and len(candidates) > 1:
@@ -456,6 +502,7 @@ class Gateway:
             raise GatewayError(502, "UNCONFIRMED", f"021's answer was lost ({res.error}) and its order book could not be read to check ({read_error}). Nothing was resent. The gateway keeps checking; review the 021 order book.", {"broker_error": res.error, "reconciled": False})
         if res.kind == "rejected" or (res.kind == "unknown" and mapping.is_risk_rejection(res.error)):
             store.update(tag, state="REJECTED", error=res.error)
+            learn_circuit(att["request"].get("instrument_id"), res.error, att["sent_at"], f"021 refusal of attempt {tag}")
             self.last_reconciliation = summary | {"result": "REJECTED"}
             raise GatewayError(422, "REJECTED_BY_021", res.error or "Rejected by 021.", {"http_status": res.status, "reconciled": True})
         store.update(tag, state="NOT_PLACED", error=res.error)

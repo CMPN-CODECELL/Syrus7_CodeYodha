@@ -32,7 +32,7 @@ from sqlalchemy import select
 
 from countersign.broker021 import instruments021, store
 from countersign.broker021.client import Client021
-from countersign.broker021.gateway import Gateway, GatewayError
+from countersign.broker021.gateway import Gateway, GatewayError, backfill_circuits
 from countersign.broker021.settings import gateway_settings, normalize_ucc
 from countersign.broker021.vault import VaultError, vault
 from countersign.core import events
@@ -236,6 +236,7 @@ def _status() -> dict:
         "faults": dict(_faults) if gateway_settings().test_faults else None,
         "boot_error": _boot["error"],
         "boot_warnings": list(_boot.get("warnings") or []),
+        "circuits_backfilled": _boot.get("circuits"),
         "started_at": _boot["started_at"],
         "ts": time.time(),
     }
@@ -351,6 +352,10 @@ def _startup() -> None:
     with _lock:
         _sweep_pending()
         _load_linked()
+    try:  # today's circuit refusals already on record (needs no 021 login and places nothing)
+        _boot["circuits"] = {iid: {k: v for k, v in val.items() if k in ("lower_paise", "upper_paise")} for iid, val in backfill_circuits().items()}
+    except Exception as e:  # noqa: BLE001
+        _boot.setdefault("warnings", []).append(f"circuit backfill failed: {type(e).__name__}")
     threading.Thread(target=_pending_sweeper, daemon=True, name="g021-pending").start()
     if not cfg.configured and not _linked:
         _boot["error"] = "No 021 account yet: CS_021_UCC / CS_021_PASSWORD are not configured and no trader has linked one."

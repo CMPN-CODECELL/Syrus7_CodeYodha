@@ -191,6 +191,13 @@ def stale_sending(account_id: str, older_than_s: float) -> list[dict]:
         return [as_dict(a) for a in rows]
 
 
+def rejected_since(since: float) -> list[dict]:
+    """REJECTED attempts sent at or after since, on every account (021 circuit limits are per instrument)."""
+    with _sf()() as s:
+        rows = s.execute(select(Attempt).where(Attempt.state == "REJECTED", Attempt.sent_at >= since).order_by(Attempt.sent_at)).scalars().all()
+        return [as_dict(a) for a in rows]
+
+
 def delete_tags(prefix: str) -> None:
     """Test helper: removes attempts whose tag starts with prefix."""
     with _sf()() as s:
