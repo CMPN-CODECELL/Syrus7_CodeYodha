@@ -4,9 +4,11 @@
 SYRUS 7.0 | 021-01 "Copilot, Not Autopilot" (AI Trading Copilot, our PS-04) | Team CodeYodha
 
 > THE AI CAN PROPOSE. THE SYSTEM CAN VERIFY. THE HUMAN MUST COUNTERSIGN. ONLY THEN CAN THE EXECUTOR ACT.
-> Under every attack in the Attack Lab: **UNAPPROVED TRADES = 0**.
+> Under every attack in the Attack Lab: **UNAPPROVED TRADES EXECUTED BY COUNTERSIGN = 0** (scenario I's out-of-band order, placed straight at the broker with stolen keys, is detected by the independent monitor, which engages the kill switch).
 
 Countersign lets a trader query and act on their 021 trading account in plain English. It trades on the real **021 Developer Sandbox** through a dedicated `gateway021` process, and also runs a local fault-injecting paper broker (one paper account per user, the Attack Lab sandboxes and offline demos). The language model is treated as an **untrusted translator, never an actor**: it can read data and draft proposals, but it holds no credentials and has no tool that can place, modify, cancel or approve anything. Every action becomes a canonical, deterministically verified object that the trader countersigns (passkey, or app PIN / authenticator code as lower-assurance fallbacks). A separate executor process, the only holder of the broker write key, re-verifies everything and sends each order at most once to 021 (it never retries an order on 021 automatically).
+
+Countersign is a hackathon prototype: it trades only on the 021 Developer Sandbox (virtual funds) and on local paper accounts. It is not built, audited or approved for real-money trading (see docs/LIMITATIONS.md, item 14).
 
 ---
 
@@ -57,7 +59,7 @@ Countersign is model-agnostic. With `CS_LLM_PROVIDER=auto` it builds a fallback 
 
 ## The 021 Developer Sandbox
 
-With `CS_021_UCC` and `CS_021_PASSWORD` in `.env`, `scripts/dev.py` starts **`gateway021`** (port 8200). It is the **only** process that reads those two values or ever holds the 021 access token; `dev.py` strips them from every other process, and the API and executor refuse to start if the 021 password is in their environment.
+With `CS_021_UCC` and `CS_021_PASSWORD` in `.env`, `scripts/dev.py` starts **`gateway021`** (port 8200). It is the **only** process that loads those two values or ever holds the 021 password and access token (the UCC, the 021 login code, is also used as the 021 account's id in Countersign's database and API responses, shown masked in the UI; see `docs/LIMITATIONS.md`); `dev.py` strips them from every other process, and the API and executor refuse to start if the 021 password is in their environment.
 
 - **Same interface as the paper broker.** The gateway serves the paper broker's `/v1` API with the same key scopes (read, write, admin, audit; the naive key is refused), so the read gateway, the executor and the monitor reach 021 by base URL alone. It serves exactly one 021 account.
 - **Linking (hackathon model).** Users whose sign-in email is listed in `CS_021_OWNER_EMAILS` are linked to that 021 account on sign-up or sign-in and land on it; they can switch to their paper account from the account menu or the Security Center (Broker connection). Everyone else only ever sees their own paper account. Self-service linking of any 021 account is future scope.
@@ -76,7 +78,7 @@ With `CS_021_UCC` and `CS_021_PASSWORD` in `.env`, `scripts/dev.py` starts **`ga
 | Level | Examples that work | How |
 |---|---|---|
 | L1 read-only | "What's my P&L today?", "Which positions are down more than 5%?", "What did I pay on average for INFY?", "Show NIFTY options near the money for this expiry" | Read tools over the read key only; on 021 the option chain comes from the live 021 chain or the answer says it cannot (no simulated prices) |
-| L2 orders | "Buy 10 Reliance at market", "Sell half my TCS", "Move my stop-loss on HDFC Bank up to 1640", "Cancel my ITC order", SL and SL-M | Exact canonical order with a source for every field; market orders carry a signed protection price (sent to 021 as a limit at that price); fractions computed from what you can sell, rounded down to the lot; stop-loss moves send the full new order state; tick size and price band are checked and never rounded silently |
+| L2 orders | "Buy 10 Reliance at market", "Sell half my TCS", "Move my stop-loss on HDFC Bank up to 690" (with a sell stop-loss already resting on HDFC Bank; the official text uses 1640, which at sandbox prices near Rs 700 is refused because a sell trigger must be below the last price), "Cancel my ITC order", SL and SL-M | Exact canonical order with a source for every field; market orders carry a signed protection price (sent to 021 as a limit at that price); fractions computed from what you can sell, rounded down to the lot; stop-loss moves send the full new order state; tick size and price band are checked and never rounded silently |
 | L3 standing instructions | "If Reliance drops below 1150, buy 10", "Tell me when any holding falls 3% in a day", price alerts | Durable in Postgres, armed only after a countersignature, fire once (compare-and-set), survive restarts, go to review instead of firing stale after downtime. A condition that is already true when drafted is never armed silently: the copilot states the live price and offers an order now or a trigger on the other side of the price |
 | L4 plans | "Exit all my losing intraday positions", "Rebalance so no single stock is more than 20% of my portfolio" | One plan, one signature over every step, the arithmetic shown on the card, each step's fill, partial fill or rejection reported; no compensating trades |
 
@@ -114,7 +116,7 @@ A rock-solid L2 comes first: every order, on paper or 021, goes through the same
 |---|---|---|---|
 | `api` | 8000 | broker READ key (+ demo admin key, sandbox-only naive key) | accounts and sign-in, chat, per-user read gateway, verifier, approval service, mandates engine, audit, Attack Lab, SSE. **Refuses to start if given the write key or the 021 password.** |
 | `executor` | - | broker WRITE key only | the only process that can place/modify/cancel; never imports AI code (checked at startup); routes each order to the paper broker or `gateway021` by account |
-| `gateway021` | 8200 | the 021 UCC, password and access token (+ the broker keys it validates) | only when configured: the 021 sandbox behind the paper broker's `/v1` interface; reconciliation, live market and order websockets, instrument file |
+| `gateway021` | 8200 | the 021 UCC (login), password and access token (+ the broker keys it validates); the UCC also serves as the 021 account id elsewhere | only when configured: the 021 sandbox behind the paper broker's `/v1` interface; reconciliation, live market and order websockets, instrument file |
 | `broker` | 8100 | issues/validates key scopes | fault-injecting paper broker with its own database; one paper account per trader, plus the LAB1 and NAIVE1 Attack Lab sandboxes |
 | `feed` | - | nothing | deterministic replay; with the gateway on it replays only the fictional instruments (ABCCORP, XYZSUSP, TATAMOTORS, the look-alike RELIANCE) and drives presenter scenarios |
 | `monitor` | - | AUDIT (read-all) key | independent invariant monitor over the paper broker and the 021 order book; trips the kill switch |
@@ -142,7 +144,7 @@ Stack: Next.js 16, React 19, TypeScript, Tailwind CSS 4, shadcn/ui, AI Elements,
 |---|---|
 | `uv run --project backend python scripts/dev.py` | start the full stack (add `--no-021` to run without the 021 gateway even when it is configured) |
 | `uv run --project backend python scripts/stop.py` | stop it |
-| `cd backend && uv run pytest -q` | the backend test suite (285 tests, all passing on 2026-10-09) incl. a Hypothesis stateful test, accounts, cross-user isolation and the 021 gateway against recorded fixtures (needs Postgres + Valkey up; run one suite at a time) |
+| `cd backend && uv run pytest -q` | the backend test suite (292 tests, all passing on 2026-10-09) incl. a Hypothesis stateful test, accounts, cross-user isolation and the 021 gateway against recorded fixtures (needs Postgres + Valkey up; run one suite at a time) |
 | `cd formal && java -cp tla2tools.jar tlc2.TLC -config Countersign.cfg -deadlock Countersign.tla` | model-check the protocol |
 | `uv run --project backend python scripts/smoke.py` | end-to-end smoke test over HTTP (automation demo account) |
 | `uv run --project backend python scripts/flows.py` | standing instruction, partial-fill plan, modify and cancel over HTTP |

@@ -9,7 +9,7 @@
 | Untrusted | LLM (any provider), browser input, instrument names/descriptions, news, tool arguments | read via read tools; create DRAFT proposals | Tool allowlist (no order/approve tools exist); raw vendor text quarantined; every value checked for provenance |
 | Trusted core | parser, builder, verifier, approval service, mandate engine, audit | build canonical objects, verify, issue challenges, verify signatures, mint capabilities | Deterministic code; Postgres constraints; RFC 8785 hashing |
 | Credential zone | executor (write key), read-only gateway (read key) | executor: send orders; gateway: read account | Keys are issued per process by `scripts/dev.py`; API exits if it is given the write key; executor exits if AI modules are loaded; broker enforces key scopes (read key cannot place orders; read and write keys reach trader accounts and LAB1 only, and every request must name its account in `X-Account`; naive key confined to NAIVE1) |
-| 021 credential zone | `gateway021` (021 UCC, password, access token) | log in to 021, call its REST API and websockets for one account | Only `broker021/settings.py` reads `CS_021_UCC` / `CS_021_PASSWORD` (the password is a `SecretStr`, never in a repr, log or error); `scripts/dev.py` strips both from every other process; the API and executor exit if the 021 password is in their environment; the token lives only in the gateway's memory. The gateway enforces the same key scopes as the paper broker and refuses the naive key, so the Attack Lab's naive copilot can never reach 021 |
+| 021 credential zone | `gateway021` (021 UCC, password, access token) | log in to 021, call its REST API and websockets for one account | Only `broker021/settings.py` loads the values of `CS_021_UCC` / `CS_021_PASSWORD` (`scripts/dev.py` only checks that both are set, and the API only checks that neither is in its own environment) (the password is a `SecretStr`, never in a repr, log or error); `scripts/dev.py` strips both from every other process; the API and executor exit if the 021 password is in their environment; the token lives only in the gateway's memory. The gateway enforces the same key scopes as the paper broker and refuses the naive key, so the Attack Lab's naive copilot can never reach 021 |
 | Independent | invariant monitor | read broker + DB, engage kill switch | Separate process, separate audit key |
 
 ## 3. Threat model
@@ -67,7 +67,7 @@
 6. No execution starts after its approval expired.
 7. Signed plans are unchanged.
 8. The audit chain verifies from genesis.
-9. The API process holds no broker write key and no 021 credential.
+9. The API process holds no broker write key and no 021 credential (the monitor checks both flags of `/api/health` every second; the API also exits at startup if the 021 password is in its environment).
 Any violation engages the kill switch, records a critical security event and is shown in the Security Center.
 
 ## 7. The 021 sandbox in particular

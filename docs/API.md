@@ -299,6 +299,7 @@ Login lockout, per (email, client): the first 4 wrong passwords answer `401`; th
 |---|---|---|---|
 | POST | `/api/auth/logout` | | `{ ok: true }` (revokes the session and clears the cookies) |
 | GET | `/api/me` | | `Me` |
+| GET | `/api/health` | | `{ ok: true; db: boolean; valkey: boolean; holds_write_key: false; holds_021_credentials: false; gateway021_enabled: boolean }` (no auth; the monitor checks `holds_write_key` and `holds_021_credentials` every second) |
 | POST | `/api/auth/step-up/start` | `{}` | `{ challenge_id: string; options: PublicKeyCredentialRequestOptionsJSON }` listing the caller's active passkeys (user verification required). `412 NO_DEVICE_REGISTERED` without one |
 | POST | `/api/auth/step-up` | `{ method: "pin" \| "totp" \| "webauthn"; pin?: string; code?: string; challenge_id?: string; credential?: AuthenticationResponseJSON }` | `{ ok: true; method; expires_at: ISO }`: this session may change approval methods for 10 minutes. Never a trade approval. Errors: `401 PIN_INVALID`, `423 PIN_LOCKED`, `401 TOTP_INVALID` or `TOTP_REPLAY`, `401 SIGNATURE_INVALID`, `410 CHALLENGE_EXPIRED`, `422 METHOD_INVALID`, `429 RATE_LIMITED` |
 | POST | `/api/auth/webauthn/register/start` | `{ device_label?: string /* up to 48 */ }` | `PublicKeyCredentialCreationOptionsJSON` (platform authenticator, discoverable credential, user verification required, user name = email). `403 STEP_UP_REQUIRED` with `methods` once the trader has any approval method and this session has no fresh step-up |
@@ -529,7 +530,9 @@ interface AttackRun { id: string; started_at: ISO; finished_at: ISO; results: Sc
 interface Scoreboard { unapproved_executions: number; naive_unapproved_executions: number; attacks_attempted: number; attacks_blocked: number; last_run_at: ISO | null }
 ```
 
-### Demo controls (enabled only when `CS_DEMO_MODE=true`)
+### Demo controls (enabled only when `CS_DEMO_MODE=true`, and only on this machine)
+Every `/api/demo/*` route answers `404` unless the request comes from a loopback peer with a loopback `Host` and `X-Forwarded-Host` and no Cloudflare tunnel headers, so the public URL cannot reach them by any path spelling. The paper broker caps a fault at 5 orders.
+
 | POST | `/api/demo/reset` | `{ ok: true; account_id: string }`. Answers `409 NOT_RESETTABLE` when the caller's active account is the 021 sandbox account. Resets **only the caller**: their paper account at the broker (orders and trades deleted; cash, holdings and position reseeded) and their own proposals, approvals and execution records, mandates, plans, outcomes, order mirrors and chat. Also sets the feed to `calm`, clears broker faults and refills the LAB1 and NAIVE1 sandboxes. Never touches other users, the kill switch, security events or the audit chain. |
 |---|---|---|
 | POST | `/api/demo/feed` | `{ scenario: "calm" \| "dip_to_trigger" \| "spike" \| "crash" \| "stale"; symbol?: string }` |

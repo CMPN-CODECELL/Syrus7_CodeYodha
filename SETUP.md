@@ -57,11 +57,11 @@ Without this step everything runs on local paper accounts. To trade on the real 
 |---|---|
 | `CS_021_UCC` | your 021 sandbox client code (the login username) |
 | `CS_021_PASSWORD` | your 021 sandbox password |
-| `CS_021_OWNER_EMAILS` | comma-separated Countersign sign-in emails that operate this 021 account. They are linked on sign-up or sign-in and land on the 021 account; anyone else only sees their own paper account. Empty: nobody is linked. |
+| `CS_021_OWNER_EMAILS` | comma-separated Countersign sign-in emails that operate this 021 account. They are linked on sign-up or sign-in and land on the 021 account; anyone else only sees their own paper account. Empty: nobody is linked. Emails are not verified, so register the account first and only then list its email. |
 | `CS_021_STRICT_MONITOR` | optional, default `false`: orders on the 021 account that Countersign did not place are informational; `true` makes them monitor violations that engage the kill switch |
 | `CS_021_TEST_FAULTS` | optional, default `false`: `true` enables the presenter's two gateway fault drills on the 021 account ("Connection fail" and "Accept, drop ack"); they never change what 021 does |
 
-With `CS_021_UCC` and `CS_021_PASSWORD` set, `scripts/dev.py` starts the `gateway021` process (port 8200). It is the only process that reads these values; every other process has them removed from its environment. `http://127.0.0.1:8200/health` shows whether it is logged in, how many instrument rows it loaded and whether both websockets are connected (no credential is ever shown).
+With `CS_021_UCC` and `CS_021_PASSWORD` set, `scripts/dev.py` starts the `gateway021` process (port 8200). It is the only process that loads these values; every other process has them removed from its environment. `http://127.0.0.1:8200/health` shows whether it is logged in, how many instrument rows it loaded and whether both websockets are connected (no credential is ever shown).
 
 **One live token per account.** 021 allows one access token per account: a new login revokes the previous one, and there is no refresh token. While the stack runs, do not log in to the same 021 account from another script (for example the API probe): the gateway's token would be revoked and it would log in again. Tokens expire at 05:00 IST; the gateway logs in again when needed. To run without 021 even when it is configured: `scripts/dev.py --no-021`.
 
@@ -94,7 +94,7 @@ With `CS_021_UCC` and `CS_021_PASSWORD` set, `scripts/dev.py` starts the `gatewa
 ## 6. Check that everything works (optional)
 
 ```
-cd backend; uv run pytest -q; cd ..                      # expect: all passed (285 on 2026-10-09); run one suite at a time
+cd backend; uv run pytest -q; cd ..                      # expect: all passed (292 on 2026-10-09); run one suite at a time
 uv run --project backend python scripts/smoke.py         # end-to-end order over HTTP
 ```
 The browser test needs a one-time `pip install playwright httpx` and `playwright install chromium`. Then run `python scripts/e2e_browser.py` (desktop) or `python scripts/e2e_browser.py --device "Pixel 7"` (phone layout); every check should pass. It creates two throwaway accounts (`e2e.*@example.test`), walks the whole journey from the landing page and revokes the test passkey at the end. Run the smoke and browser tests while the app is running.
@@ -104,7 +104,7 @@ The browser test needs a one-time `pip install playwright httpx` and `playwright
 | You see | Fix |
 |---|---|
 | `error during connect` / `Cannot connect to the Docker daemon` | Docker Desktop is not running. Start it and wait for "Engine running". |
-| `port is already allocated` or `did not open port` | Another program uses 3000, 8000, 8100, 55432 or 56379. Run `scripts/stop.py`, or close that program. |
+| `port is already allocated` or `did not open port` | Another program uses 3000, 8000, 8100, 8200 (gateway021), 55432 or 56379. Run `scripts/stop.py`, or close that program. |
 | `! api exited with code 1` (or another process) | Open `.logs/api.log` (or that process's log); the last lines say why. |
 | Chat takes 15+ seconds | No AI key and Ollama is running on the CPU. Add a Groq key, or quit Ollama so the built-in engine answers instantly. |
 | Passkey prompt fails | Open the app at `http://localhost:3000` (or the HTTPS address you registered the passkey on), or use the App PIN tab instead. |
