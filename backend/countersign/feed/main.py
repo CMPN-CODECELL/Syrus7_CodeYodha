@@ -1,5 +1,10 @@
-"""Market feed: replays a deterministic, seeded market into Valkey. In production this process is the 021
-WebSocket adapter; for the hackathon it is a tick replay with scripted scenarios so demos never depend on luck."""
+"""Market feed: replays a deterministic, seeded market into Valkey, with scripted scenarios for demos.
+
+When the 021 gateway runs (CS_GATEWAY021_ENABLED=true), the gateway publishes live 021 prices for every real
+instrument, and this replay keeps only the fictional instruments (ABCCORP, XYZSUSP, TATAMOTORS and the look-alike
+listing) that the Attack Lab and demo scenarios use. A presenter or Attack Lab scenario that drives a real
+instrument's price (set / scenario commands) takes it over for at most two minutes (cs:feed:override:<id>), during
+which the gateway does not publish it; "calm" hands every instrument back to 021 at once."""
 
 from __future__ import annotations
 
@@ -13,11 +18,14 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 
 from countersign.core import events
+from countersign.core.config import settings
 from countersign.core.db import session_scope
 from countersign.core.models import Instrument
 from countersign.core.pricing import option_premium_paise
 
 TICK_INTERVAL = 1.0
+OVERRIDE_S = 120
+OVERRIDE_KEY = "cs:feed:override:{}"
 
 
 @dataclass
@@ -37,6 +45,8 @@ class Sym:
     strike: int | None = None
     opt: str | None = None
     expiry: str | None = None
+    external: bool = False  # priced by the 021 gateway; replayed only while a scenario overrides it
+    override_until: float = 0.0
 
 
 class Feed:
@@ -52,8 +62,11 @@ class Feed:
             from countersign.core.instruments import nifty_expiries
 
             near = set(nifty_expiries()[:2])
+            live021 = settings().gateway021_enabled
+            from countersign.core.instruments import REPLAY_ONLY
+
             for r in rows:
-                if r.segment == "FO" and r.expiry not in near:
+                if r.segment == "FO" and (r.expiry not in near or live021):
                     continue
                 if r.segment == "EQ" and r.status != "ACTIVE" and r.symbol != "XYZSUSP":
                     continue
@@ -69,6 +82,7 @@ class Feed:
                     ltp=start, segment=r.segment, vol_bps=6 if r.segment == "IDX" else 10,
                     strike=r.strike_paise, opt=r.option_type, expiry=r.expiry,
                     mode="hold" if r.symbol == "ABCCORP" else "walk",
+                    external=live021 and r.symbol not in REPLAY_ONLY and "LOOKALIKE_SYMBOL" not in (r.flags or []),
                 )
 
     def _round(self, s: Sym, p: int) -> int:
@@ -82,6 +96,8 @@ class Feed:
             spot = self.syms.get("NSE:IDX:NIFTY")
             for s in self.syms.values():
                 if s.segment == "FO":
+                    continue
+                if s.external and now >= s.override_until:
                     continue
                 if s.mode == "stale" and now < s.stale_until:
                     continue
@@ -124,12 +140,41 @@ class Feed:
             "seq": s.seq,
         }
 
+    def _take_over(self, s: Sym) -> None:
+        """A scenario drives a 021-priced instrument: start from its live price and keep the gateway off it briefly."""
+        if not s.external:
+            return
+        if time.time() >= s.override_until:
+            try:
+                raw = events.client().get(events.TICK_KEY.format(s.inst_id))
+                if raw:
+                    live = json.loads(raw)
+                    s.ltp = int(live["ltp_paise"])
+                    s.prev_close = int(live.get("prev_close_paise") or s.prev_close)
+            except Exception:  # noqa: BLE001
+                pass
+        s.override_until = time.time() + OVERRIDE_S
+        try:
+            events.client().set(OVERRIDE_KEY.format(s.inst_id), "1", ex=OVERRIDE_S)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _release_all(self) -> None:
+        for s in self.syms.values():
+            if s.external and s.override_until:
+                s.override_until = 0.0
+                try:
+                    events.client().delete(OVERRIDE_KEY.format(s.inst_id))
+                except Exception:  # noqa: BLE001
+                    pass
+
     def control(self, cmd: dict) -> None:
         name = cmd.get("cmd")
         with self.lock:
             if name == "set":
                 s = self.syms.get(cmd["instrument_id"])
                 if s:
+                    self._take_over(s)
                     s.ltp = self._round(s, int(cmd["ltp_paise"]))
                     s.mode = "hold"
                     publish([self._emit(s)])
@@ -144,9 +189,11 @@ class Feed:
                 for s in self.syms.values():
                     if s.segment != "FO":
                         s.mode = "walk" if s.symbol != "ABCCORP" else "hold"
+                self._release_all()
                 return
             if target is None:
                 return
+            self._take_over(target)
             p = target.ltp
             if scen == "dip_to_trigger":
                 if target.symbol == "ABCCORP":
@@ -190,7 +237,7 @@ def _backfill(feed: Feed) -> None:
     now = int(time.time())
     rng = random.Random(11)
     for s in feed.syms.values():
-        if s.segment == "FO":
+        if s.segment == "FO" or s.external:
             continue
         hk = events.HISTORY_KEY.format(s.inst_id)
         if c.llen(hk) > 100:
@@ -227,7 +274,7 @@ def main() -> None:
     feed.load()
     _backfill(feed)
     threading.Thread(target=_control_listener, args=(feed,), daemon=True).start()
-    events.client().set("cs:feed:status", json.dumps({"mode": feed.mode, "started": time.time()}))
+    events.client().set("cs:feed:status", json.dumps({"mode": "replay+021" if settings().gateway021_enabled else feed.mode, "started": time.time(), "replayed": sorted(s.symbol for s in feed.syms.values() if not s.external and s.segment != "FO")}))
     while True:
         t0 = time.time()
         try:

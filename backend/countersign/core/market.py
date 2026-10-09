@@ -1,4 +1,4 @@
-"""MarketDataProvider: reads the latest ticks published by the feed (021 WebSocket adapter or replay)."""
+"""MarketDataProvider: reads the latest ticks published by the 021 gateway (live 021 market socket) or the replay feed."""
 
 from __future__ import annotations
 
@@ -66,11 +66,44 @@ class Tick:
         )
 
 
+WANT_021_KEY = "cs:gw021:want"
+_asked: dict[str, float] = {}
+
+
+def _ask_021(instrument_id: str) -> bool:
+    """Asks the 021 gateway to subscribe an instrument it is not streaming yet (it drains this set every few seconds).
+    Returns True the first time in a minute, when a caller may wait briefly for the first tick."""
+    import time
+
+    if not settings().gateway021_enabled or instrument_id.startswith(("PORTFOLIO:",)):
+        return False
+    now = time.time()
+    if now - _asked.get(instrument_id, 0.0) < 60:
+        return False
+    _asked[instrument_id] = now
+    try:
+        events.client().sadd(WANT_021_KEY, instrument_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 def latest(instrument_id: str) -> Tick | None:
     try:
         raw = events.client().get(events.TICK_KEY.format(instrument_id))
     except Exception:
         return None
+    if not raw and _ask_021(instrument_id):
+        import time
+
+        for _ in range(6):  # the gateway subscribes within a few seconds; 021 answers a subscribe with a snapshot
+            time.sleep(0.25)
+            try:
+                raw = events.client().get(events.TICK_KEY.format(instrument_id))
+            except Exception:
+                return None
+            if raw:
+                break
     return Tick.from_json(raw) if raw else None
 
 
@@ -97,6 +130,8 @@ def history(instrument_id: str, points: int = 300) -> list[dict]:
 
 
 def session_state(now: datetime | None = None) -> dict:
+    if settings().market_always_open and settings().gateway021_enabled:
+        return {"open": True, "label": "021 sandbox (simulated exchange; demo mode treats the market as open, 021 decides)"}
     if settings().market_always_open:
         return {"open": True, "label": "Replay session (simulated market, demo mode)"}
     now_ist = (now or datetime.now(UTC)).astimezone(IST)
