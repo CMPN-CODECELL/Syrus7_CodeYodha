@@ -4,14 +4,18 @@ the sealed credentials of self-service linked 021 accounts.
 021 has no client order tag, so the gateway keeps tag -> 021 orderId itself. The row is written BEFORE the order is
 sent (write-ahead), so a tag is never sent twice, and an ambiguous outcome is always reconciled from a known send time.
 g021_credentials holds one row per (UCC, linking Countersign user): the password sealed with the gateway's AES-GCM
-data key (vault.py), never in clear. Both tables are created with CREATE TABLE IF NOT EXISTS (metadata.create_all)."""
+data key (vault.py), never in clear, and only once the API confirmed the link. A freshly verified password first waits in
+g021_pending_credentials until the API attached the account and confirmed (POST /admin/link/confirm); an unconfirmed one
+is deleted after PENDING_TTL_S and is never used to log in. g021_link_failures records failed verification logins per
+UCC (the per-UCC budget that stops anyone from driving wrong-password logins at one 021 account). All tables are created
+with CREATE TABLE IF NOT EXISTS (metadata.create_all)."""
 
 from __future__ import annotations
 
 import time
 from functools import lru_cache
 
-from sqlalchemy import BigInteger, Float, Integer, String, Text, create_engine, delete, select
+from sqlalchemy import BigInteger, Float, Integer, String, Text, create_engine, delete, func, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -52,6 +56,25 @@ class Credential(G):
     linked_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     password_enc: Mapped[str] = mapped_column(Text)  # AES-256-GCM (12-byte nonce + ciphertext + tag), base64
     created_at: Mapped[float] = mapped_column(Float)
+
+
+class PendingCredential(G):
+    """A verified password waiting for the API to confirm the link. Never read by a login."""
+
+    __tablename__ = "g021_pending_credentials"
+    ucc: Mapped[str] = mapped_column(String(32), primary_key=True)
+    linked_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    password_enc: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class LinkFailure(G):
+    """One failed verification login (021 refused the UCC and password) during self-service linking."""
+
+    __tablename__ = "g021_link_failures"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ucc: Mapped[str] = mapped_column(String(32), index=True)
+    at: Mapped[float] = mapped_column(Float)
 
 
 @lru_cache
@@ -177,6 +200,8 @@ def delete_tags(prefix: str) -> None:
 
 # ------------------------------------------------------------------ sealed credentials of linked accounts
 
+PENDING_TTL_S = 120.0  # an unconfirmed link is deleted (and its session dropped) after this long
+
 
 def save_credential(ucc: str, user_id: str, password_enc: str) -> None:
     with _sf()() as s:
@@ -188,16 +213,33 @@ def save_credential(ucc: str, user_id: str, password_enc: str) -> None:
         s.commit()
 
 
-def latest_credential(ucc: str) -> tuple[str, str] | None:
-    """(linked user id, sealed password) of the most recent link of this UCC, or None."""
+def credentials(ucc: str) -> list[tuple[str, str]]:
+    """(linked user id, sealed password) of every CONFIRMED link of this UCC, newest first. Pending (unconfirmed)
+    links live in another table and are never returned."""
     with _sf()() as s:
-        row = s.execute(select(Credential).where(Credential.ucc == ucc).order_by(Credential.created_at.desc()).limit(1)).scalar_one_or_none()
-        return (row.linked_user_id, row.password_enc) if row else None
+        rows = s.execute(select(Credential).where(Credential.ucc == ucc).order_by(Credential.created_at.desc())).scalars().all()
+        return [(r.linked_user_id, r.password_enc) for r in rows]
+
+
+def latest_credential(ucc: str) -> tuple[str, str] | None:
+    """(linked user id, sealed password) of the most recent confirmed link of this UCC, or None."""
+    rows = credentials(ucc)
+    return rows[0] if rows else None
 
 
 def linked_uccs() -> list[str]:
+    """UCCs with at least one confirmed link (the accounts the gateway serves after a start)."""
     with _sf()() as s:
         return sorted(set(s.execute(select(Credential.ucc)).scalars()))
+
+
+def holders(ucc: str) -> set[str]:
+    """Users holding a confirmed or a still-pending (not expired) link of this UCC."""
+    fresh = time.time() - PENDING_TTL_S
+    with _sf()() as s:
+        done = set(s.execute(select(Credential.linked_user_id).where(Credential.ucc == ucc)).scalars())
+        pending = set(s.execute(select(PendingCredential.linked_user_id).where(PendingCredential.ucc == ucc, PendingCredential.created_at >= fresh)).scalars())
+    return done | pending
 
 
 def has_credential(ucc: str) -> bool:
@@ -207,6 +249,68 @@ def has_credential(ucc: str) -> bool:
 def delete_credential(ucc: str, user_id: str) -> int:
     with _sf()() as s:
         n = s.execute(delete(Credential).where(Credential.ucc == ucc, Credential.linked_user_id == user_id)).rowcount
+        s.commit()
+        return int(n or 0)
+
+
+def save_pending(ucc: str, user_id: str, password_enc: str) -> None:
+    with _sf()() as s:
+        row = s.get(PendingCredential, (ucc, user_id))
+        if row is None:
+            s.add(PendingCredential(ucc=ucc, linked_user_id=user_id, password_enc=password_enc, created_at=time.time()))
+        else:
+            row.password_enc, row.created_at = password_enc, time.time()
+        s.commit()
+
+
+def confirm_pending(ucc: str, user_id: str, now: float | None = None) -> bool:
+    """Moves a pending link into g021_credentials (replacing that user's earlier password for the UCC). False when
+    there is no pending link or it is older than PENDING_TTL_S (it is then deleted, never confirmed)."""
+    now = time.time() if now is None else now
+    with _sf()() as s:
+        row = s.execute(select(PendingCredential).where(PendingCredential.ucc == ucc, PendingCredential.linked_user_id == user_id).with_for_update()).scalar_one_or_none()
+        if row is None:
+            return False
+        enc, fresh = row.password_enc, now - row.created_at <= PENDING_TTL_S
+        s.delete(row)
+        if fresh:
+            done = s.get(Credential, (ucc, user_id))
+            if done is None:
+                s.add(Credential(ucc=ucc, linked_user_id=user_id, password_enc=enc, created_at=now))
+            else:
+                done.password_enc, done.created_at = enc, now
+        s.commit()
+        return fresh
+
+
+def delete_pending(ucc: str, user_id: str) -> int:
+    with _sf()() as s:
+        n = s.execute(delete(PendingCredential).where(PendingCredential.ucc == ucc, PendingCredential.linked_user_id == user_id)).rowcount
+        s.commit()
+        return int(n or 0)
+
+
+def expire_pending(now: float | None = None) -> list[tuple[str, str]]:
+    """Deletes every pending link older than PENDING_TTL_S; returns the (UCC, user id) pairs deleted."""
+    before = (time.time() if now is None else now) - PENDING_TTL_S
+    with _sf()() as s:
+        rows = s.execute(delete(PendingCredential).where(PendingCredential.created_at < before).returning(PendingCredential.ucc, PendingCredential.linked_user_id)).all()
+        s.commit()
+        return [(r[0], r[1]) for r in rows]
+
+
+def record_link_failure(ucc: str, now: float | None = None) -> None:
+    with _sf()() as s:
+        s.add(LinkFailure(ucc=ucc, at=time.time() if now is None else now))
+        s.commit()
+
+
+def link_failures(ucc: str, window_s: float, now: float | None = None) -> int:
+    """Failed verification logins for this UCC in the rolling window (rows far older than the window are pruned)."""
+    since = (time.time() if now is None else now) - window_s
+    with _sf()() as s:
+        s.execute(delete(LinkFailure).where(LinkFailure.at < since - window_s))
+        n = s.execute(select(func.count()).select_from(LinkFailure).where(LinkFailure.ucc == ucc, LinkFailure.at >= since)).scalar_one()
         s.commit()
         return int(n or 0)
 

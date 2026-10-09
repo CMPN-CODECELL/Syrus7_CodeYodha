@@ -4,9 +4,12 @@ It exposes the paper broker's /v1 interface and key scopes (read, write, admin, 
 ReadGateway, OrderExecutionProvider and BrokerAdmin reach the real 021 sandbox by base URL alone. It serves several 021
 accounts: the one configured in .env (CS_021_UCC / CS_021_PASSWORD) and every account a trader linked through
 self-service linking (POST /admin/link; the password arrives encrypted to this process's RSA key and is stored sealed
-with its AES-GCM key, see vault.py). Each account has its own Gateway (one token, single-flight login, write-ahead
-attempts, reconciliation, no automatic retry); X-Account picks it, and an unknown or unlinked account is refused.
-One market-data websocket runs (the .env account's, else the first linked account's); order updates for linked
+with its AES-GCM key, see vault.py). A verified link stays PENDING until the API confirms it (POST /admin/link/confirm)
+and is deleted, with its session, when no confirmation arrives within store.PENDING_TTL_S. Failed verification logins
+are budgeted per UCC (LINK_FAILURE_BUDGET per rolling LINK_FAILURE_WINDOW_S, across all users, stored in the gateway's
+database): once spent, linking that UCC is refused without contacting 021. Each account has its own Gateway (one
+token, single-flight login, write-ahead attempts, reconciliation, no automatic retry); X-Account picks it, and an
+unknown or unlinked account is refused. One market-data websocket runs (the .env account's, else the first linked account's); order updates for linked
 accounts come from REST polling of their order book every 3 s (the orders websocket runs for the primary account).
 
 Run: python -m countersign.broker021.app   (port 8200; started by scripts/dev.py when CS_021_UCC is configured)"""
@@ -16,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 import threading
 import time
@@ -29,7 +33,7 @@ from sqlalchemy import select
 from countersign.broker021 import instruments021, store
 from countersign.broker021.client import Client021
 from countersign.broker021.gateway import Gateway, GatewayError
-from countersign.broker021.settings import gateway_settings
+from countersign.broker021.settings import gateway_settings, normalize_ucc
 from countersign.broker021.vault import VaultError, vault
 from countersign.core import events
 from countersign.core.config import settings
@@ -48,7 +52,14 @@ _ows = None
 _boot: dict = {"instruments": None, "recovered": [], "started_at": None, "error": None}
 _faults = {"drop_after_accept": 0, "fail_before_send": 0}
 _used_nonces: dict[str, float] = {}  # link nonces already opened here (defence in depth; the API consumes them first)
+# Verified but not yet confirmed links: (UCC, user id) -> (the client that holds the verification login's token, or
+# None when the account was already served, and when it was verified). Never served through X-Account.
+_pending: dict[tuple[str, str], tuple[Client021 | None, float]] = {}
 UCC_RE = re.compile(r"^[A-Z0-9]{4,16}$")
+LINK_FAILURE_BUDGET = 3  # failed verification logins per UCC, across all users ...
+LINK_FAILURE_WINDOW_S = 86400.0  # ... per rolling 24 hours
+TOO_MANY_FAILURES = "Too many failed attempts for this account, try again later."
+log = logging.getLogger("countersign.gateway021")
 
 
 def _publish():
@@ -81,6 +92,7 @@ def gateways() -> list[Gateway]:
 
 
 def account_gw(ucc: str) -> Gateway | None:
+    ucc = normalize_ucc(ucc)
     env = _env_gw()
     if env is not None and ucc and ucc == env.account_id:
         return env
@@ -88,13 +100,13 @@ def account_gw(ucc: str) -> Gateway | None:
 
 
 def _stored_password(ucc: str) -> str:
-    hit = store.latest_credential(ucc)
-    if hit is None:
-        return ""
-    try:
-        return vault().unseal(hit[1], ucc, hit[0])
-    except VaultError:
-        return ""
+    """The newest confirmed password of this UCC that this gateway's key opens (pending links are never used)."""
+    for user_id, sealed in store.credentials(ucc):
+        try:
+            return vault().unseal(sealed, ucc, user_id)
+        except VaultError:
+            continue
+    return ""
 
 
 def _linked_client(ucc: str) -> Client021:
@@ -110,8 +122,10 @@ def _add_linked(ucc: str, client: Client021) -> Gateway:
 
 
 def account_key(ucc: str) -> str:
-    """A stable, non-reversible key for one account in the status heartbeat (which never carries a full UCC)."""
-    return hashlib.sha256(ucc.encode()).hexdigest()[:16]
+    """The name of one account in the status (GET /health and the heartbeat never carry a full UCC): an HMAC-SHA256
+    with a key only this gateway reads, so a reader of the status cannot confirm UCC guesses. The API asks for the
+    key of an account it already knows with GET /v1/account-key (read key)."""
+    return hmac.new(vault().status_key(), normalize_ucc(ucc).encode(), hashlib.sha256).hexdigest()[:16]
 
 
 def mask(ucc: str) -> str:
@@ -221,6 +235,7 @@ def _status() -> dict:
         "last_reconciliation": g.last_reconciliation,
         "faults": dict(_faults) if gateway_settings().test_faults else None,
         "boot_error": _boot["error"],
+        "boot_warnings": list(_boot.get("warnings") or []),
         "started_at": _boot["started_at"],
         "ts": time.time(),
     }
@@ -281,8 +296,38 @@ def _daily_instruments() -> None:
             _boot["error"] = f"daily instrument reload failed: {type(e).__name__}: {str(e)[:200]}"
 
 
+def _drop_client(client: Client021 | None) -> None:
+    if client is None or any(g.client is client for g in gateways()):
+        return  # never close a session an account is served with
+    client.drop_token()
+    client.close()
+
+
+def _sweep_pending(now: float | None = None) -> int:
+    """Deletes links the API never confirmed within store.PENDING_TTL_S and drops their verification sessions.
+    Caller holds _lock. Returns how many were dropped."""
+    now = time.time() if now is None else now
+    gone = set(store.expire_pending(now))
+    gone |= {k for k, (_, at) in _pending.items() if now - at > store.PENDING_TTL_S}
+    for key in gone:
+        client, _ = _pending.pop(key, (None, 0.0))
+        _drop_client(client)
+    return len(gone)
+
+
+def _pending_sweeper() -> None:
+    while True:
+        time.sleep(15.0)
+        try:
+            with _lock:
+                _sweep_pending()
+        except Exception as e:  # noqa: BLE001
+            log.warning("pending link sweep failed: %s", type(e).__name__)
+
+
 def _load_linked() -> None:
-    """Every self-service linked account gets its own session (logged in lazily with its unsealed password)."""
+    """Every self-service linked account (confirmed links only; pending ones are never loaded) gets its own session,
+    logged in lazily with its unsealed password."""
     env = _env_gw()
     for ucc in store.linked_uccs():
         if (env is not None and ucc == env.account_id) or ucc in _linked:
@@ -299,9 +344,14 @@ def _startup() -> None:
 
     create_all()
     store.init_db()
-    vault().ensure_keys()  # creates the link key pair and the store key once, under .secrets/
+    vault().ensure_keys()  # creates the link key pair, the store key and the status key once, under .secrets/
+    for name, ok in vault().restrict_files().items():
+        if not ok:
+            _boot.setdefault("warnings", []).append(f"{name}: could not restrict file permissions to the current user")
     with _lock:
+        _sweep_pending()
         _load_linked()
+    threading.Thread(target=_pending_sweeper, daemon=True, name="g021-pending").start()
     if not cfg.configured and not _linked:
         _boot["error"] = "No 021 account yet: CS_021_UCC / CS_021_PASSWORD are not configured and no trader has linked one."
         threading.Thread(target=_heartbeat, daemon=True, name="g021-heartbeat").start()
@@ -343,6 +393,12 @@ def account(c: Caller = Depends(need("read", "write", "admin", "audit"))) -> dic
     """The account configured in .env (the operator-linked account), or null when only linked accounts exist."""
     env = _env_gw()
     return {"account_id": env.account_id if env else None, "broker": "021", "label": mask(env.account_id) if env else None}
+
+
+@app.get("/v1/account-key")
+def status_key_of(c: Caller = READ, g: Gateway = Depends(acct)) -> dict:
+    """The name of the X-Account account in the status heartbeat (see account_key). Read key, served accounts only."""
+    return {"key": account_key(g.account_id)}
 
 
 @app.get("/v1/funds")
@@ -633,12 +689,34 @@ def _refuse(status: int, code: str, message: str):
     raise HTTPException(status, {"code": code, "message": message})
 
 
+def _security_event(severity: str, kind: str, message: str, ucc: str, **data) -> None:
+    """A security event about one 021 account, raised by the gateway (masked UCC only). Never raises."""
+    if gateway_settings().isolated:
+        log.warning("%s for %s", kind, mask(ucc))
+        return
+    try:
+        from countersign.core import state
+        from countersign.core.models import Account
+
+        with session_scope() as s:
+            a = s.get(Account, ucc)
+            state.security_event(s, severity, kind, message, {"account": mask(ucc), **data}, actor="gateway021", account_id=ucc if (a is not None and a.broker_kind == "021") else None)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not record the security event %s: %s", kind, type(e).__name__)
+
+
+def _budget_spent(ucc: str, failures: int) -> None:
+    _security_event("warning", "BROKER_021_LINK_FAILURE_BUDGET", f"Connecting 021 account {mask(ucc)} is paused: {failures} failed password checks in 24 hours. Further attempts are refused without contacting 021, so they cannot lock the account.", ucc, failures_24h=failures)
+
+
 @app.post("/admin/link")
 def link(body: LinkBody, request: Request, c: Caller = Depends(need("admin"))) -> dict:
-    """Opens the browser's ciphertext, checks it carries the nonce and user id the API expected, validates the UCC and
-    verifies the password with exactly one 021 login. Only a verified password is stored (sealed). Returns the account
-    id (the UCC, which is the 021 account id everywhere in Countersign), its mask and the session status; never the
-    password, the token or the ciphertext."""
+    """Opens the browser's ciphertext, checks it carries the nonce and user id the API expected and validates the UCC.
+    Then, without contacting 021, refuses a UCC another user already holds (the .env account excepted) and a UCC whose
+    failed-verification budget is spent (LINK_FAILURE_BUDGET per LINK_FAILURE_WINDOW_S across all users). Only then is
+    the password verified with exactly one 021 login. A verified password is stored sealed as a PENDING link, which the
+    API must confirm (POST /admin/link/confirm) within store.PENDING_TTL_S. Returns the account id (the UCC, which is the
+    021 account id everywhere in Countersign) and its mask; never the password, the token or the ciphertext."""
     _local_only(request)
     if len(body.ciphertext) > 2048 or not body.nonce or not body.user_id:
         _refuse(400, "LINK_INVALID", "The link request is malformed.")
@@ -650,7 +728,7 @@ def link(body: LinkBody, request: Request, c: Caller = Depends(need("admin"))) -
         _refuse(400, "LINK_NONCE_MISMATCH", "These encrypted credentials were not made for this request. Reload the page and try again.")
     if not _fresh_nonce(body.nonce):
         _refuse(400, "LINK_REPLAYED", "These encrypted credentials were already used. Reload the page and try again.")
-    ucc = str(data.get("ucc") or "").strip().upper()
+    ucc = normalize_ucc(data.get("ucc"))
     password = data.get("password")
     del data
     if not UCC_RE.match(ucc):
@@ -658,28 +736,71 @@ def link(body: LinkBody, request: Request, c: Caller = Depends(need("admin"))) -
     if not isinstance(password, str) or not 1 <= len(password) <= 128:
         _refuse(422, "PASSWORD_INVALID", "Enter your 021 password.")
     with _lock:
+        _sweep_pending()
+        env = _env_gw()
+        is_env = env is not None and ucc == env.account_id
+        if not is_env and store.holders(ucc) - {body.user_id}:
+            # The API would refuse it anyway (one self-service trader per 021 account): 021 is not contacted.
+            _refuse(409, "UCC_LINKED_ELSEWHERE", "That 021 account is already connected to another Countersign user. Nothing was changed.")
+        failures = store.link_failures(ucc, LINK_FAILURE_WINDOW_S)
+        if failures >= LINK_FAILURE_BUDGET:
+            _budget_spent(ucc, failures)
+            _refuse(429, "LINK_TOO_MANY_FAILURES", TOO_MANY_FAILURES)
         existing = account_gw(ucc)
         client = existing.client if existing is not None else _linked_client(ucc)
         # One login with the entered password. For an account this gateway already serves, the same client takes the
-        # new token, so there is never a second session of the same account in this process.
+        # new token, so there is never a second session of the same account in this process. A refused password never
+        # marks that session's own credentials as rejected (verify_login does not touch them).
         kind, detail = client.verify_login(password)
         if kind != "ok":
             if existing is None:
                 client.close()
+            if kind in ("rejected", "refused"):
+                store.record_link_failure(ucc)
+                if failures + 1 >= LINK_FAILURE_BUDGET:
+                    _budget_spent(ucc, failures + 1)
             if kind == "rejected":
                 _refuse(401, "LINK_WRONG_CREDENTIALS", "021 did not accept that UCC and password. Check both and try again. Nothing was stored.")
             if kind == "refused":
                 _refuse(422, "LINK_REFUSED", f"021 refused the login ({detail}). Nothing was stored.")
             _refuse(503, "LINK_021_UNAVAILABLE", "021 did not answer, try again. Nothing was stored.")
-        store.save_credential(ucc, body.user_id, vault().seal(password, ucc, body.user_id))
+        store.save_pending(ucc, body.user_id, vault().seal(password, ucc, body.user_id))
         del password
+        old, _ = _pending.pop((ucc, body.user_id), (None, 0.0))
+        _drop_client(old)
+        _pending[(ucc, body.user_id)] = (client if existing is None else None, time.time())
+    return {"account_id": ucc, "masked": mask(ucc), "status": "pending", "confirm_within_s": int(store.PENDING_TTL_S), "source": "env" if is_env else "linked"}
+
+
+class ConfirmBody(BaseModel):
+    account_id: str
+    user_id: str
+
+
+@app.post("/admin/link/confirm")
+def link_confirm(body: ConfirmBody, request: Request, c: Caller = Depends(need("admin"))) -> dict:
+    """The API attached the account to the trader: the pending link becomes a stored credential and the account is
+    served (the verification login's session is kept). A link older than store.PENDING_TTL_S was already deleted and
+    cannot be confirmed."""
+    _local_only(request)
+    ucc = normalize_ucc(body.account_id)
+    key = (ucc, body.user_id)
+    with _lock:
+        if not store.confirm_pending(ucc, body.user_id):
+            client, _ = _pending.pop(key, (None, 0.0))
+            _drop_client(client)
+            _refuse(409, "LINK_EXPIRED", "The connection was not completed in time, so the 021 gateway deleted it. Nothing was stored. Try again.")
+        client, _ = _pending.pop(key, (None, 0.0))
         env = _env_gw()
-        g = existing
+        g = account_gw(ucc)
         if g is None:
-            g = _add_linked(ucc, client)
+            g = _add_linked(ucc, client or _linked_client(ucc))
             _start_poller(g)
-        elif g is not env:
-            g.client.credentials_rejected = False
+        else:
+            if client is not g.client:
+                _drop_client(client)
+            if g is not env:
+                g.client.credentials_rejected = False
     _ensure_market()
     return {"account_id": ucc, "masked": mask(ucc), "status": "linked", "source": "env" if g is env else "linked", "logged_in": g.client.logged_in, "token_expires_at": _account_status(g, "")["token_expires_at"]}
 
@@ -687,16 +808,22 @@ def link(body: LinkBody, request: Request, c: Caller = Depends(need("admin"))) -
 class UnlinkBody(BaseModel):
     account_id: str
     user_id: str
+    pending_only: bool = False  # the API's rollback of a link it could not attach: keep an earlier confirmed password
 
 
 @app.post("/admin/unlink")
 def unlink(body: UnlinkBody, request: Request, c: Caller = Depends(need("admin"))) -> dict:
-    """Deletes the trader's stored credential for this account. When no linked trader is left, the account's session is
-    dropped (its token forgotten, polling stops). The .env account always keeps its session."""
+    """Deletes the trader's pending link and (unless pending_only) their stored credential for this account. When no
+    linked trader is left, the account's session is dropped (its token forgotten, polling stops). The .env account
+    always keeps its session."""
     _local_only(request)
-    ucc = body.account_id.strip().upper()
+    ucc = normalize_ucc(body.account_id)
     with _lock:
-        deleted = store.delete_credential(ucc, body.user_id)
+        deleted = store.delete_pending(ucc, body.user_id)
+        client, _ = _pending.pop((ucc, body.user_id), (None, 0.0))
+        _drop_client(client)
+        if not body.pending_only:
+            deleted += store.delete_credential(ucc, body.user_id)
         env = _env_gw()
         dropped = False
         if ucc in _linked and not store.has_credential(ucc):

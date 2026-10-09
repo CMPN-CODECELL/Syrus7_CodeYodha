@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from countersign.core.config import REPO_ROOT
@@ -36,9 +36,19 @@ class GatewaySettings(BaseSettings):
     test_faults: bool = False  # enables the two gateway drills on /admin/faults (fail_before_send, drop_after_accept); off by default (off by default)
     instruments_cache: str = str(REPO_ROOT / "backend" / ".cache" / "021_instruments.csv.gz")
 
+    @field_validator("ucc", mode="before")
+    @classmethod
+    def _normalize_ucc(cls, v: object) -> str:
+        return normalize_ucc(v)
+
     @property
     def configured(self) -> bool:
         return bool(self.ucc and self.password.get_secret_value())
+
+
+def normalize_ucc(v: object) -> str:
+    """The one spelling of a UCC used everywhere (settings, X-Account, linking, the API): trimmed and upper-case."""
+    return str(v or "").strip().upper()
 
 
 @lru_cache

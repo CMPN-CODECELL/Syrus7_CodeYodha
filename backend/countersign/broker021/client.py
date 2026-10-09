@@ -76,6 +76,18 @@ def error_text(r: httpx.Response) -> str:
     return str(body)[:300]
 
 
+def login_failure(status: int) -> str:
+    """A fixed message for a refused 021 login that keeps only the HTTP status: 021's own error text is never passed on
+    (to the API, the status heartbeat or a browser)."""
+    if status in (401, 403):
+        return f"021 did not accept the UCC and password (HTTP {status})."
+    if status == 429:
+        return "021 is limiting logins right now (HTTP 429)."
+    if status >= 500:
+        return f"021 could not process the login (HTTP {status})."
+    return f"021 refused the login (HTTP {status})."
+
+
 class Client021:
     def __init__(self, cfg: GatewaySettings, transport: httpx.BaseTransport | None = None, sleep: Callable[[float], None] = time.sleep, password: Callable[[], str] | None = None, stop_on_rejected: bool = False):
         self.cfg = cfg
@@ -126,7 +138,7 @@ class Client021:
         if r.status_code != 200:
             if r.status_code in (401, 403) and self.stop_on_rejected:
                 self.credentials_rejected = True  # never retry a refused password on its own: it could lock the account
-            raise LoginFailed(f"021 login refused: HTTP {r.status_code} {error_text(r)}")
+            raise LoginFailed(login_failure(r.status_code))
         if not self._install(r):
             raise LoginFailed("021 login answered without an access token.")
 
@@ -151,7 +163,8 @@ class Client021:
         """One login with a password the trader just entered (self-service linking). It goes through this account's
         single-flight lock, so on success the new token replaces this client's own token (021 keeps one live token per
         account). Returns (kind, detail): ok | rejected (401 / 403: wrong UCC or password) | refused (other 4xx) |
-        unavailable (429, 5xx, timeout, no token). Never retried; detail never contains the password."""
+        unavailable (429, 5xx, timeout, no token). Never retried. detail is only "HTTP <status>" or an exception class
+        name: never the password and never 021's error text."""
         with self._login_lock:
             try:
                 r = self._http.post("/auth/token", json={"username": self.cfg.ucc, "password": password})
@@ -159,11 +172,11 @@ class Client021:
                 return "unavailable", type(e).__name__
             self._note_clock(r)
             if r.status_code in (401, 403):
-                return "rejected", error_text(r)
+                return "rejected", f"HTTP {r.status_code}"
             if r.status_code == 429 or r.status_code >= 500:
                 return "unavailable", f"HTTP {r.status_code}"
             if r.status_code != 200:
-                return "refused", f"HTTP {r.status_code} {error_text(r)}"
+                return "refused", f"HTTP {r.status_code}"
             if not self._install(r):
                 return "unavailable", "021 answered without an access token"
             self.credentials_rejected = False
