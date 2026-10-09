@@ -80,3 +80,13 @@ def test_021_standing_alert_does_not_fire_on_a_simulated_price(live021):
 
 def test_parse_of_alert_used_above_is_a_price_alert():
     assert parse("Alert me if RELIANCE falls below 1000").mandate.kind == "ALERT"
+
+
+def test_replay_only_instrument_is_blocked_on_021_before_the_countersign(live021):
+    # TATAMOTORS has no 021 token (it demerged into TMPV and TMCV): its price here is simulated, so the 021 account
+    # must never be asked to countersign it. A paper account still trades it on the replay feed.
+    p, _ = ltp("TATAMOTORS")
+    out = draft_order(f"Buy 1 TATAMOTORS at {rupees(p)}", Gw())
+    order = CanonicalOrder.model_validate(out.proposal.canonical)
+    assert "INSTRUMENT_NOT_ON_021" in _codes(order, ACCT)
+    assert "INSTRUMENT_NOT_ON_021" not in _codes(order, "LAB1")

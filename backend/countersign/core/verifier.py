@@ -111,9 +111,11 @@ class AccountState:
         """Delivery quantity that can still be sold, and the arithmetic behind it.
 
         With 021 holdings as the gateway reports them (free_quantity = freeQty, settled; btst_quantity = btstQty,
-        bought but not yet settled; sell_quantity = sellQty, already sold or in pending sell orders today):
-        free + btst - max(sellQty, pending CNC sells we can see). With paper holdings (quantity only; fills already
-        reduce it): quantity - pending CNC sells. A MODIFY excludes the order being modified (not an extra sale)."""
+        bought but not yet settled; today_quantity = today's net delivery buys from 021's positions; sell_quantity =
+        sellQty, already sold or in pending sell orders today): free + btst + today - max(sellQty, pending CNC sells
+        we can see). Selling a same-day delivery buy is an ordinary square-off on NSE, so it counts; 021's own risk
+        checks still decide. With paper holdings (quantity only; fills already reduce it): quantity - pending CNC
+        sells. A MODIFY excludes the order being modified (not an extra sale)."""
         h = self.holdings.get(instrument_id)
         if not h or int(h.get("quantity") or 0) <= 0:
             return 0, "no delivery holding"
@@ -122,10 +124,11 @@ class AccountState:
         own = self.pending_sell_qty(instrument_id) - pending
         if h.get("sell_quantity") is not None:
             t1 = int(h.get("btst_quantity") or 0)
-            free = int(h["free_quantity"]) if h.get("free_quantity") is not None else total - t1
+            today = max(int(h.get("today_quantity") or 0), 0)
+            free = int(h["free_quantity"]) if h.get("free_quantity") is not None else total - t1 - today
             used = max(max(int(h["sell_quantity"]) - own, 0), pending)
-            sellable = max(free + t1 - used, 0)
-            return sellable, f"{free:,} settled + {t1:,} unsettled (T1) - {used:,} already sold or in pending sell orders = {sellable:,} sellable"
+            sellable = max(free + t1 + today - used, 0)
+            return sellable, f"{free:,} settled + {t1:,} unsettled (T1) + {today:,} bought today - {used:,} already sold or in pending sell orders = {sellable:,} sellable"
         sellable = max(total - pending, 0)
         if pending:
             return sellable, f"{total:,} held - {pending:,} in pending sell orders = {sellable:,} sellable"
@@ -808,6 +811,11 @@ def verify_order(
         issues.append(Issue(code="STALE_MARKET_DATA", severity="BLOCK", message=f"Market data for {inst.symbol} is {tick.age_ms / 1000:.1f}s old (limit {cfg.tick_stale_seconds:.0f}s). Not safe to price this order."))
     if order.action != "CANCEL" and market.scenario_driven(inst.instrument_id) and _is_021_account(s, account.account_id):
         issues.append(Issue(code="SIMULATED_PRICE", severity="BLOCK", message=f"{inst.symbol} is being driven by a demo market scenario (at most two minutes). A real 021 order is never priced from simulated prices; try again when the live 021 feed is back."))
+    if order.action != "CANCEL" and inst.token_021 is None and (inst.symbol in instruments.REPLAY_ONLY or "REPLAY_ONLY" in (inst.flags or [])) and _is_021_account(s, account.account_id):
+        # Replay-only instruments (fictional, or delisted like TATAMOTORS) have simulated prices and no 021 token: never
+        # ask a trader to countersign them on the real account (the gateway would also refuse, but only afterwards).
+        hint = " Tata Motors demerged: on 021 it trades as TMPV (passenger vehicles) or TMCV (commercial vehicles)." if inst.symbol == "TATAMOTORS" else ""
+        issues.append(Issue(code="INSTRUMENT_NOT_ON_021", severity="BLOCK", message=f"{inst.symbol} is not in today's 021 instrument file, so it cannot be traded on the 021 account; its price here is simulated (replay only).{hint}", field="instrument"))
 
     if order.action == "CANCEL":
         return issues, None

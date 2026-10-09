@@ -110,7 +110,16 @@ def test_021_holdings_use_settled_plus_unsettled_minus_already_sold():
     gw, _, _ = _tcs(25, free_quantity=20, btst_quantity=5, sell_quantity=4)
     v = _ok(draft_order("Sell half my TCS at market", gw))
     assert v["steps"][0]["canonical"]["quantity"] == 10
-    assert "20 settled + 5 unsettled (T1) - 4 already sold or in pending sell orders = 21 sellable" in fields(v)["quantity_basis"]["display"]
+    assert "20 settled + 5 unsettled (T1) + 0 bought today - 4 already sold or in pending sell orders = 21 sellable" in fields(v)["quantity_basis"]["display"]
+
+
+def test_021_shares_bought_today_are_sellable():
+    # The gateway merges today's net CNC buys from 021's positions as today_quantity; freeQty and btstQty stay 0
+    # until settlement, so "Sell half my TCS" on shares bought today must still draft (not "0 sellable").
+    gw, _, _ = _tcs(5, free_quantity=0, btst_quantity=0, sell_quantity=0, today_quantity=5)
+    v = _ok(draft_order("Sell half my TCS at market", gw))
+    assert v["steps"][0]["canonical"]["quantity"] == 2
+    assert "0 settled + 0 unsettled (T1) + 5 bought today - 0 already sold or in pending sell orders = 5 sellable" in fields(v)["quantity_basis"]["display"]
 
 
 def test_zero_or_nothing_held_is_explained_and_never_drafted():
