@@ -35,7 +35,7 @@ export function MandatesView() {
         title="Mandates"
         description="Standing instructions you countersigned once. Each fires at most once, only on a fresh tick, and never after the system was offline: those move to review."
         actions={
-          <Button variant="outline" size="sm" onClick={() => revise("Buy 100 TATAMOTORS if price falls below 900")}>
+          <Button variant="outline" size="sm" onClick={() => revise("If Reliance drops below 2800, buy 10")}>
             <MessageSquarePlus /> New mandate in Copilot
           </Button>
         }
@@ -71,7 +71,7 @@ export function MandatesView() {
           <EmptyState
             icon={Crosshair}
             title={filter === "live" ? "No active standing instructions" : filter === "review" ? "Nothing needs review" : "No mandate history yet"}
-            description='Ask the copilot something like "Buy 100 TATAMOTORS if price falls below 900" or "Alert me if TATAMOTORS falls more than 5%", then countersign to arm it.'
+            description='Ask the copilot something like "If Reliance drops below 2800, buy 10" or "Tell me when any holding falls 3% in a day", then countersign to arm it.'
           />
         </div>
       ) : (

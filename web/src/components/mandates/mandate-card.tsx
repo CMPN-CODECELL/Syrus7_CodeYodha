@@ -12,11 +12,14 @@ import { Eyebrow } from "@/components/ui/panel";
 import { errorMessage } from "@/lib/errors";
 import { dateTime, pct, price, qty, until } from "@/lib/format";
 import { useCancelMandate, useHoldings, useProposal } from "@/lib/queries";
-import { MANDATE_STATE } from "@/lib/status";
+import { mandateLook } from "@/lib/status";
 import { useLiveStore, useTick } from "@/lib/store";
 import type { MandateView, Proposal } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useNow } from "@/hooks/use-now";
+
+/** Instrument id of a standing alert that watches every holding instead of one stock. */
+const ALL_HOLDINGS_ID = "PORTFOLIO:HOLDINGS";
 
 /** Live distance between the trigger and the current price. */
 export function TriggerDistance({ mandate }: { mandate: MandateView }) {
@@ -24,21 +27,36 @@ export function TriggerDistance({ mandate }: { mandate: MandateView }) {
   const holdings = useHoldings();
   const pred = mandate.predicate;
   const ltp = tick?.ltp_paise;
+  if (pred.field === "DAY_CHANGE_BPS" && mandate.instrument.instrument_id === ALL_HOLDINGS_ID) {
+    return (
+      <div className="rounded-lg bg-surface-2/50 px-3 py-2 text-xs leading-snug text-muted-foreground ring-1 ring-hairline">
+        Watches every stock you hold and alerts when one is {pct(Math.abs(pred.threshold))} or more {pred.threshold < 0 ? "below" : "above"} its
+        previous close on the day.
+      </div>
+    );
+  }
   let threshold: number | null = null;
   if (pred.field === "LTP") threshold = pred.threshold;
-  else {
+  else if (pred.field === "DAY_CHANGE_BPS") {
+    const prev = tick?.prev_close_paise;
+    threshold = prev ? Math.round(prev * (1 + pred.threshold / 10000)) : null;
+  } else {
     const h = holdings.data?.find((x) => x.instrument.instrument_id === mandate.instrument.instrument_id);
     if (h) threshold = Math.round(h.avg_price_paise * (1 - pred.threshold / 10000));
   }
   if (!ltp || !threshold) {
     return (
       <div className="h-[52px] rounded-lg bg-surface-2/50 px-3 py-2 text-xs text-muted-foreground ring-1 ring-hairline">
-        {pred.field === "DROP_FROM_AVG_BPS" ? `Fires when price is ${pct(pred.threshold)} below your average price.` : "Waiting for a live tick..."}
+        {pred.field === "DROP_FROM_AVG_BPS"
+          ? `Fires when price is ${pct(pred.threshold)} below your average price.`
+          : pred.field === "DAY_CHANGE_BPS"
+            ? `Fires when price is ${pct(Math.abs(pred.threshold))} ${pred.threshold < 0 ? "below" : "above"} the previous close.`
+            : "Waiting for a live tick..."}
       </div>
     );
   }
   // DROP_FROM_AVG_BPS compares the drop (GTE means "fell at least this far"), i.e. price at or below the trigger.
-  const priceOp = pred.field === "LTP" ? pred.op : pred.op === "GTE" ? "LTE" : "GTE";
+  const priceOp = pred.field === "DROP_FROM_AVG_BPS" ? (pred.op === "GTE" ? "LTE" : "GTE") : pred.op;
   const distBps = priceOp === "LTE" ? ((ltp - threshold) / ltp) * 10000 : ((threshold - ltp) / ltp) * 10000;
   const met = distBps <= 0;
   const fill = met ? 100 : Math.max(4, Math.min(100, 100 - distBps / 10));
@@ -73,7 +91,7 @@ export function MandateCard({ mandate: initial, proposal, className }: { mandate
   const revise = useRevise();
   const source = useProposal(proposal ? null : m.proposal_id);
   const p = proposal ?? source.data;
-  const look = MANDATE_STATE[m.state];
+  const look = mandateLook(m.state);
   const awaitingApproval = p?.status === "AWAITING_APPROVAL" || p?.status === "BLOCKED";
   const cancellable = ["ACTIVE", "NEEDS_REVIEW"].includes(m.state) && !awaitingApproval;
   const t = m.template;
@@ -191,7 +209,11 @@ export function MandateCard({ mandate: initial, proposal, className }: { mandate
           <ProposalActions
             proposal={p}
             countersignLabel="Countersign to arm"
-            caption="Arming needs your signature once. It fires at most once, only on a fresh tick, and expires on its own."
+            caption={
+              m.instrument.instrument_id === ALL_HOLDINGS_ID
+                ? "Arming needs your signature once. It alerts at most once per holding per trading day, only on a fresh tick, and expires on its own."
+                : "Arming needs your signature once. It fires at most once, only on a fresh tick, and expires on its own."
+            }
           />
         </footer>
       ) : (
