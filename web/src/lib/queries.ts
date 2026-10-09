@@ -7,7 +7,17 @@ import { api, type OrdersFilter } from "./api";
 import { IS_MOCK } from "./env";
 import { isApiError } from "./errors";
 import { useChatStore } from "./store";
-import type { ApprovalMethod, BrokerFault, FeedScenario, Proposal, ProposalKind, ProposalStatus, SecurityEventScope } from "./types";
+import type {
+  ApprovalMethod,
+  BrokerAccount,
+  BrokerFault,
+  BrokerKind,
+  FeedScenario,
+  Proposal,
+  ProposalKind,
+  ProposalStatus,
+  SecurityEventScope,
+} from "./types";
 
 export const qk = {
   me: ["me"] as const,
@@ -34,6 +44,7 @@ export const qk = {
   runs: ["attack-lab", "runs"] as const,
   scoreboard: ["attack-lab", "scoreboard"] as const,
   demo: ["demo", "state"] as const,
+  brokerAccounts: ["broker", "accounts"] as const,
 };
 
 export const ACTIVE_STATUSES: ProposalStatus[] = ["APPROVED", "EXECUTING"];
@@ -176,7 +187,83 @@ export function useDemoMode(): boolean {
   return flag ?? probe.isSuccess;
 }
 
+/**
+ * GET /api/broker/accounts. Resolves to null when this server has no such endpoint yet (404), so callers can fall
+ * back to the paper account from /api/me instead of showing an error.
+ */
+export function useBrokerAccounts() {
+  return useQuery({
+    queryKey: qk.brokerAccounts,
+    queryFn: async (): Promise<BrokerAccount[] | null> => {
+      try {
+        return await api.brokerAccounts();
+      } catch (e) {
+        if (isApiError(e) && (e.status === 404 || e.status === 405)) return null;
+        throw e;
+      }
+    },
+    retry: (count, err) => !(isApiError(err) && err.status < 500) && count < 1,
+    staleTime: 10_000,
+    refetchInterval: (q) => (q.state.data ? 15_000 : false),
+  });
+}
+
+export interface ActiveBroker {
+  /** The active broker account, or null when the server does not report accounts. */
+  account: BrokerAccount | null;
+  accounts: BrokerAccount[];
+  kind: BrokerKind;
+  /** Prices stream live from the 021 sandbox for the active account. */
+  live021: boolean;
+  /** False when the server has no broker accounts endpoint (an older backend). */
+  reported: boolean;
+  isPending: boolean;
+  error: unknown;
+}
+
+/** The trader's active broker, with fallbacks for an older backend: /api/me, then the security status. */
+export function useActiveBroker(): ActiveBroker {
+  const q = useBrokerAccounts();
+  const me = useMe();
+  const sec = useSecurityStatus();
+  const accounts = q.data ?? [];
+  const account = accounts.find((a) => a.active) ?? (accounts.length === 1 ? accounts[0] : null);
+  const kind: BrokerKind = account?.kind ?? me.data?.account?.kind ?? sec.data?.broker.kind ?? "paper";
+  return {
+    account,
+    accounts,
+    kind,
+    live021: account?.kind === "021" && account.status.market_data === "live",
+    reported: Array.isArray(q.data),
+    isPending: q.isPending,
+    error: q.error,
+  };
+}
+
+/** Broker kind for an account id (a proposal's canonical account), or null when unknown. */
+export function useBrokerKindFor(accountId: string | null | undefined): BrokerKind | null {
+  const q = useBrokerAccounts();
+  const me = useMe();
+  if (!accountId) return null;
+  const hit = q.data?.find((a) => a.account_id === accountId);
+  if (hit) return hit.kind;
+  const mine = me.data?.account;
+  if (mine && mine.id === accountId && mine.kind) return mine.kind;
+  return null;
+}
+
 // Mutations
+
+export function useSetActiveBroker() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (account_id: string) => api.setActiveBroker(account_id),
+    onSuccess: () => {
+      // Portfolio, orders, market data source and status all depend on the active account.
+      void qc.invalidateQueries();
+    },
+  });
+}
 
 export function useRejectProposal() {
   const qc = useQueryClient();

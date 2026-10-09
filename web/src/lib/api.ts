@@ -22,6 +22,7 @@ import type {
   AttackRun,
   AuditEvent,
   AuditVerify,
+  BrokerAccount,
   BrokerFault,
   BrokerOrder,
   ChatEvent,
@@ -101,6 +102,9 @@ export interface CountersignApi {
   holdings(): Promise<Holding[]>;
   positions(): Promise<Position[]>;
   orders(status: OrdersFilter): Promise<BrokerOrder[]>;
+  // Broker accounts: which broker this trader's orders go to. Never carries a broker token.
+  brokerAccounts(): Promise<BrokerAccount[]>;
+  setActiveBroker(account_id: string): Promise<unknown>;
   // Market
   instruments(q: string): Promise<InstrumentHandle[]>;
   quote(symbol: string): Promise<Quote>;
@@ -283,6 +287,8 @@ export const realApi: CountersignApi = {
   holdings: () => request("GET", "/api/account/holdings"),
   positions: () => request("GET", "/api/account/positions"),
   orders: (status) => request("GET", `/api/account/orders${qs({ status })}`),
+  brokerAccounts: () => request("GET", "/api/broker/accounts"),
+  setActiveBroker: (account_id) => request("POST", "/api/broker/active", { account_id }),
 
   instruments: (q) => request("GET", `/api/market/instruments${qs({ q })}`),
   quote: (symbol) => request("GET", `/api/market/quote/${enc(symbol)}`),

@@ -71,7 +71,7 @@ export interface Holding {
   day_change_bps: Bps;
 }
 
-export type Product = "CNC" | "MIS" | "NRML";
+export type Product = "CNC" | "MIS" | "NRML" | "INTRADAY";
 export type OrderType = "LIMIT" | "MARKET" | "SL" | "SL-M";
 export type Side = "BUY" | "SELL";
 export type Validity = "DAY" | "IOC";
@@ -114,6 +114,29 @@ export interface BrokerOrder {
   reject_reason: string | null;
   placed_at: ISO;
   updated_at: ISO;
+  /** "external": in the broker's order book but not placed by Countersign (for example from the 021 web app). */
+  origin?: "countersign" | "external" | null;
+}
+
+// Broker accounts: the 021 Developer Sandbox (linked by the operator) or the local paper broker.
+
+export type BrokerKind = "paper" | "021";
+export type MarketDataSource = "live" | "replay";
+
+export interface BrokerAccountStatus {
+  connected: boolean;
+  token_expires_at: ISO | null;
+  market_data: MarketDataSource;
+  last_error: string | null;
+}
+
+/** GET /api/broker/accounts row. For a 021 account the id is the UCC, which the UI always masks. */
+export interface BrokerAccount {
+  account_id: string;
+  kind: BrokerKind;
+  label: string;
+  active: boolean;
+  status: BrokerAccountStatus;
 }
 
 export interface OptionLeg {
@@ -159,7 +182,8 @@ export type ProposalStatus =
   | "REJECTED_BY_USER"
   | "EXPIRED"
   | "ACTIVE"
-  | "CANCELLED";
+  | "CANCELLED"
+  | "NEEDS_REVIEW";
 
 export interface Issue {
   code: string;
@@ -206,7 +230,13 @@ export type StepState =
   | "CANCELLED"
   | "FAILED"
   | "SKIPPED"
-  | "BLOCKED";
+  | "BLOCKED"
+  // The broker refused or failed before accepting it and the order is not in its order book: nothing to reconcile.
+  | "NOT_PLACED"
+  // The executor could not tell whether the broker has the order: never resent, the trader reviews it.
+  // The backend calls this NEEDS_REVIEW; AMBIGUOUS is accepted as a synonym.
+  | "NEEDS_REVIEW"
+  | "AMBIGUOUS";
 
 export interface CanonicalOrder {
   schema_version: 1;
@@ -222,6 +252,8 @@ export interface CanonicalOrder {
   trigger_price_paise: Paise | null;
   protection_price_paise: Paise | null;
   target_broker_order_id: string | null;
+  /** MODIFY only: the order as it was when the change was drafted (old values). */
+  modify_from?: { quantity: number; order_type: OrderType; limit_price_paise: Paise | null; trigger_price_paise: Paise | null } | null;
 }
 
 export interface ProposalStep {
@@ -238,6 +270,35 @@ export interface ProposalStep {
   filled_quantity?: number;
   avg_fill_price_paise?: Paise | null;
   reason?: string | null;
+  /** Why the plan computed this step, e.g. the rebalance arithmetic for this stock. */
+  rationale?: string | null;
+}
+
+/** Plans the backend computes from the account (L4). The math is data, formatted by the UI. */
+export type PlanKind = "exit_losing_intraday" | "rebalance" | "custom";
+
+export interface PlanFact {
+  label: string;
+  paise?: Paise | null;
+  bps?: Bps | null;
+  qty?: number | null;
+  text?: string | null;
+}
+
+export interface PlanMathColumn {
+  key: string;
+  label: string;
+  format?: "paise" | "bps" | "qty" | "text";
+}
+
+export interface PlanDetail {
+  kind: PlanKind | (string & {});
+  title?: string | null;
+  summary?: string | null;
+  facts?: PlanFact[];
+  columns?: PlanMathColumn[];
+  rows?: Record<string, string | number | null>[];
+  notes?: string[];
 }
 
 export type MandateState =
@@ -257,7 +318,8 @@ export interface MandateView {
   kind: "ORDER" | "ALERT";
   instrument: InstrumentHandle;
   condition_text: string;
-  predicate: { field: "LTP" | "DROP_FROM_AVG_BPS"; op: "LTE" | "GTE"; threshold: number };
+  /** DAY_CHANGE_BPS: signed change from the previous close (LTE -300 means down 3% or more today). */
+  predicate: { field: "LTP" | "DROP_FROM_AVG_BPS" | "DAY_CHANGE_BPS"; op: "LTE" | "GTE"; threshold: number };
   template: CanonicalOrder | null;
   max_quantity: number | null;
   price_limit_paise: Paise | null;
@@ -315,7 +377,10 @@ export interface Proposal {
   short_hash: string;
   steps: ProposalStep[];
   mandate: MandateView | null;
-  failure_policy: "STOP_ON_FAILURE" | null;
+  /** STOP_ON_FAILURE: later steps are skipped after a failure. CONTINUE_ON_FAILURE: independent steps, each reported. */
+  failure_policy: "STOP_ON_FAILURE" | "CONTINUE_ON_FAILURE" | null;
+  /** Present on computed plans (exit losing intraday positions, rebalance). */
+  plan?: PlanDetail | null;
   issues: Issue[];
   can_approve: boolean;
   interpretation: {
@@ -359,7 +424,7 @@ export interface Me {
   session: { id: string; created_at: ISO; expires_at: ISO };
   // Added with real sign-up. Optional so an older backend's response still renders.
   email?: string | null;
-  account?: { id: string; label: string } | null;
+  account?: { id: string; label: string; kind?: BrokerKind } | null;
   onboarding?: Onboarding | null;
   demo_mode?: boolean;
 }
@@ -407,7 +472,7 @@ export interface PublicStatus {
   attacks_blocked: number;
   last_attack_run_at: ISO | null;
   audit_events: number;
-  market: { mode: "replay"; nifty: { ltp_paise: Paise; change_bps: Bps } | null };
+  market: { mode: MarketDataSource; nifty: { ltp_paise: Paise; change_bps: Bps } | null };
   generated_at: ISO;
 }
 
@@ -510,6 +575,9 @@ export type OutcomeKind =
   | "ORDER_FILLED"
   | "ORDER_REJECTED"
   | "ORDER_CANCELLED"
+  | "ORDER_NOT_PLACED"
+  | "ORDER_NEEDS_REVIEW"
+  | "EXTERNAL_ORDER"
   | "EXECUTION_BLOCKED"
   | "RECONCILED"
   | "MANDATE_ARMED"
@@ -591,7 +659,7 @@ export interface SecurityStatus {
   monitor: MonitorStatus;
   executor: { healthy: boolean; last_heartbeat: ISO | null; holds_write_key: true };
   api: { holds_write_key: false; llm_has_order_tools: false };
-  broker: { healthy: boolean; latency_ms: number | null };
+  broker: { healthy: boolean; latency_ms: number | null; kind?: BrokerKind; label?: string };
   feed: { healthy: boolean; last_tick_age_ms: number | null; mode: string };
   llm: {
     engine: string;
@@ -666,7 +734,10 @@ export type BrokerFault =
   | "delay_ack"
   | "reject"
   | "partial_fill"
-  | "connection_failure";
+  | "connection_failure"
+  // Mock mode only: the broker answers 503 before accepting (not placed), or times out with no match (needs review).
+  | "unavailable_503"
+  | "timeout_unmatched";
 
 export interface DemoState {
   feed_mode: string;

@@ -3,12 +3,14 @@
 import {
   Activity,
   Ban,
+  BookCopy,
   Bell,
   BookOpen,
   Calculator,
   CircleCheck,
   CircleDashed,
   CircleDot,
+  CircleSlash,
   CircleX,
   Clock,
   Crosshair,
@@ -42,6 +44,7 @@ import type {
   StepState,
   TranscriptLine,
 } from "./types";
+import { humanize } from "./format";
 
 export type Tone = "neutral" | "muted" | "profit" | "loss" | "warning" | "danger" | "info" | "ai" | "human";
 
@@ -64,6 +67,7 @@ export const PROPOSAL_STATUS: Record<ProposalStatus, Look> = {
   EXPIRED: { label: "Expired", tone: "muted", icon: Hourglass },
   ACTIVE: { label: "Armed", tone: "human", icon: Crosshair },
   CANCELLED: { label: "Cancelled", tone: "muted", icon: Ban },
+  NEEDS_REVIEW: { label: "Needs your review", tone: "warning", icon: TriangleAlert },
 };
 
 export const STEP_STATE: Record<StepState, Look> = {
@@ -77,6 +81,9 @@ export const STEP_STATE: Record<StepState, Look> = {
   FAILED: { label: "Failed", tone: "danger", icon: OctagonX },
   SKIPPED: { label: "Skipped", tone: "muted", icon: Ban },
   BLOCKED: { label: "Blocked", tone: "danger", icon: Lock },
+  NOT_PLACED: { label: "Not placed", tone: "danger", icon: CircleSlash },
+  NEEDS_REVIEW: { label: "Needs your review", tone: "warning", icon: TriangleAlert },
+  AMBIGUOUS: { label: "Needs your review", tone: "warning", icon: TriangleAlert },
 };
 
 export const MANDATE_STATE: Record<MandateState, Look> = {
@@ -107,6 +114,9 @@ export const OUTCOME_KIND: Record<OutcomeKind, { label: string; icon: LucideIcon
   ORDER_FILLED: { label: "Filled", icon: CircleCheck },
   ORDER_REJECTED: { label: "Rejected", icon: CircleX },
   ORDER_CANCELLED: { label: "Cancelled", icon: Ban },
+  ORDER_NOT_PLACED: { label: "Not placed", icon: CircleSlash },
+  ORDER_NEEDS_REVIEW: { label: "Needs your review", icon: TriangleAlert },
+  EXTERNAL_ORDER: { label: "Outside Countersign", icon: BookCopy },
   EXECUTION_BLOCKED: { label: "Blocked", icon: ShieldX },
   RECONCILED: { label: "Reconciled", icon: RefreshCcwDot },
   MANDATE_ARMED: { label: "Mandate armed", icon: Crosshair },
@@ -121,11 +131,33 @@ export const OUTCOME_KIND: Record<OutcomeKind, { label: string; icon: LucideIcon
 };
 
 export const OUTCOME_GROUPS: { id: string; label: string; kinds: OutcomeKind[] }[] = [
-  { id: "orders", label: "Orders", kinds: ["ORDER_ACCEPTED", "ORDER_PARTIALLY_FILLED", "ORDER_FILLED", "ORDER_REJECTED", "ORDER_CANCELLED", "RECONCILED"] },
+  { id: "orders", label: "Orders", kinds: ["ORDER_ACCEPTED", "ORDER_PARTIALLY_FILLED", "ORDER_FILLED", "ORDER_REJECTED", "ORDER_CANCELLED", "ORDER_NOT_PLACED", "ORDER_NEEDS_REVIEW", "EXTERNAL_ORDER", "RECONCILED"] },
   { id: "mandates", label: "Mandates", kinds: ["MANDATE_ARMED", "MANDATE_TRIGGERED", "MANDATE_NEEDS_REVIEW", "ALERT"] },
   { id: "plans", label: "Plans", kinds: ["PLAN_COMPLETED", "PLAN_PARTIALLY_COMPLETED", "PLAN_FAILED"] },
   { id: "security", label: "Approvals and security", kinds: ["APPROVAL_VERIFIED", "EXECUTION_BLOCKED", "KILL_SWITCH"] },
 ];
+
+// Safe lookups: a state the backend adds later renders as a neutral chip instead of crashing the card.
+
+function fallbackLook(state: string | null | undefined): Look {
+  return { label: humanize(state || "unknown"), tone: "muted", icon: CircleDashed };
+}
+
+export function proposalLook(s: string | null | undefined): Look {
+  return PROPOSAL_STATUS[s as ProposalStatus] ?? fallbackLook(s);
+}
+
+export function stepLook(s: string | null | undefined): Look {
+  return STEP_STATE[(s || "PENDING") as StepState] ?? fallbackLook(s);
+}
+
+export function orderLook(s: string | null | undefined): Look {
+  return ORDER_STATUS[s as BrokerOrderStatus] ?? fallbackLook(s);
+}
+
+export function mandateLook(s: string | null | undefined): Look {
+  return MANDATE_STATE[s as MandateState] ?? fallbackLook(s);
+}
 
 export const SEVERITY_TONE: Record<Severity, Tone> = {
   info: "info",
