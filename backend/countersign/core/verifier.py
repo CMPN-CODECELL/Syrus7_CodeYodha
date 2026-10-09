@@ -770,6 +770,13 @@ def _session_issue() -> Issue | None:
     return None
 
 
+def _is_021_account(s: Session, account_id: str) -> bool:
+    from countersign.core.models import Account
+
+    acct = s.get(Account, account_id)
+    return acct is not None and acct.broker_kind == "021"
+
+
 def verify_order(
     s: Session,
     order: CanonicalOrder,
@@ -799,6 +806,8 @@ def verify_order(
         return issues, None
     if tick.stale:
         issues.append(Issue(code="STALE_MARKET_DATA", severity="BLOCK", message=f"Market data for {inst.symbol} is {tick.age_ms / 1000:.1f}s old (limit {cfg.tick_stale_seconds:.0f}s). Not safe to price this order."))
+    if order.action != "CANCEL" and market.scenario_driven(inst.instrument_id) and _is_021_account(s, account.account_id):
+        issues.append(Issue(code="SIMULATED_PRICE", severity="BLOCK", message=f"{inst.symbol} is being driven by a demo market scenario (at most two minutes). A real 021 order is never priced from simulated prices; try again when the live 021 feed is back."))
 
     if order.action == "CANCEL":
         return issues, None
@@ -1196,6 +1205,12 @@ def build_mandate(
         br.clarify = (r.message + " Please give the exact symbol.", [c.symbol for c in r.candidates][:6])
         return None, br, issues
     inst = r.instrument
+    ask = _already_true_question(intent, inst)
+    if ask is not None:
+        # Never arm an instruction that would fire on the next tick: the trader chooses an order now or a new trigger.
+        br.clarify = ask
+        br.instrument = inst
+        return None, br, issues
     expires = (datetime.now(UTC) + timedelta(days=max(1, min(intent.expires_days, 30)))).replace(microsecond=0)
     template = None
     if intent.kind == "ORDER":
@@ -1249,6 +1264,65 @@ def build_mandate(
         if already:
             issues.append(Issue(code="CONDITION_ALREADY_TRUE", severity="WARN", message=f"The condition is already true at the current price {inr(tick.ltp_paise)}; it would trigger on the next tick."))
     return mandate, br, issues
+
+
+def _rupees_text(paise: int) -> str:
+    """₹1,400 for whole rupees, ₹1,213.40 otherwise (Indian grouping), in a form the parser reads back."""
+    txt = inr(paise)
+    return txt[:-3] if txt.endswith(".00") else txt
+
+
+_PRODUCT_WORD = {Product.CNC: " delivery", Product.MIS: " intraday"}
+
+
+def _already_true_question(intent: MandateIntent, inst) -> tuple[str, list[str]] | None:
+    """A clarifying question when a price condition is already true at the live price, or None. The options are
+    complete sentences: the order placed now (a normal countersigned order) or a trigger on the far side of the price."""
+    if intent.field != "LTP" or intent.threshold_price is None:
+        return None
+    if intent.kind == "ORDER" and (intent.order is None or intent.order.side is None or not intent.order.quantity):
+        return None
+    tick = market.latest(inst.instrument_id)
+    if tick is None:
+        return None
+    threshold = rupees_to_paise(intent.threshold_price)
+    ltp = tick.ltp_paise
+    below = intent.op == "LTE"
+    if not ((ltp <= threshold) if below else (ltp >= threshold)):
+        return None
+    sym = inst.symbol
+    cond = f"{'falls below' if below else 'rises above'} {_rupees_text(threshold)}"
+    # A new trigger about 2% beyond the live price, in whole rupees, on the side the condition needs.
+    new_trig = (ltp * 98 // 100) // 100 * 100 if below else -(-(ltp * 102 // 100) // 100) * 100
+    move = "drops below" if below else "rises above"
+    if intent.kind == "ALERT":
+        options = [f"Alert me if {sym} {'falls below' if below else 'rises above'} {_rupees_text(new_trig)}"]
+        q = (
+            f"{sym} is at {inr(ltp)} right now, so the condition '{cond}' is already true and the alert would fire on the next price update. "
+            f"I have not set it. Choose a level {'below' if below else 'above'} the current price, or tell me a different one."
+        )
+        return q, options
+    o = intent.order
+    side = o.side.value.lower()
+    qty = int(o.quantity)
+    product = _PRODUCT_WORD.get(o.product, "") if o.product else ""
+    limit = rupees_to_paise(o.limit_price) if o.limit_price is not None else threshold
+    lo, hi = inst.lower_circuit_paise or 0, inst.upper_circuit_paise or 0
+    in_band = (not hi or lo <= limit <= hi) and (inst.tick_size_paise <= 0 or limit % inst.tick_size_paise == 0)
+    # The live price can sit off the tick grid: round it so a buy stays marketable (up) and a sell too (down).
+    now_limit = limit if in_band else round_to_tick(ltp, inst.tick_size_paise, "up" if o.side == Side.BUY else "down")
+    options = [
+        f"{side.capitalize()} {qty} {sym} now at limit {_rupees_text(now_limit)}{product}",
+        f"If {sym} {move} {_rupees_text(new_trig)}, {side} {qty}{product}",
+    ]
+    q = (
+        f"{sym} is at {inr(ltp)} right now, so the condition '{cond}' is already true: armed as written, this instruction would "
+        f"{side} {qty} {sym} on the next price update. I have not armed it. Do you want to {side} now with a limit order you countersign, "
+        f"or set a trigger {'below' if below else 'above'} the current price?"
+    )
+    if not in_band:
+        q += f" Your limit {_rupees_text(limit)} is outside today's price band or tick size, so the order now uses the live price as its limit."
+    return q, options
 
 
 ALL_HOLDINGS_HANDLE = InstrumentHandle(
