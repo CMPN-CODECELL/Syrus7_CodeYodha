@@ -1,0 +1,202 @@
+"""Chat orchestrator: streams typed events (meta, tool, text-delta, card, done, error) for the web chat."""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import re
+import uuid
+from collections.abc import AsyncIterator
+
+from countersign.core import audit
+from countersign.core.config import settings
+from countersign.core.db import session_scope
+from countersign.core.models import ChatMessage
+from countersign.core.parser import parse
+from countersign.llm import router
+from countersign.llm.agent import build_agent, engine_label, resolve_engine
+from countersign.llm.tools import ChatDeps
+
+_HISTORY: dict[tuple[str, str], list] = {}
+
+TOOL_LABELS = {
+    "get_account_summary": "Reading account summary",
+    "get_holdings": "Reading holdings",
+    "get_positions": "Reading positions",
+    "get_orders": "Reading orders",
+    "get_quote": "Fetching live quote",
+    "get_option_chain": "Building NIFTY option chain",
+    "find_instrument": "Resolving instrument",
+    "propose_order": "Drafting order for deterministic verification",
+    "propose_cancel": "Drafting cancellation for verification",
+    "propose_modify": "Drafting modification for verification",
+    "propose_plan": "Drafting plan for verification",
+    "propose_standing_instruction": "Drafting standing instruction for verification",
+    "ask_clarification": "Asking you to clarify",
+}
+
+
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+# Where a run-on reasoning block meets the answer: sentence punctuation directly followed by a capital letter.
+_SEAM = re.compile(r"[.!?](?=[A-Z])")
+
+
+class ReasoningFilter:
+    """Keeps a model's private reasoning out of the chat. Some reasoning models (or a model imitating earlier turns)
+    write a "<think>" block as ordinary text; it is dropped. If the closing tag never arrives, only the text after the
+    last sentence seam ("...for clarification.Which product...") is kept."""
+
+    def __init__(self) -> None:
+        self.buf = ""
+        self.mode = "start"  # start: undecided, think: inside a reasoning block, text: passing through
+
+    def feed(self, chunk: str) -> str:
+        if self.mode == "text":
+            return chunk
+        self.buf += chunk
+        if self.mode == "start":
+            head = self.buf.lstrip()
+            if head.startswith(THINK_OPEN):
+                self.mode, self.buf = "think", head[len(THINK_OPEN) :]
+            elif THINK_OPEN.startswith(head):
+                return ""  # could still become "<think>"
+            else:
+                self.mode, out, self.buf = "text", self.buf, ""
+                return out
+        end = self.buf.find(THINK_CLOSE)
+        if end < 0:
+            return ""
+        self.mode, out, self.buf = "text", self.buf[end + len(THINK_CLOSE) :].lstrip(), ""
+        return out
+
+    def finish(self) -> str:
+        out = ""
+        if self.mode == "start":
+            out = self.buf
+        elif self.mode == "think":
+            seams = list(_SEAM.finditer(self.buf))
+            out = self.buf[seams[-1].end() :] if seams else ""
+        self.buf = ""
+        return out
+
+
+def strip_reasoning(text: str) -> str:
+    f = ReasoningFilter()
+    return (f.feed(text) + f.finish()).strip()
+
+
+def _clean_history(messages: list) -> list:
+    """Model memory without reasoning: replaying earlier "<think>" blocks invites the model to write them again."""
+    from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart
+
+    out = []
+    for m in messages:
+        if isinstance(m, ModelResponse):
+            parts = [dataclasses.replace(x, content=strip_reasoning(x.content)) if isinstance(x, TextPart) else x for x in m.parts if not isinstance(x, ThinkingPart)]
+            m = dataclasses.replace(m, parts=parts or m.parts)
+        out.append(m)
+    return out
+
+
+async def stream(user_id: str, account_id: str, conversation_id: str | None, message: str, engine: str = "auto") -> AsyncIterator[dict]:
+    conversation_id = conversation_id or str(uuid.uuid4())
+    message = message.strip()[:2000]
+    if (engine or "auto").lower() == "auto" and engine_label("auto") != "deterministic" and parse(message).kind == "query":
+        # Read-only questions the deterministic interpreter recognises with certainty are answered on a fast
+        # path (sub-second, no model cost). Anything that drafts an action always goes through the AI chain.
+        model, label = None, "deterministic (fast path for read-only query)"
+    else:
+        model, label = resolve_engine(engine)
+    msg_id = str(uuid.uuid4())
+    yield {"type": "meta", "conversation_id": conversation_id, "engine": label, "message_id": msg_id}
+    with session_scope() as s:
+        s.add(ChatMessage(conversation_id=conversation_id, user_id=user_id, role="user", text=message, cards=[]))
+        audit.record(s, "trader", "USER_REQUEST", "conversation", conversation_id, {"text": message, "engine": label})
+
+    cards: list[dict] = []
+    pending: list[dict] = []
+    deps = ChatDeps(user_id=user_id, account_id=account_id, conversation_id=conversation_id, user_text=message, engine=label, emit=pending.append)
+    text_parts: list[str] = []
+
+    async def flush():
+        while pending:
+            c = pending.pop(0)
+            cards.append(c)
+            yield {"type": "card", "card": c}
+
+    if model is None:
+        yield {"type": "tool", "id": "det", "name": "deterministic_interpreter", "label": "Interpreting your request (deterministic engine)", "status": "running"}
+        text = await asyncio.to_thread(router.handle, deps)
+        yield {"type": "tool", "id": "det", "name": "deterministic_interpreter", "label": "Interpreted", "status": "done"}
+        async for e in flush():
+            yield e
+        for i in range(0, len(text), 24):
+            yield {"type": "text-delta", "delta": text[i : i + 24]}
+            await asyncio.sleep(0.01)
+        text_parts.append(text)
+    else:
+        agent = build_agent(model)
+        # Model memory is keyed by user too: a conversation id from another trader never loads their context.
+        history = _HISTORY.get((user_id, conversation_id), [])
+        failed = None
+        reasoning = ReasoningFilter()
+        try:
+            async with asyncio.timeout(settings().llm_timeout_s):
+                async with agent.run_stream_events(message, deps=deps, message_history=history) as stream:
+                    async for ev in stream:
+                        name = type(ev).__name__
+                        piece = ""
+                        if name == "PartStartEvent":
+                            part = ev.part
+                            if type(part).__name__ == "TextPart" and part.content:
+                                piece = reasoning.feed(part.content)
+                        elif name == "PartDeltaEvent":
+                            delta = ev.delta
+                            if type(delta).__name__ == "TextPartDelta" and delta.content_delta:
+                                piece = reasoning.feed(delta.content_delta)
+                        elif name == "FunctionToolCallEvent":
+                            p = ev.part
+                            yield {"type": "tool", "id": p.tool_call_id, "name": p.tool_name, "label": TOOL_LABELS.get(p.tool_name, p.tool_name), "status": "running"}
+                        elif name == "FunctionToolResultEvent":
+                            r = getattr(ev, "part", None) or getattr(ev, "result", None)
+                            tid = getattr(r, "tool_call_id", "")
+                            tname = getattr(r, "tool_name", "") or ""
+                            ok = type(r).__name__ != "RetryPromptPart"
+                            yield {"type": "tool", "id": tid, "name": tname, "label": TOOL_LABELS.get(tname, tname), "status": "done" if ok else "error"}
+                            async for e in flush():
+                                yield e
+                        elif name == "AgentRunResultEvent":
+                            try:
+                                _HISTORY[(user_id, conversation_id)] = _clean_history(list(ev.result.all_messages())[-16:])
+                            except Exception:  # noqa: BLE001
+                                pass
+                        if piece:
+                            text_parts.append(piece)
+                            yield {"type": "text-delta", "delta": piece}
+        except Exception as e:  # noqa: BLE001
+            failed = e
+        if tail := reasoning.finish():
+            text_parts.append(tail)
+            yield {"type": "text-delta", "delta": tail}
+        async for e in flush():
+            yield e
+        if failed is not None and not deps.proposal_ids and not cards:
+            yield {"type": "card", "card": {"kind": "notice", "tone": "warning", "title": "AI engine unavailable", "message": f"{label} did not respond ({type(failed).__name__}). Answered with the deterministic engine instead; safety is unchanged."}}
+            deps.engine = "deterministic"
+            text = await asyncio.to_thread(router.handle, deps)
+            async for e in flush():
+                yield e
+            text_parts = [text]
+            yield {"type": "text-delta", "delta": text}
+        elif failed is not None:
+            yield {"type": "card", "card": {"kind": "notice", "tone": "warning", "title": "AI response interrupted", "message": "The model stopped early. Anything it drafted is shown above and still requires your countersignature."}}
+    final_text = "".join(text_parts).strip()
+    with session_scope() as s:
+        s.add(ChatMessage(conversation_id=conversation_id, user_id=user_id, role="assistant", text=final_text, cards=cards, engine=label))
+    yield {"type": "done"}
+
+
+def forget(user_id: str, conversation_ids: list[str]) -> None:
+    """Drops a trader's in-memory model context (used by the per-user demo reset)."""
+    for cid in conversation_ids:
+        _HISTORY.pop((user_id, cid), None)
