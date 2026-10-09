@@ -279,11 +279,21 @@ class Journey:
             p.wait_for_timeout(3500)
         p.get_by_label("Authenticator code", exact=True).click()
         p.keyboard.type(totp_now(secret))
+        self.skip_021_step()
         p.get_by_role("heading", name="You are ready to countersign").wait_for(timeout=20000)
         self.shot("06_onboarding_done")
         for text in ("Set", "1 registered", "Linked"):
             p.get_by_text(text, exact=True).first.wait_for(timeout=5000)
         return "authenticator linked; summary shows PIN, passkey and authenticator"
+
+    def skip_021_step(self) -> None:
+        # The optional "Connect your 021 account" step only appears when the 021 gateway runs: skip it if it does.
+        p = self.page
+        step = p.get_by_role("heading", name="Connect your 021 account", exact=True)
+        done = p.get_by_role("heading", name="You are ready to countersign", exact=True)
+        step.or_(done).first.wait_for(timeout=20000)
+        if step.is_visible():
+            p.get_by_role("button", name="Skip for now", exact=True).click()
 
     def enter_copilot(self) -> str:
         p = self.page
