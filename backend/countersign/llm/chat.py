@@ -30,7 +30,10 @@ TOOL_LABELS = {
     "propose_order": "Drafting order for deterministic verification",
     "propose_cancel": "Drafting cancellation for verification",
     "propose_modify": "Drafting modification for verification",
+    "propose_modify_stop_loss": "Drafting stop-loss modification for verification",
     "propose_plan": "Drafting plan for verification",
+    "propose_exit_losing_positions": "Computing exits for losing positions",
+    "propose_rebalance": "Computing a sells-only rebalance",
     "propose_standing_instruction": "Drafting standing instruction for verification",
     "ask_clarification": "Asking you to clarify",
 }

@@ -14,7 +14,7 @@ from countersign.core import portfolio, proposals
 from countersign.core.broker_client import ReadGateway, read_gateway
 from countersign.core.db import session_scope
 from countersign.core.money import inr
-from countersign.core.parser import clauses, extract_facts, facts_for
+from countersign.core.parser import clauses, extract_facts, facts_for, fraction_str, parse_fraction
 from countersign.core.schemas import MandateIntent, OrderIntent, OrderType, PlanIntent, Product, Side
 from countersign.core.verifier import AccountState
 
@@ -27,7 +27,17 @@ READ_TOOLS = [
     "get_option_chain",
     "find_instrument",
 ]
-DRAFT_TOOLS = ["propose_order", "propose_cancel", "propose_modify", "propose_plan", "propose_standing_instruction", "ask_clarification"]
+DRAFT_TOOLS = [
+    "propose_order",
+    "propose_cancel",
+    "propose_modify",
+    "propose_modify_stop_loss",
+    "propose_plan",
+    "propose_exit_losing_positions",
+    "propose_rebalance",
+    "propose_standing_instruction",
+    "ask_clarification",
+]
 
 
 @dataclass
@@ -61,32 +71,67 @@ def get_account_summary(d: ChatDeps) -> dict:
     return {k: (inr(v) if k.endswith("_paise") else v) for k, v in data.items()}
 
 
-def get_holdings(d: ChatDeps, losers_below_pct: float | None = None, symbol: str | None = None) -> dict:
+def get_holdings(d: ChatDeps, losers_below_pct: float | None = None, symbol: str | None = None, basis: str = "avg", emit: bool = True) -> dict:
+    """basis 'avg': down from the average buy price; 'day': down today from the previous close."""
     with session_scope() as s:
         rows = portfolio.holdings(s, d.gateway)
     title = "Holdings"
     if losers_below_pct is not None:
-        rows = [h for h in rows if h["pnl_bps"] <= -int(losers_below_pct * 100)]
-        title = f"Holdings down more than {losers_below_pct:g}% from your average price"
+        key = "day_change_bps" if basis == "day" else "pnl_bps"
+        rows = [h for h in rows if h[key] <= -int(losers_below_pct * 100)]
+        title = f"Holdings down more than {losers_below_pct:g}% " + ("today" if basis == "day" else "from your average price")
     if symbol:
         su = symbol.upper()
         rows = [h for h in rows if h["instrument"]["symbol"] == su or su in h["instrument"]["display_name"].upper()]
         title = f"Holding: {symbol.upper()}"
-    d.emit({"kind": "holdings", "title": title, "data": rows})
+    if emit:
+        d.emit({"kind": "holdings", "title": title, "data": rows})
     return {
         "count": len(rows),
         "holdings": [
-            {"symbol": h["instrument"]["symbol"], "qty": h["quantity"], "avg_price": inr(h["avg_price_paise"]), "ltp": inr(h["ltp_paise"]), "pnl": inr(h["pnl_paise"], True), "pnl_pct": round(h["pnl_bps"] / 100, 2)}
+            {
+                "symbol": h["instrument"]["symbol"],
+                "qty": h["quantity"],
+                "avg_price": inr(h["avg_price_paise"]),
+                "ltp": inr(h["ltp_paise"]),
+                "pnl": inr(h["pnl_paise"], True),
+                "pnl_pct": round(h["pnl_bps"] / 100, 2),
+                "day_change_pct": round(h["day_change_bps"] / 100, 2),
+            }
             for h in rows
         ],
     }
 
 
-def get_positions(d: ChatDeps) -> dict:
+def get_positions(d: ChatDeps, losers_below_pct: float | None = None, basis: str = "avg", symbol: str | None = None, emit: bool = True) -> dict:
     with session_scope() as s:
         rows = portfolio.positions(s, d.gateway)
-    d.emit({"kind": "positions", "title": "Open positions", "data": rows})
-    return {"positions": [{"symbol": p["instrument"]["symbol"], "product": p["product"], "qty": p["quantity"], "avg": inr(p["avg_price_paise"]), "ltp": inr(p["ltp_paise"]), "pnl": inr(p["pnl_paise"], True)} for p in rows]}
+    rows = [p for p in rows if p["quantity"] != 0] if (losers_below_pct is not None or symbol) else rows
+    title = "Open positions"
+    if losers_below_pct is not None:
+        rows = portfolio.losing_positions(rows, losers_below_pct, basis)
+        title = f"Positions down more than {losers_below_pct:g}% " + ("today" if basis == "day" else "from your average price")
+    if symbol:
+        su = symbol.upper()
+        rows = [p for p in rows if p["instrument"]["symbol"] == su or su in p["instrument"]["display_name"].upper()]
+        title = f"Position: {su}"
+    if emit:
+        d.emit({"kind": "positions", "title": title, "data": rows})
+    return {
+        "count": len(rows),
+        "positions": [
+            {
+                "symbol": p["instrument"]["symbol"],
+                "product": p["product"],
+                "qty": p["quantity"],
+                "avg": inr(p["avg_price_paise"]),
+                "ltp": inr(p["ltp_paise"]),
+                "pnl": inr(p["pnl_paise"], True),
+                "pnl_pct": round(p["pnl_bps"] / 100, 2),
+            }
+            for p in rows
+        ],
+    }
 
 
 def get_orders(d: ChatDeps, status: str = "open") -> dict:
@@ -114,9 +159,31 @@ def get_quote(d: ChatDeps, symbol: str) -> dict:
     return out
 
 
+def _live_021_chain(expiry: str | None, width: int) -> dict | None:
+    """The live 021 chain when the 021 gateway is enabled (market data, the same for every trader), as the API's
+    option-chain endpoint serves it. None when 021 is not in use. Raises when 021 is in use but unavailable, so a
+    simulated chain is never shown in its place."""
+    from countersign.core.config import settings
+
+    if not getattr(settings(), "gateway021_enabled", False):
+        return None
+    from countersign.broker021 import linking
+
+    ucc = linking.gateway_account_id()
+    if not ucc:
+        return None
+    return read_gateway(ucc).option_chain("NIFTY", expiry, width)
+
+
 def get_option_chain(d: ChatDeps, expiry: str | None = None, width: int = 6) -> dict:
-    with session_scope() as s:
-        oc = portfolio.option_chain(s, expiry, max(2, min(width, 12)))
+    width = max(2, min(width, 12))
+    try:
+        oc = _live_021_chain(expiry, width)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"The live 021 option chain is not available right now ({getattr(e, 'message', type(e).__name__)}). Tell the trader; do not guess prices."}
+    if oc is None:
+        with session_scope() as s:
+            oc = portfolio.option_chain(s, expiry, width)
     d.emit({"kind": "option_chain", "data": oc})
     atm = [r for r in oc["rows"] if abs(r["distance"]) <= 2]
     return {
@@ -152,6 +219,10 @@ def _record(d: ChatDeps, out: proposals.Outcome) -> dict:
         q, opts = out.clarify
         d.emit({"kind": "clarify", "question": q, "options": opts})
         return {"status": "NEEDS_CLARIFICATION", "question": q}
+    if out.notice:
+        title, message = out.notice
+        d.emit({"kind": "notice", "tone": "info", "title": title, "message": message})
+        return {"status": "NOTHING_DRAFTED", "message": message, "note": "Nothing was drafted. Tell the trader exactly this reason; do not draft anything else instead."}
     p = out.proposal
     d.proposal_ids.append(p.id)
     d.emit({"kind": "proposal", "proposal_id": p.id, "status": p.status})
@@ -171,15 +242,28 @@ def _dec(v) -> Decimal | None:
     return Decimal(str(v))
 
 
+def _order_type(raw: str | None) -> OrderType:
+    v = (raw or "LIMIT").upper().replace("_", "-").replace(" ", "-")
+    return OrderType({"SLM": "SL-M", "STOP-LOSS": "SL", "STOPLOSS": "SL", "STOP-LOSS-MARKET": "SL-M"}.get(v, v))
+
+
+def _product(raw: str | None) -> Product | None:
+    if not raw:
+        return None
+    v = raw.upper()
+    return Product("MIS" if v == "INTRADAY" else "CNC" if v == "DELIVERY" else v)
+
+
 def propose_order(
     d: ChatDeps,
     side: str,
     symbol: str,
-    quantity: int,
+    quantity: int | None = None,
     order_type: str = "LIMIT",
     limit_price: float | None = None,
     trigger_price: float | None = None,
     product: str | None = None,
+    fraction: str | None = None,
 ) -> dict:
     if (prev := _already(d)) is not None:
         return prev
@@ -187,14 +271,21 @@ def propose_order(
         return {
             "error": "The trader asked for several actions in one message. Do not draft them separately: call propose_plan ONCE with every step so a single countersignature binds the whole plan.",
         }
+    frac = None
+    if fraction not in (None, ""):
+        fr = parse_fraction(fraction)
+        if fr is None:
+            return {"error": f"'{fraction}' is not a fraction. Use for example '1/2', '1/3', '25%' or 'all'."}
+        frac = fraction_str(fr)
     intent = OrderIntent(
         side=Side(side.upper()),
         instrument_ref=symbol,
-        quantity=int(quantity),
-        order_type=OrderType(order_type.upper()),
+        quantity=int(quantity) if quantity not in (None, "") and not (frac and int(quantity) == 0) else None,
+        order_type=_order_type(order_type),
         limit_price=_dec(limit_price),
         trigger_price=_dec(trigger_price),
-        product=Product(product.upper()) if product else None,
+        product=_product(product),
+        quantity_fraction=frac,
     )
     with session_scope() as s:
         out = proposals.create_order(s, intent, user_text=d.user_text, account=_account(d), user_id=d.user_id, engine=d.engine, conversation_id=d.conversation_id, origin=d.origin, facts=facts_for(d.user_text, symbol))
@@ -217,6 +308,42 @@ def propose_modify(d: ChatDeps, order_ref: str, new_limit_price: float) -> dict:
         return _record(d, out)
 
 
+def propose_modify_stop_loss(
+    d: ChatDeps,
+    new_trigger_price: float,
+    symbol: str | None = None,
+    order_ref: str | None = None,
+    new_limit_price: float | None = None,
+) -> dict:
+    if (prev := _already(d)) is not None:
+        return prev
+    if order_ref and not str(order_ref).strip().isdigit():
+        symbol, order_ref = symbol or order_ref, None
+    if not symbol and not order_ref:
+        return {"error": "Give the stock symbol (or the order id) whose stop-loss should move."}
+    intent = OrderIntent(action="MODIFY", instrument_ref=symbol, target_order_ref=order_ref, trigger_price=_dec(new_trigger_price), limit_price=_dec(new_limit_price))
+    with session_scope() as s:
+        out = proposals.create_order(s, intent, user_text=d.user_text, account=_account(d), user_id=d.user_id, engine=d.engine, conversation_id=d.conversation_id, origin=d.origin)
+        return _record(d, out)
+
+
+def propose_exit_losing_positions(d: ChatDeps, intraday_only: bool = True) -> dict:
+    """The scope (intraday only or all positions) is read from the trader's own words; the argument is ignored if it differs."""
+    if (prev := _already(d)) is not None:
+        return prev
+    with session_scope() as s:
+        out = proposals.create_exit_plan(s, user_text=d.user_text, account=_account(d), user_id=d.user_id, engine=d.engine, conversation_id=d.conversation_id, origin=d.origin)
+        return _record(d, out)
+
+
+def propose_rebalance(d: ChatDeps, max_weight_pct: float) -> dict:
+    if (prev := _already(d)) is not None:
+        return prev
+    with session_scope() as s:
+        out = proposals.create_rebalance_plan(s, user_text=d.user_text, account=_account(d), user_id=d.user_id, engine=d.engine, max_pct=_dec(max_weight_pct), conversation_id=d.conversation_id, origin=d.origin)
+        return _record(d, out)
+
+
 def propose_plan(d: ChatDeps, steps: list[dict]) -> dict:
     if (prev := _already(d)) is not None:
         return prev
@@ -226,13 +353,18 @@ def propose_plan(d: ChatDeps, steps: list[dict]) -> dict:
         if action == "CANCEL":
             intents.append(OrderIntent(action="CANCEL", target_order_ref=st.get("order_ref") or st.get("symbol"), instrument_ref=st.get("symbol")))
             continue
+        fr = parse_fraction(st.get("fraction")) if st.get("fraction") not in (None, "") else None
+        qty = st.get("quantity")
         intents.append(
             OrderIntent(
                 side=Side(str(st["side"]).upper()),
                 instrument_ref=st["symbol"],
-                quantity=int(st["quantity"]),
-                order_type=OrderType(str(st.get("order_type", "LIMIT")).upper()),
+                quantity=int(qty) if qty not in (None, "") and not (fr and int(qty) == 0) else None,
+                order_type=_order_type(st.get("order_type")),
                 limit_price=_dec(st.get("limit_price")),
+                trigger_price=_dec(st.get("trigger_price")),
+                product=_product(st.get("product")),
+                quantity_fraction=fraction_str(fr) if fr else None,
             )
         )
     with session_scope() as s:
@@ -243,7 +375,7 @@ def propose_plan(d: ChatDeps, steps: list[dict]) -> dict:
 def propose_standing_instruction(
     d: ChatDeps,
     kind: str,
-    symbol: str,
+    symbol: str | None = None,
     condition: str = "LTP_BELOW",
     threshold_price: float | None = None,
     drop_pct: float | None = None,
@@ -254,14 +386,29 @@ def propose_standing_instruction(
     if (prev := _already(d)) is not None:
         return prev
     kind = kind.upper()
+    cond = (condition or "LTP_BELOW").upper()
+    if cond in ("ANY_HOLDING_DAY_DROP", "ANY_HOLDING_DROP_FROM_AVG"):
+        mi = MandateIntent(
+            kind="ORDER" if kind == "ORDER" else "ALERT",
+            scope="ALL_HOLDINGS",
+            field="DAY_CHANGE_BPS" if cond == "ANY_HOLDING_DAY_DROP" else "DROP_FROM_AVG_BPS",
+            op="LTE" if cond == "ANY_HOLDING_DAY_DROP" else "GTE",
+            drop_pct=_dec(abs(drop_pct)) if drop_pct is not None else None,
+            expires_days=30,
+        )
+        with session_scope() as s:
+            out = proposals.create_mandate(s, mi, user_text=d.user_text, account=_account(d), user_id=d.user_id, engine=d.engine, conversation_id=d.conversation_id, origin=d.origin)
+            return _record(d, out)
+    if not symbol:
+        return {"error": "A standing instruction on one stock needs its symbol. For an alert on every holding use condition ANY_HOLDING_DAY_DROP or ANY_HOLDING_DROP_FROM_AVG."}
     order = None
     if kind == "ORDER":
         order = OrderIntent(side=Side(str(side).upper()), instrument_ref=symbol, quantity=int(quantity or 0), order_type=OrderType.LIMIT, limit_price=_dec(limit_price if limit_price is not None else threshold_price))
     mi = MandateIntent(
         kind="ORDER" if kind == "ORDER" else "ALERT",
         instrument_ref=symbol,
-        field="DROP_FROM_AVG_BPS" if condition.upper() == "DROP_FROM_AVG" else "LTP",
-        op="GTE" if condition.upper() in ("LTP_ABOVE", "DROP_FROM_AVG") else "LTE",
+        field="DROP_FROM_AVG_BPS" if cond == "DROP_FROM_AVG" else "LTP",
+        op="GTE" if cond in ("LTP_ABOVE", "DROP_FROM_AVG") else "LTE",
         threshold_price=_dec(threshold_price),
         drop_pct=_dec(drop_pct),
         order=order,
@@ -292,5 +439,28 @@ propose_cancel = _single_draft(propose_cancel)
 propose_modify = _single_draft(propose_modify)
 propose_plan = _single_draft(propose_plan)
 propose_standing_instruction = _single_draft(propose_standing_instruction)
+propose_modify_stop_loss = _single_draft(propose_modify_stop_loss)
+propose_exit_losing_positions = _single_draft(propose_exit_losing_positions)
+propose_rebalance = _single_draft(propose_rebalance)
 
-TOOL_FUNCS = {f.__name__: f for f in (get_account_summary, get_holdings, get_positions, get_orders, get_quote, get_option_chain, find_instrument, propose_order, propose_cancel, propose_modify, propose_plan, propose_standing_instruction, ask_clarification)}
+TOOL_FUNCS = {
+    f.__name__: f
+    for f in (
+        get_account_summary,
+        get_holdings,
+        get_positions,
+        get_orders,
+        get_quote,
+        get_option_chain,
+        find_instrument,
+        propose_order,
+        propose_cancel,
+        propose_modify,
+        propose_modify_stop_loss,
+        propose_plan,
+        propose_exit_losing_positions,
+        propose_rebalance,
+        propose_standing_instruction,
+        ask_clarification,
+    )
+}
