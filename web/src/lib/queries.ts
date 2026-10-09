@@ -215,6 +215,8 @@ export interface ActiveBroker {
   kind: BrokerKind;
   /** Prices stream live from the 021 sandbox for the active account. */
   live021: boolean;
+  /** Real instruments are priced by the live 021 feed (true for paper accounts too while the gateway streams). */
+  liveFeed: boolean;
   /** False when the server has no broker accounts endpoint (an older backend). */
   reported: boolean;
   isPending: boolean;
@@ -234,6 +236,7 @@ export function useActiveBroker(): ActiveBroker {
     accounts,
     kind,
     live021: account?.kind === "021" && account.status.market_data === "live",
+    liveFeed: account?.status.market_data === "live",
     reported: Array.isArray(q.data),
     isPending: q.isPending,
     error: q.error,

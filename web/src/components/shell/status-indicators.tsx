@@ -62,6 +62,14 @@ export function useMarketSource(): MarketSource {
     if (broker.live021) {
       return { live: true, label: "Live from the 021 sandbox", title: "Prices stream from the 021 Developer Sandbox market data websocket" };
     }
+    if (broker.liveFeed) {
+      // A paper account still sees real instruments at live 021 prices; only replay-only test stocks are simulated.
+      return {
+        live: true,
+        label: "Live from the 021 sandbox",
+        title: "Real stocks are priced live from the 021 Developer Sandbox; replay-only test stocks such as ABCCORP are simulated",
+      };
+    }
     return {
       live: false,
       label: "Replay",
@@ -135,7 +143,7 @@ export function useSystemHealth() {
             label: "Market feed",
             icon: RadioTower,
             tone: !data.feed.healthy ? "danger" : (data.feed.last_tick_age_ms ?? 0) > 5000 ? "warning" : "profit",
-            value: `${source.live ? (broker.kind === "021" ? "Live 021 feed" : "Live feed") : "Replay"}, tick ${ms(data.feed.last_tick_age_ms)} ago`,
+            value: `${source.live ? (broker.live021 || broker.liveFeed ? "Live 021 feed" : "Live feed") : "Replay"}, tick ${ms(data.feed.last_tick_age_ms)} ago`,
             detail: data.feed.healthy ? source.title : "Stale: approvals and mandates pause",
           },
           {
