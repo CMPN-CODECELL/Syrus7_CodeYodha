@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-PATTERNS = ["countersign.broker.app", "countersign.feed.main", "countersign.executor.main", "countersign.api.main", "countersign.monitor.main", "scripts/dev.py", "scripts\\dev.py"]
+PATTERNS = ["countersign.broker.app", "countersign.broker021.app", "countersign.feed.main", "countersign.executor.main", "countersign.api.main", "countersign.monitor.main", "scripts/dev.py", "scripts\\dev.py"]
 
 
 def main() -> None:

@@ -6,7 +6,10 @@ Credential zones are enforced at process launch: each process receives only the 
   api      : READ key + demo admin key + sandbox-only naive key; never the write key (it refuses to start if given one)
   monitor  : AUDIT (read-all) key only
   feed     : no keys
-Usage:  uv run --project backend python scripts/dev.py [--no-web] [--no-docker]"""
+  gateway021 (only when CS_021_UCC and CS_021_PASSWORD are set in .env): the 021 sandbox adapter. It verifies the
+             read / write / admin / audit keys like the paper broker and is the ONLY process that holds the 021 UCC,
+             password and access token (it reads them from .env itself; they are stripped from every other process).
+Usage:  uv run --project backend python scripts/dev.py [--no-web] [--no-docker] [--no-021]"""
 
 from __future__ import annotations
 
@@ -34,6 +37,21 @@ def keys() -> dict:
     return json.loads(p.read_text())
 
 
+def has_021_credentials() -> bool:
+    """True when .env (or .env.local) sets both CS_021_UCC and CS_021_PASSWORD. Values are never printed."""
+    found: dict[str, bool] = {}
+    for name in (".env", ".env.local"):
+        f = ROOT / name
+        if not f.exists():
+            continue
+        for line in f.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                if k.strip() in ("CS_021_UCC", "CS_021_PASSWORD"):
+                    found[k.strip()] = bool(v.strip())
+    return found.get("CS_021_UCC", False) and found.get("CS_021_PASSWORD", False)
+
+
 def py() -> str:
     win = BACKEND / ".venv" / "Scripts" / "python.exe"
     nix = BACKEND / ".venv" / "bin" / "python"
@@ -57,9 +75,11 @@ def main() -> None:
     args = set(sys.argv[1:])
     k = keys()
     LOGS.mkdir(exist_ok=True)
-    base = {kk: v for kk, v in os.environ.items() if not kk.startswith("CS_BROKER_")}
+    base = {kk: v for kk, v in os.environ.items() if not kk.startswith(("CS_BROKER_", "CS_021_UCC", "CS_021_PASSWORD"))}
     base["PYTHONIOENCODING"] = "utf-8"
     base["PYTHONUNBUFFERED"] = "1"
+    use_021 = "--no-021" not in args and has_021_credentials()
+    base["CS_GATEWAY021_ENABLED"] = "true" if use_021 else "false"
 
     if "--no-docker" not in args:
         print("starting postgres + valkey (docker compose)...")
@@ -72,6 +92,11 @@ def main() -> None:
 
     plan = [
         ("broker", ["-m", "countersign.broker.app"], {"CS_BROKER_READ_KEY": k["read"], "CS_BROKER_WRITE_KEY": k["write"], "CS_BROKER_ADMIN_KEY": k["admin"], "CS_BROKER_NAIVE_KEY": k["naive"], "CS_BROKER_AUDIT_KEY": k["audit"]}, 8100),
+    ]
+    if use_021:
+        # Started before the API so owners are linked to the 021 account on their first sign-in.
+        plan.append(("gateway021", ["-m", "countersign.broker021.app"], {"CS_BROKER_READ_KEY": k["read"], "CS_BROKER_WRITE_KEY": k["write"], "CS_BROKER_ADMIN_KEY": k["admin"], "CS_BROKER_AUDIT_KEY": k["audit"]}, 8200))
+    plan += [
         ("feed", ["-m", "countersign.feed.main"], {}, None),
         ("executor", ["-m", "countersign.executor.main"], {"CS_BROKER_WRITE_KEY": k["write"]}, None),
         ("api", ["-m", "countersign.api.main"], {"CS_BROKER_READ_KEY": k["read"], "CS_BROKER_ADMIN_KEY": k["admin"], "CS_BROKER_NAIVE_KEY": k["naive"]}, 8000),
@@ -83,9 +108,10 @@ def main() -> None:
         log = open(LOGS / f"{name}.log", "w", encoding="utf-8")
         p = subprocess.Popen([py(), *argv], cwd=BACKEND, env={**base, **env_extra}, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
         procs.append((name, p))
-        print(f"  {name:9s} pid {p.pid}  (keys: {', '.join(x.split('_')[2].lower() for x in env_extra) or 'none'})")
+        note = "; holds the 021 credentials" if name == "gateway021" else ""
+        print(f"  {name:9s} pid {p.pid}  (keys: {', '.join(x.split('_')[2].lower() for x in env_extra) or 'none'}{note})")
         if port:
-            if not wait_port(port, 90):
+            if not wait_port(port, 150 if name == "gateway021" else 90):
                 print(f"  ! {name} did not open port {port}; see .logs/{name}.log")
     if "--no-web" not in args and (WEB / "package.json").exists():
         log = open(LOGS / "web.log", "w", encoding="utf-8")
@@ -97,6 +123,13 @@ def main() -> None:
     print("  Web app   http://localhost:3000")
     print("  API       http://127.0.0.1:8000/docs")
     print("  Broker    http://127.0.0.1:8100/health")
+    if use_021:
+        print("  021       http://127.0.0.1:8200/health   (021 sandbox gateway)")
+        owners = os.environ.get("CS_021_OWNER_EMAILS") or next((ln.split("=", 1)[1].strip() for f in (ROOT / ".env", ROOT / ".env.local") if f.exists() for ln in f.read_text(encoding="utf-8").splitlines() if ln.startswith("CS_021_OWNER_EMAILS=")), "")
+        if not owners:
+            print("            CS_021_OWNER_EMAILS is empty: nobody is linked to the 021 account until you list sign-in emails there")
+    else:
+        print("  021       not started (set CS_021_UCC and CS_021_PASSWORD in .env to trade on the 021 sandbox)")
     print("  Logs      .logs/*.log      (Ctrl+C to stop everything)\n")
     try:
         while True:
