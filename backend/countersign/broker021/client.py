@@ -87,6 +87,7 @@ class Client021:
         self.clock_offset_s = 0.0  # 021 server time minus local time, from the Date header
         self.stats = Stats()
         self.drop_next_write_responses = 0  # fault drill only (gateway /admin/faults, test_faults=true)
+        self.fail_next_write_connects = 0  # fault drill only: the next order write fails before any byte is sent
 
     # ------------------------------------------------------------------ token
 
@@ -214,6 +215,11 @@ class Client021:
             return WriteResult(kind="not_sent", error=str(e))
         sent_at = time.time()
         t0 = time.perf_counter()
+        if self.fail_next_write_connects > 0 and method == "POST":
+            # Fault drill: the network drops before the connection is made, so nothing reaches 021.
+            self.fail_next_write_connects -= 1
+            self._note_error(f"{method} {path}: not sent (fault drill)")
+            return WriteResult(kind="not_sent", error="Connection to 021 failed before the request was sent (fault drill: simulated network drop).", sent_at=sent_at, elapsed_s=0.0)
         try:
             r = self._http.request(method, path, json=body, headers={"Authorization": f"Bearer {tok}"}, timeout=self.cfg.write_timeout_s)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:

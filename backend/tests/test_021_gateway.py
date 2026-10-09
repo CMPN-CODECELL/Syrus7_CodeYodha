@@ -86,7 +86,7 @@ class Fake021:
                     self.orders_gate.wait(5)
                 return httpx.Response(200, json=list(self.book))
             if path.startswith("/orders/") and path.endswith("/trades"):
-                return httpx.Response(200, json=[])
+                return httpx.Response(200, json=[t for t in self.trades if str(t.get("orderId")) == path.split("/")[2]])
             if path.startswith("/orders/"):
                 o = self.find(path.split("/")[2])
                 if o is None:
@@ -449,7 +449,10 @@ def test_funds_are_an_estimate_and_portfolio_maps_to_paper_shape(gw, fake):
 
 def test_http_scopes_match_the_paper_broker_and_refuse_the_naive_key(gw, fake, monkeypatch):
     from countersign.broker021 import app as gapp
+    from countersign.broker021.settings import gateway_settings
     from countersign.core.config import settings
+
+    monkeypatch.setattr(gateway_settings(), "test_faults", False)  # independent of the developer's .env
 
     cfg = settings()
     for name, val in (("broker_read_key", "k-read"), ("broker_write_key", "k-write"), ("broker_admin_key", "k-admin"), ("broker_audit_key", "k-audit"), ("broker_naive_key", "k-naive")):
@@ -480,3 +483,60 @@ def test_http_scopes_match_the_paper_broker_and_refuse_the_naive_key(gw, fake, m
     r = c.post("/v1/orders", json=_body("CSTEST021HTP2", quantity=9), headers=h("k-write"))
     assert r.status_code == 502 and r.json()["code"] == "NOT_PLACED"
     assert c.get("/v1/account", headers=h("k-read", None)).json() == {"account_id": ACCT, "broker": "021", "label": "HACK***0"}
+
+
+def test_fault_drills_not_placed_sends_nothing_and_drop_after_accept_reconciles(gw, fake, monkeypatch):
+    from countersign.broker021 import app as gapp
+    from countersign.broker021.settings import gateway_settings
+    from countersign.core.config import settings
+
+    cfg = settings()
+    for name, val in (("broker_read_key", "k-read"), ("broker_write_key", "k-write"), ("broker_admin_key", "k-admin"), ("broker_audit_key", "k-audit")):
+        monkeypatch.setattr(cfg, name, val)
+    monkeypatch.setattr(gapp, "_gw", gw)
+    monkeypatch.setattr(gateway_settings(), "test_faults", True)
+    monkeypatch.setattr(gapp, "_faults", {"drop_after_accept": 0, "fail_before_send": 0})
+    c = TestClient(gapp.app)
+    admin = {"Authorization": "Bearer k-admin"}
+    write = {"Authorization": "Bearer k-write", "X-Account": ACCT}
+    assert c.post("/admin/faults", json={"mode": "unknown"}, headers=admin).status_code == 422
+    assert c.post("/admin/faults", json={"mode": "fail_before_send"}, headers=admin).json() == {"enabled": True, "drop_after_accept": 0, "fail_before_send": 1}
+    r = c.post("/v1/orders", json=_body("CSTEST021NOTP"), headers=write)
+    assert r.status_code == 502 and r.json()["code"] == "NOT_PLACED" and "fault drill" in r.json()["message"]
+    assert fake.posts == [] and fake.book == []  # not one byte reached 021
+    assert c.get("/v1/attempts/CSTEST021NOTP", headers={"Authorization": "Bearer k-read", "X-Account": ACCT}).json()["state"] == "NOT_PLACED"
+    # The fault was used once; countersigning again (a new tag) sends exactly one order.
+    r = c.post("/v1/orders", json=_body("CSTEST021NOT2"), headers=write)
+    assert r.status_code == 200 and len(fake.posts) == 1 and len(fake.book) == 1
+    assert c.post("/admin/faults", json={"mode": "drop_after_accept"}, headers=admin).json()["drop_after_accept"] == 1
+    r = c.post("/v1/orders", json=_body("CSTEST021DROP", quantity=3), headers=write)
+    assert r.status_code == 200 and r.json().get("reconciled") is True and len(fake.posts) == 2 and len(fake.book) == 2
+    assert c.post("/admin/faults", json={"mode": "none"}, headers=admin).json() == {"enabled": True, "drop_after_accept": 0, "fail_before_send": 0}
+
+
+def test_market_order_filled_in_many_small_trades_reports_the_weighted_average(gw, fake):
+    """Live sandbox behaviour: a market order fills in several small trades, and some rest Pending part filled. The
+    filled quantity is 021's traded quantity and the average is weighted over the order's own trades."""
+    o21 = {"exchange": "NSE", "token": 1594, "qty": 10, "price": 99500, "book": "RL", "trigger": 0, "product": "CNC", "validity": "Day"}
+    row = fake.add(o21, status="Executed")
+    row.update(qtyRemaining=0, qtyTraded=10)
+    oid = row["orderId"]
+    fake.trades = [
+        {"tradeId": 11, "orderId": oid, "tradeTime": 2107038142, "quantity": 3, "token": 1594, "exchange": "NSECM", "product": "CNC", "price": 99000},
+        {"tradeId": 12, "orderId": oid, "tradeTime": 2107038143, "quantity": 2, "token": 1594, "exchange": "NSECM", "product": "CNC", "price": 99100},
+        {"tradeId": 13, "orderId": oid, "tradeTime": 2107038145, "quantity": 5, "token": 1594, "exchange": "NSECM", "product": "CNC", "price": 98950},
+        {"tradeId": 14, "orderId": 999999, "tradeTime": 2107038146, "quantity": 7, "token": 1594, "exchange": "NSECM", "product": "CNC", "price": 1},
+    ]
+    o = gw.to_order(dict(row))
+    assert o["status"] == "COMPLETE" and o["filled_quantity"] == 10 and o["side"] == "BUY"
+    assert o["avg_fill_price_paise"] == (3 * 99000 + 2 * 99100 + 5 * 98950) // 10
+    part = fake.add(o21 | {"qty": -8}, status="Pending")
+    part.update(qtyRemaining=-5, qtyTraded=-3)
+    fake.trades += [
+        {"tradeId": 21, "orderId": part["orderId"], "tradeTime": 2107038150, "quantity": -1, "token": 1594, "exchange": "NSECM", "product": "CNC", "price": 99400},
+        {"tradeId": 22, "orderId": part["orderId"], "tradeTime": 2107038151, "quantity": -2, "token": 1594, "exchange": "NSECM", "product": "CNC", "price": 99300},
+    ]
+    po = gw.to_order(dict(part))
+    assert po["status"] == "PARTIALLY_FILLED" and po["filled_quantity"] == 3 and po["pending_quantity"] == 5 and po["side"] == "SELL"
+    assert po["avg_fill_price_paise"] == (99400 + 2 * 99300) // 3
+    assert mapping.unix_ts(2107038142) == 1791525142  # trade times arrive shifted; corrected to Unix seconds

@@ -105,6 +105,9 @@ def update(tag: str, **kw) -> None:
         s.commit()
 
 
+NEVER_SENT = "never sent: the connection failed before any byte reached 021"
+
+
 def holding_fingerprint(fp: str, account_id: str, hold_s: float) -> dict | None:
     """An unresolved placement with this fingerprint (in flight, needing review, or resolved as not placed only
     moments ago and so still able to appear late). A second identical placement is refused while one exists."""
@@ -114,6 +117,8 @@ def holding_fingerprint(fp: str, account_id: str, hold_s: float) -> dict | None:
         for a in rows:
             if a.state == "SENDING" and now - a.sent_at < 600:
                 return as_dict(a)
+            if a.state == "NOT_PLACED" and a.note == NEVER_SENT:
+                continue  # nothing reached 021, so it cannot appear late: countersigning again may send at once
             if a.state in ("NOT_PLACED", "AMBIGUOUS", "UNCONFIRMED") and a.resolved_at and now - a.resolved_at < hold_s:
                 return as_dict(a)
     return None
@@ -134,7 +139,7 @@ def late_candidates(account_id: str, window_s: float) -> list[dict]:
     since = time.time() - window_s
     with _sf()() as s:
         rows = s.execute(select(Attempt).where(Attempt.account_id == account_id, Attempt.state.in_(["NOT_PLACED", "UNCONFIRMED"]), Attempt.order_id.is_(None), Attempt.sent_at >= since)).scalars().all()
-        return [as_dict(a) for a in rows]
+        return [as_dict(a) for a in rows if a.note != NEVER_SENT]
 
 
 def stale_sending(account_id: str, older_than_s: float) -> list[dict]:

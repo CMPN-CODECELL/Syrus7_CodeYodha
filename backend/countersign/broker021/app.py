@@ -35,7 +35,7 @@ _gw: Gateway | None = None
 _md = None
 _ows = None
 _boot: dict = {"instruments": None, "recovered": [], "started_at": None, "error": None}
-_faults = {"drop_after_accept": 0}
+_faults = {"drop_after_accept": 0, "fail_before_send": 0}
 
 
 def gw() -> Gateway:
@@ -274,13 +274,17 @@ class PlaceBody(BaseModel):
 @app.post("/v1/orders", dependencies=[Depends(_account_required)])
 def place(body: PlaceBody, c: Caller = Depends(need("write"))) -> dict:
     g = gw()
-    if _faults["drop_after_accept"] > 0:
+    if _faults["fail_before_send"] > 0:
+        _faults["fail_before_send"] -= 1
+        g.client.fail_next_write_connects = 1
+    elif _faults["drop_after_accept"] > 0:
         _faults["drop_after_accept"] -= 1
         g.client.drop_next_write_responses = 1
     try:
         return g.place(body.model_dump())
     finally:
         g.client.drop_next_write_responses = 0
+        g.client.fail_next_write_connects = 0
 
 
 class ModifyBody(BaseModel):
@@ -442,13 +446,17 @@ def get_faults(c: Caller = Depends(need("admin"))) -> dict:
 
 @app.post("/admin/faults")
 def set_faults(body: FaultBody, c: Caller = Depends(need("admin"))) -> dict:
-    """Drill only (CS_021_TEST_FAULTS=true): drop the HTTP answer of the next placement AFTER 021 accepted it, to show
-    that reconciliation finds the order and nothing is sent twice. Off by default; never affects 021 itself."""
+    """Drill only (CS_021_TEST_FAULTS=true), for the next 1 to 3 placements: 'drop_after_accept' drops the HTTP answer
+    AFTER 021 accepted the order (reconciliation finds it, nothing is sent twice); 'fail_before_send' fails the
+    connection before any byte is sent (the order is NOT_PLACED and the trader countersigns again to resend). Off by
+    default; never changes what 021 itself does."""
     if not gateway_settings().test_faults:
         raise HTTPException(403, {"code": "FAULTS_DISABLED", "message": "Fault drills are disabled on this gateway (CS_021_TEST_FAULTS is not true)."})
-    if body.mode not in ("none", "drop_after_accept"):
-        raise HTTPException(422, {"code": "UNKNOWN_FAULT", "message": "Fault must be 'none' or 'drop_after_accept'."})
-    _faults["drop_after_accept"] = 0 if body.mode == "none" else max(1, min(body.count, 3))
+    if body.mode not in ("none", "drop_after_accept", "fail_before_send"):
+        raise HTTPException(422, {"code": "UNKNOWN_FAULT", "message": "Fault must be 'none', 'drop_after_accept' or 'fail_before_send'."})
+    n = max(1, min(body.count, 3))
+    _faults["drop_after_accept"] = n if body.mode == "drop_after_accept" else 0
+    _faults["fail_before_send"] = n if body.mode == "fail_before_send" else 0
     return {"enabled": True, **_faults}
 
 

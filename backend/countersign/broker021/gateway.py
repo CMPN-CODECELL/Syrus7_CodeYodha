@@ -378,7 +378,7 @@ class Gateway:
                 return self._accepted_order(tag, oid, o21)
             res.error = "021 answered success without an orderId."
         if res.kind == "not_sent":
-            store.update(tag, state="NOT_PLACED", error=res.error)
+            store.update(tag, state="NOT_PLACED", error=res.error, note=store.NEVER_SENT)
             raise GatewayError(502, "NOT_PLACED", f"{res.error} Nothing was sent to 021.", {"reconciled": False, "broker_error": res.error})
         return self._reconcile_place(tag, res)
 

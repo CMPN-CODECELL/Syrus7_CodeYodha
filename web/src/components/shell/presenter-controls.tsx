@@ -49,6 +49,13 @@ const FAULTS: { id: BrokerFault; label: string; hint: string }[] = [
     : []),
 ];
 
+/** On the 021 account the gateway drills these two faults itself; 021 is never asked to misbehave. */
+const FAULT_HINTS_021: Partial<Record<BrokerFault, string>> = {
+  none: "Gateway sends orders normally",
+  accept_then_drop: "021 accepts; the gateway drops the answer and reconciles",
+  connection_failure: "Fails before anything reaches 021: not placed",
+};
+
 const SYMBOLS = ["TATAMOTORS", "RELIANCE", "INFY", "TCS", "HDFCBANK", "SBIN", "ITC", "NIFTY"];
 
 export function PresenterControls() {
@@ -62,6 +69,10 @@ export function PresenterControls() {
   const [confirmReset, setConfirmReset] = useState(false);
 
   const onError = (title: string) => (e: unknown) => toast.error(title, { description: errorMessage(e) });
+  const on021 = state.data?.broker === "021";
+  const faults = on021
+    ? FAULTS.filter((f) => (state.data?.faults_available ?? []).includes(f.id)).map((f) => ({ ...f, hint: FAULT_HINTS_021[f.id] ?? f.hint }))
+    : FAULTS;
 
   // Ctrl+. (Cmd+. on a Mac) toggles the panel during a demo.
   useEffect(() => {
@@ -148,9 +159,14 @@ export function PresenterControls() {
           </section>
 
           <section className="space-y-2">
-            <Eyebrow>Broker fault injection</Eyebrow>
+            <Eyebrow>{on021 ? "021 gateway fault drills" : "Broker fault injection"}</Eyebrow>
+            {on021 && faults.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                Fault drills on the 021 account are off. Start the gateway with CS_021_TEST_FAULTS=true, or switch to your paper account.
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-1.5">
-              {FAULTS.map((f) => {
+              {faults.map((f) => {
                 const active = state.data?.broker_fault === f.id;
                 return (
                   <button

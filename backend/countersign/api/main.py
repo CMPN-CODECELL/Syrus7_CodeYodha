@@ -27,7 +27,7 @@ from countersign.auth import factors
 from countersign.auth.sessions import COOKIE, CSRF_COOKIE, Principal, check_origin, create, current, revoke_presented
 from countersign.core import audit, events, instruments, market, portfolio, state
 from countersign.core.approval_crypto import CountersignError, b64url
-from countersign.core.broker_client import BrokerAdmin, BrokerError, BrokerTimeout, BrokerUnavailable, ReadGateway, read_gateway
+from countersign.core.broker_client import BrokerAdmin, BrokerError, BrokerTimeout, BrokerUnavailable, ReadGateway, broker_kind, read_gateway
 from countersign.core.config import rp_id_for, rp_id_from_credential, settings
 from countersign.core.db import session_scope
 from countersign.core.models import (
@@ -1449,14 +1449,31 @@ def _demo_only() -> None:
         raise HTTPException(404, {"code": "NOT_FOUND", "message": "Demo controls are disabled."})
 
 
+# Presenter fault buttons on the 021 account map to the gateway's two drills (CS_021_TEST_FAULTS=true). They never
+# change what 021 does: one drops the gateway's answer after 021 accepted, the other fails before anything is sent.
+GATEWAY_FAULTS = {"none": "none", "accept_then_drop": "drop_after_accept", "connection_failure": "fail_before_send"}
+
+
+def _on_021(p: Principal) -> bool:
+    return settings().gateway021_enabled and broker_kind(p.account_id) == "021"
+
+
 @app.get("/api/demo/state")
 def demo_state(p: Principal = Depends(current)):
     _demo_only()
+    scenarios = ["calm", "dip_to_trigger", "spike", "crash", "stale"]
+    if _on_021(p):
+        try:
+            f = BrokerAdmin(base_url=settings().gateway021_url).fault_state()
+            mode = "accept_then_drop" if f.get("drop_after_accept") else "connection_failure" if f.get("fail_before_send") else "none"
+            return {"feed_mode": "live", "broker_fault": mode, "broker": "021", "faults_available": sorted(GATEWAY_FAULTS) if f.get("enabled") else [], "scenarios": scenarios}
+        except Exception:  # noqa: BLE001
+            return {"feed_mode": "live", "broker_fault": "unknown", "broker": "021", "faults_available": [], "scenarios": scenarios}
     try:
         fault = BrokerAdmin().fault_state()
     except Exception:  # noqa: BLE001
         fault = {"mode": "unknown"}
-    return {"feed_mode": "replay", "broker_fault": fault.get("mode"), "scenarios": ["calm", "dip_to_trigger", "spike", "crash", "stale"]}
+    return {"feed_mode": "replay", "broker_fault": fault.get("mode"), "broker": "paper", "scenarios": scenarios}
 
 
 class FeedBody(BaseModel):
@@ -1488,6 +1505,17 @@ class FaultBody(BaseModel):
 @app.post("/api/demo/broker-fault")
 def demo_fault(body: FaultBody, p: Principal = Depends(current)):
     _demo_only()
+    if _on_021(p):
+        mode = GATEWAY_FAULTS.get(body.mode)
+        if mode is None:
+            raise HTTPException(422, {"code": "FAULT_NOT_ON_021", "message": "On the 021 account only 'Accept, drop ack' and 'Connection fail' can be drilled (in the gateway); the other faults apply to the paper broker."})
+        try:
+            r = BrokerAdmin(base_url=settings().gateway021_url).set_fault(mode, body.count)
+        except BrokerError as e:
+            raise HTTPException(e.status if 400 <= e.status < 500 else 502, {"code": e.code, "message": e.message}) from None
+        with session_scope() as s:
+            audit.record(s, "presenter", "BROKER_FAULT_SET", "broker", "021", {"mode": body.mode, "gateway_mode": mode, "count": body.count})
+        return r
     r = BrokerAdmin().set_fault(body.mode, body.count)
     with session_scope() as s:
         audit.record(s, "presenter", "BROKER_FAULT_SET", "broker", "paper", {"mode": body.mode, "count": body.count})
@@ -1594,8 +1622,12 @@ def public_status():
 
 @app.get("/api/health")
 def health():
-    # holds_021_credentials is always False: the 021 UCC, password and token exist only in the gateway021 process.
-    return {"ok": True, "db": True, "valkey": events.ping(), "holds_write_key": bool(settings().broker_write_key), "holds_021_credentials": False, "gateway021_enabled": settings().gateway021_enabled}
+    # The 021 UCC, password and token exist only in the gateway021 process: scripts/dev.py strips the variables from
+    # every other process, and this process never imports broker021/settings.py (the only code that reads them).
+    import os
+
+    holds_021 = bool(os.environ.get("CS_021_UCC") or os.environ.get("CS_021_PASSWORD"))
+    return {"ok": True, "db": True, "valkey": events.ping(), "holds_write_key": bool(settings().broker_write_key), "holds_021_credentials": holds_021, "gateway021_enabled": settings().gateway021_enabled}
 
 
 def main() -> None:
