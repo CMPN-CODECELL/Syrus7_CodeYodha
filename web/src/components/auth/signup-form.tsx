@@ -158,8 +158,8 @@ export function SignUpForm() {
         <div className="flex items-start gap-2.5 rounded-xl bg-info/[0.07] px-3.5 py-3 text-xs leading-relaxed text-muted-foreground ring-1 ring-info/20">
           <FlaskConical className="mt-0.5 size-3.5 shrink-0 text-info" aria-hidden />
           <p>
-            <span className="font-medium text-foreground">Paper trading on a simulated market.</span> Prices come from a replay feed and
-            orders go to a paper broker. No real money moves.
+            <span className="font-medium text-foreground">You start on your own paper trading account.</span> Orders go to a local paper
+            broker. Accounts the operator links to the 021 Developer Sandbox trade virtual money there. No real money moves.
           </p>
         </div>
 

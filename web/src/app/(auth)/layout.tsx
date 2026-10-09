@@ -33,7 +33,7 @@ export default function AuthLayout({ children }: LayoutProps<"/">) {
         {children}
       </main>
       <footer className="relative z-10 px-4 pb-6 text-center text-xs text-subtle">
-        Paper trading on a simulated market. No real money, no real orders.
+        Paper accounts and the 021 Developer Sandbox: virtual money only, no real orders on an exchange.
       </footer>
     </div>
   );

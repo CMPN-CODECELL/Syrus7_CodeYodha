@@ -4,13 +4,13 @@ import type { BrokerKind, CanonicalOrder } from "./types";
 
 const UCC_RE = /^HACK\d+$/i;
 
-/** "HACK1234" becomes "HACK••34". Short ids keep only their last two characters. */
+/** "HACK1234" becomes "HACK•••4", like the backend's "HACK***4". Short ids keep only their last character. */
 export function maskUcc(id: string): string {
   const v = id.trim();
   if (v.length <= 4) return "•".repeat(Math.max(2, v.length));
-  const head = v.length > 6 ? v.slice(0, 4) : "";
-  const tail = v.slice(-2);
-  return `${head}${"•".repeat(Math.max(2, v.length - head.length - 2))}${tail}`;
+  const head = v.length > 5 ? v.slice(0, 4) : "";
+  const tail = v.slice(-1);
+  return `${head}${"•".repeat(Math.max(3, v.length - head.length - 1))}${tail}`;
 }
 
 /** An account id as it may be shown: masked for 021 (or anything shaped like a UCC), as is for paper accounts. */

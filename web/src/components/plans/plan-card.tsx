@@ -243,7 +243,8 @@ export function PlanCard({ proposal, className }: { proposal: Proposal; classNam
             <span>
               <span className="font-semibold text-info">Independent steps: no automatic compensating trades.</span>{" "}
               <span className="text-muted-foreground">
-                Each order stands alone. A rejection does not stop the others, and nothing is retried or reversed for you.
+                No step waits for another. If the broker refuses a step when it is sent, the later steps are skipped; a rejection reported after a
+                step was accepted does not stop the others. Nothing is retried or reversed for you.
               </span>
             </span>
           </div>
@@ -252,7 +253,10 @@ export function PlanCard({ proposal, className }: { proposal: Proposal; classNam
             <ShieldAlert className="mt-0.5 size-3.5 shrink-0 text-warning" aria-hidden />
             <span>
               <span className="font-semibold text-warning">Stop on failure: no automatic compensating trades.</span>{" "}
-              <span className="text-muted-foreground">If a step does not fill, later steps are skipped and nothing is reversed for you.</span>
+              <span className="text-muted-foreground">
+                If a step that a later one depends on does not fill, or the broker refuses a step when it is sent, later steps are skipped. Nothing is
+                reversed for you.
+              </span>
             </span>
           </div>
         )}

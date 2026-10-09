@@ -743,6 +743,10 @@ export interface DemoState {
   feed_mode: string;
   broker_fault: string;
   scenarios: string[];
+  /** Which broker the caller's active account uses; fault drills differ (021: only the gateway's two drills). */
+  broker?: "paper" | "021";
+  /** 021 only: the drills the gateway allows (empty when CS_021_TEST_FAULTS is off). */
+  faults_available?: string[];
 }
 
 export interface Quote {
