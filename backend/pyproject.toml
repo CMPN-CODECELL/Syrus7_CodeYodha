@@ -1,0 +1,36 @@
+[project]
+name = "countersign"
+version = "0.1.0"
+description = "AI trading copilot that cannot trade without the trader's signature"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2.10",
+    "pydantic-settings",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "redis>=5",
+    "httpx",
+    "webauthn>=3",
+    "rfc8785",
+    "argon2-cffi",
+    "pyotp",
+    "cryptography",
+    "pydantic-ai-slim[openai,google,groq]",
+    "dbos",
+]
+
+[dependency-groups]
+dev = ["pytest", "hypothesis", "pytest-timeout"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["countersign"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
