@@ -11,16 +11,22 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from decimal import Decimal
+
 from countersign.core import audit, events, state
 from countersign.core.canonical import canonical_hash, short
 from countersign.core.models import Approval, ExecJob, OutboxEntry, Plan, PlanStep, Proposal, StandingMandate
-from countersign.core.parser import Facts, extract_facts
+from countersign.core.parser import Facts, detect_exit_losers, detect_rebalance, extract_facts
 from countersign.core.schemas import CanonicalMandate, CanonicalOrder, CanonicalPlan, MandateIntent, OrderIntent, PlanIntent, iso
 from countersign.core.verifier import (
+    MAX_GENERATED_PLAN_STEPS,
     AccountState,
+    PlanDraft,
+    build_exit_plan,
     build_mandate,
     build_order,
     build_plan,
+    build_rebalance_plan,
     describe_predicate,
     mandate_summary,
     summarize,
@@ -33,6 +39,7 @@ from countersign.core.verifier import (
 class Outcome:
     proposal: Proposal | None = None
     clarify: tuple[str, list[str]] | None = None
+    notice: tuple[str, str] | None = None  # (title, message): nothing to draft, and exactly why
 
 
 def _step_view(step_no: int, order: CanonicalOrder, fields, preview, issues, depends_on=None) -> dict:
@@ -183,11 +190,33 @@ def create_plan(
         steps_view.append(_step_view(st.step_no, st.order, builds[i].fields, previews[i], builds[i].issues + per_issues[i], st.depends_on))
     disagreements = [d.model_dump() for b in builds for d in b.disagreements]
     summary = " ; then ".join(f"({st.step_no}) {summarize(st.order)}" for st in plan.steps)
+    p = _persist_plan(
+        s, plan, steps_view, plan_issues, f"Plan of {len(plan.steps)} steps: {summary}", disagreements,
+        user_id=user_id, account=account, engine=engine, user_text=user_text, conversation_id=conversation_id, origin=origin,
+    )
+    return Outcome(proposal=p)
+
+
+def _persist_plan(
+    s: Session,
+    plan: CanonicalPlan,
+    steps_view: list[dict],
+    plan_issues: list,
+    summary: str,
+    disagreements: list[dict],
+    *,
+    user_id: str,
+    account: AccountState,
+    engine: str,
+    user_text: str,
+    conversation_id: str | None,
+    origin: str,
+) -> Proposal:
     p = _persist(
         s,
         kind="PLAN",
         canonical=plan.model_dump(mode="json"),
-        summary=f"Plan of {len(plan.steps)} steps: {summary}",
+        summary=summary,
         steps_view=steps_view,
         issues=[i.model_dump(mode="json") for i in plan_issues],
         disagreements=disagreements,
@@ -202,7 +231,88 @@ def create_plan(
     for st in plan.steps:
         s.add(PlanStep(plan_id=p.id, step_no=st.step_no, canonical=st.order.model_dump(mode="json"), step_hash=canonical_hash(st.order), depends_on=st.depends_on, state="PENDING"))
     audit.record(s, "verifier", "PLAN_STATE", "plan", p.id, {"to": "AWAITING_APPROVAL" if p.status != "BLOCKED" else "BLOCKED", "plan_hash": p.canonical_hash})
+    return p
+
+
+def _generated_plan(
+    s: Session,
+    draft: PlanDraft,
+    *,
+    user_text: str,
+    account: AccountState,
+    user_id: str,
+    engine: str,
+    conversation_id: str | None,
+    origin: str,
+    kind: str,
+) -> Outcome:
+    """Persist a verifier-computed plan: independent steps (no dependencies), one signature for all of them."""
+    if draft.message is not None:
+        audit.record(s, "verifier", "NO_PLAN_NEEDED", "account", account.account_id, {"kind": kind, "reason": draft.message[:300]})
+        return Outcome(notice=(draft.title or "Nothing to do", draft.message))
+    plan = build_plan(draft.orders, account.account_id, [None] * len(draft.orders))
+    per_issues, previews, plan_issues = verify_plan(s, plan, account, max_steps=MAX_GENERATED_PLAN_STEPS, independent=True)
+    plan_blocks = [i for i in plan_issues if i.severity == "BLOCK"]
+    plan_issues = list(draft.notes) + [i for i in plan_issues if i.code != "PLAN_USES_PROCEEDS"]
+    steps_view = []
+    for i, st in enumerate(plan.steps):
+        step_issues = draft.issues[i] + per_issues[i]
+        if i == 0:
+            # The plan card lists issues per step, so the method, the resulting weights and any plan-wide block
+            # (for example too many steps) travel with step 1.
+            step_issues = list(draft.notes) + plan_blocks + step_issues
+        steps_view.append(_step_view(st.step_no, st.order, draft.fields[i], previews[i], step_issues, None))
+    summary = " ; ".join(f"({st.step_no}) {summarize(st.order)}" for st in plan.steps)
+    p = _persist_plan(
+        s, plan, steps_view, plan_issues, f"{draft.title}: {summary}", [],
+        user_id=user_id, account=account, engine=engine, user_text=user_text, conversation_id=conversation_id, origin=origin,
+    )
     return Outcome(proposal=p)
+
+
+def create_exit_plan(
+    s: Session,
+    *,
+    user_text: str,
+    account: AccountState,
+    user_id: str,
+    engine: str,
+    conversation_id: str | None = None,
+    origin: str = "chat",
+) -> Outcome:
+    """'Exit all my losing intraday positions'. The scope comes from the trader's words, never from the AI."""
+    req = detect_exit_losers(user_text)
+    if req is None:
+        audit.record(s, "verifier", "ACTION_NOT_REQUESTED", "account", account.account_id, {"kind": "EXIT_LOSERS", "user_text": user_text[:300]})
+        return Outcome(notice=("Nothing drafted", "Your message does not ask to exit losing positions, so no exit plan was drafted."))
+    draft = build_exit_plan(s, account, extract_facts(user_text), intraday_only=req["intraday_only"])
+    return _generated_plan(s, draft, user_text=user_text, account=account, user_id=user_id, engine=engine, conversation_id=conversation_id, origin=origin, kind="EXIT_LOSERS")
+
+
+def create_rebalance_plan(
+    s: Session,
+    *,
+    user_text: str,
+    account: AccountState,
+    user_id: str,
+    engine: str,
+    max_pct: Decimal | None = None,
+    conversation_id: str | None = None,
+    origin: str = "chat",
+) -> Outcome:
+    """'Rebalance so no single stock is more than 20% of my portfolio'. The cap must be the one the trader stated."""
+    req = detect_rebalance(user_text)
+    if req is None:
+        audit.record(s, "verifier", "ACTION_NOT_REQUESTED", "account", account.account_id, {"kind": "REBALANCE", "user_text": user_text[:300]})
+        return Outcome(notice=("Nothing drafted", "Your message does not ask to rebalance, so no rebalance plan was drafted."))
+    stated = req["max_pct"]
+    if stated is None:
+        return Outcome(clarify=("What is the maximum weight for a single stock? For example 'Rebalance so no single stock is more than 20% of my portfolio'.", []))
+    if max_pct is not None and Decimal(str(max_pct)) != stated:
+        audit.record(s, "verifier", "MISREAD_BLOCKED", "account", account.account_id, {"kind": "REBALANCE", "trader": str(stated), "model": str(max_pct)})
+        return Outcome(notice=("Misread guard", f"You said {stated.normalize():f}% but the AI asked for {Decimal(str(max_pct)).normalize():f}%. Nothing was drafted; please restate the limit."))
+    draft = build_rebalance_plan(s, account, extract_facts(user_text), max_pct=stated)
+    return _generated_plan(s, draft, user_text=user_text, account=account, user_id=user_id, engine=engine, conversation_id=conversation_id, origin=origin, kind="REBALANCE")
 
 
 def create_mandate(
@@ -250,7 +360,7 @@ def create_mandate(
         max_quantity=mandate.max_quantity,
         price_limit_paise=mandate.price_limit_paise,
         mandate_hash=p.canonical_hash,
-        one_shot=True,
+        one_shot=mandate.one_shot,
         state="PENDING_APPROVAL",
         expires_at=datetime.fromisoformat(mandate.expires_at.replace("Z", "+00:00")),
     )
@@ -354,6 +464,13 @@ def view(s: Session, p: Proposal) -> dict:
         if m:
             mandate = mandate_view(m, p.canonical)
     all_issues = list(p.issues or []) + [i for sv in steps for i in sv["issues"]]
+    aggregate: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for i in all_issues:
+        key = (i.get("code", ""), i.get("message", ""))
+        if key not in seen:
+            seen.add(key)
+            aggregate.append(i)
     ks = state.kill_switch(s)
     can = p.status == "AWAITING_APPROVAL" and not any(i["severity"] == "BLOCK" for i in all_issues) and not ks["engaged"]
     return {
@@ -366,7 +483,7 @@ def view(s: Session, p: Proposal) -> dict:
         "steps": steps,
         "mandate": mandate,
         "failure_policy": "STOP_ON_FAILURE" if p.kind == "PLAN" else None,
-        "issues": p.issues or [],
+        "issues": aggregate,  # aggregate of plan-level and step issues (docs/API.md contract), de-duplicated
         "can_approve": can,
         "interpretation": p.interpretation,
         "approval": approval_view(approval),
