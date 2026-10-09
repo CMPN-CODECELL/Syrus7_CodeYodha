@@ -1,0 +1,11 @@
+{
+  "status": 200,
+  "body": {
+    "data": {
+      "message": "Order modification sent to exchange succesfully",
+      "type": "SUCCESS"
+    },
+    "success": true,
+    "error": null
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "request": {
+    "exchange": "NSE",
+    "token": 14366,
+    "qty": 1,
+    "price": 1187,
+    "book": "RL",
+    "trigger": 0,
+    "discQuantity": 0,
+    "product": "CNC",
+    "validity": "Day",
+    "amo": false
+  },
+  "status": 200,
+  "body": {
+    "data": {
+      "message": "Order sent to exchange",
+      "orderId": "256159",
+      "type": "SUCCESS"
+    },
+    "success": true,
+    "error": null
+  },
+  "elapsed_s": 0.105
+}

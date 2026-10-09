@@ -1,0 +1,39 @@
+{
+  "status": 200,
+  "body": [
+    {
+      "time": 1791525084,
+      "lastActivity": 1791525084,
+      "token": 14366,
+      "exchange": "NSECM",
+      "product": "CNC",
+      "qtyRemaining": 1,
+      "qtyTraded": 0,
+      "discQty": 0,
+      "price": 1188,
+      "triggerPrice": 0,
+      "book": "RL",
+      "reason": "",
+      "validity": "Day",
+      "orderId": 256159,
+      "placedBy": "User",
+      "status": "Cancelled",
+      "amo": false,
+      "exits": {
+        "target": {
+          "scale": "",
+          "trigger": 0,
+          "limit": 0
+        },
+        "stoploss": {
+          "scale": "",
+          "trigger": 0,
+          "limit": 0
+        }
+      },
+      "parentUUId": "",
+      "orderType": "",
+      "exchangeOrderNumber": "95084721077687"
+    }
+  ]
+}
