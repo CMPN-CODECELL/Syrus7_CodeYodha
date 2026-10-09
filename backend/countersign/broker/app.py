@@ -168,6 +168,23 @@ def _register_keys(s: Session) -> None:
             s.merge(BKey(key_hash=_hash(key), scope=scope, accounts=accounts))
 
 
+def _seed_avg(instrument_id: str, avg: int) -> int:
+    """Seed averages are written against the fictional seed prices. When the 021 gateway prices an instrument live,
+    the average keeps the same ratio to today's real previous close, so a paper account's P&L stays plausible."""
+    from countersign.core.instruments import EQUITIES
+
+    ref = next((int(round(close * 100)) for sym, _n, _i, close, _t, _a in EQUITIES if f"NSE:EQ:{sym}" == instrument_id), None)
+    try:
+        raw = events.client().get(events.TICK_KEY.format(instrument_id))
+        live = json.loads(raw) if raw else None
+    except Exception:  # noqa: BLE001
+        live = None
+    if not ref or not live or live.get("src") != "021" or not live.get("prev_close_paise"):
+        return avg
+    out = int(live["prev_close_paise"]) * avg // ref
+    return max(5, out - out % 5)
+
+
 def seed_account(s: Session, account_id: str) -> None:
     """(Re)seeds one account's cash, holdings and positions from its template. Orders and trades are untouched."""
     template = account_id if account_id in SEED_HOLDINGS else TEMPLATE_ACCOUNT
@@ -175,9 +192,9 @@ def seed_account(s: Session, account_id: str) -> None:
     s.query(BPosition).filter(BPosition.account_id == account_id).delete()
     s.merge(BAccount(id=account_id, cash_paise=_starting_cash(account_id), kind=_kind(account_id)))
     for iid, sym, q, avg in SEED_HOLDINGS[template]:
-        s.add(BHolding(account_id=account_id, instrument_id=iid, symbol=sym, quantity=q, avg_price_paise=avg))
+        s.add(BHolding(account_id=account_id, instrument_id=iid, symbol=sym, quantity=q, avg_price_paise=_seed_avg(iid, avg)))
     for iid, sym, prod, q, avg in SEED_POSITIONS.get(template, []):
-        s.add(BPosition(account_id=account_id, instrument_id=iid, product=prod, symbol=sym, quantity=q, avg_price_paise=avg))
+        s.add(BPosition(account_id=account_id, instrument_id=iid, product=prod, symbol=sym, quantity=q, avg_price_paise=_seed_avg(iid, avg)))
 
 
 def seed(s: Session, hard: bool = True) -> None:
