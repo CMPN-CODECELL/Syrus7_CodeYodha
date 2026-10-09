@@ -1,4 +1,5 @@
-"""Gateway core: the paper broker's /v1 semantics on top of the 021 REST API, for exactly one 021 account.
+"""Gateway core: the paper broker's /v1 semantics on top of the 021 REST API, for one 021 account (app.py keeps one
+Gateway per managed account: the .env account and each self-service linked account).
 
 Placement (never retried):
   1. Map the signed order to 021 exactly (mapping.to_021_order) or refuse it.
@@ -228,6 +229,8 @@ class Gateway:
     def _wait_resolved(self, tag: str, timeout_s: float) -> dict | None:
         end = time.time() + timeout_s
         att = store.get(tag)
+        if att is not None and att["account_id"] != self.account_id:
+            return None  # another account's placement: never visible through this account
         while att is not None and att["state"] == "SENDING" and time.time() < end:
             self._sleep(0.3)
             att = store.get(tag)
@@ -235,7 +238,7 @@ class Gateway:
 
     def attempt(self, tag: str, wait_s: float = 0.0) -> dict | None:
         att = self._wait_resolved(tag, wait_s) if wait_s else store.get(tag)
-        if att is None:
+        if att is None or att["account_id"] != self.account_id:
             return None
         return {k: att[k] for k in ("tag", "state", "broker_order_id", "http_status", "error", "candidates", "note", "sent_at", "resolved_at")}
 
@@ -376,6 +379,8 @@ class Gateway:
         fp = mapping.request_fingerprint(o21)
         with self._place_lock:
             existing = store.get(tag)
+            if existing is not None and existing["account_id"] != self.account_id:
+                raise GatewayError(409, "TAG_ALREADY_USED", f"Tag {tag} was already used for another account; a tag is never sent twice.", {"attempt_state": "OTHER_ACCOUNT"})
             if existing is not None:
                 return self._attempt_answer(existing)
             hold = store.holding_fingerprint(fp, self.account_id, self.fingerprint_hold_s)

@@ -166,6 +166,7 @@ class MarketData:
         self.ticks_published = 0
         self.decode_errors = 0
         self.lock = threading.Lock()
+        self.books = None  # optional: every managed account's gateway, so open orders of linked accounts are watched too
 
     # ------------------------------------------------------------------ what to subscribe
 
@@ -195,7 +196,8 @@ class MarketData:
                     code = wire.EXCHANGE_CODES.get(ex)
                     if code:
                         want[(code, int(tok))] = {"instrument_id": iid, "symbol": sym, "segment": seg, "prev_close": prev}
-        for row in list(self.gw._book.values()):
+        rows = [r for g in (self.books() if self.books else [self.gw]) for r in list(g._book.values())]
+        for row in rows:
             if row.get("status") in ("Executed", "Rejected", "Cancelled"):
                 continue
             code = wire.EXCHANGE_CODES.get(row.get("exchange") or "")

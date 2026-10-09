@@ -1,8 +1,13 @@
-"""gateway021: the ONLY process that holds the 021 UCC, password and access token.
+"""gateway021: the ONLY process that holds 021 passwords and access tokens.
 
 It exposes the paper broker's /v1 interface and key scopes (read, write, admin, audit; the naive key is refused), so
-ReadGateway, OrderExecutionProvider and BrokerAdmin reach the real 021 sandbox by base URL alone. It serves exactly
-one 021 account (the configured UCC); X-Account must name it.
+ReadGateway, OrderExecutionProvider and BrokerAdmin reach the real 021 sandbox by base URL alone. It serves several 021
+accounts: the one configured in .env (CS_021_UCC / CS_021_PASSWORD) and every account a trader linked through
+self-service linking (POST /admin/link; the password arrives encrypted to this process's RSA key and is stored sealed
+with its AES-GCM key, see vault.py). Each account has its own Gateway (one token, single-flight login, write-ahead
+attempts, reconciliation, no automatic retry); X-Account picks it, and an unknown or unlinked account is refused.
+One market-data websocket runs (the .env account's, else the first linked account's); order updates for linked
+accounts come from REST polling of their order book every 3 s (the orders websocket runs for the primary account).
 
 Run: python -m countersign.broker021.app   (port 8200; started by scripts/dev.py when CS_021_UCC is configured)"""
 
@@ -11,18 +16,21 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import threading
 import time
 from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 from sqlalchemy import select
 
 from countersign.broker021 import instruments021, store
+from countersign.broker021.client import Client021
 from countersign.broker021.gateway import Gateway, GatewayError
 from countersign.broker021.settings import gateway_settings
+from countersign.broker021.vault import VaultError, vault
 from countersign.core import events
 from countersign.core.config import settings
 from countersign.core.db import session_scope
@@ -31,19 +39,79 @@ from countersign.core.models import Instrument, Instrument021
 STATUS_KEY = "cs:gw021:status"
 
 app = FastAPI(title="Countersign 021 gateway")
-_gw: Gateway | None = None
+_gw: Gateway | None = None  # the .env account (or an unconfigured placeholder whose calls fail closed)
+_linked: dict[str, Gateway] = {}  # self-service linked accounts by UCC (the .env UCC is never in here)
+_transport = None  # tests inject an httpx MockTransport for linked accounts' clients
+_lock = threading.RLock()  # guards _linked, the market socket start and linking
 _md = None
 _ows = None
 _boot: dict = {"instruments": None, "recovered": [], "started_at": None, "error": None}
 _faults = {"drop_after_accept": 0, "fail_before_send": 0}
+_used_nonces: dict[str, float] = {}  # link nonces already opened here (defence in depth; the API consumes them first)
+UCC_RE = re.compile(r"^[A-Z0-9]{4,16}$")
+
+
+def _publish():
+    return (lambda order: None) if gateway_settings().isolated else None
+
+
+def _env_gw() -> Gateway | None:
+    """The account configured in .env, or None."""
+    global _gw
+    if _gw is None and gateway_settings().configured:
+        _gw = Gateway(gateway_settings(), publish=_publish())
+    return _gw if (_gw is not None and _gw.account_id) else None
 
 
 def gw() -> Gateway:
+    """The primary account: the .env account, else the first linked account. Instruments, the market socket and the
+    status heartbeat use it."""
     global _gw
-    if _gw is None:
-        cfg = gateway_settings()
-        _gw = Gateway(cfg, publish=(lambda order: None) if cfg.isolated else None)
-    return _gw
+    g = _env_gw() or next(iter(_linked.values()), None)
+    if g is None:
+        if _gw is None:
+            _gw = Gateway(gateway_settings(), publish=_publish())
+        return _gw
+    return g
+
+
+def gateways() -> list[Gateway]:
+    env = _env_gw()
+    return ([env] if env else []) + list(_linked.values())
+
+
+def account_gw(ucc: str) -> Gateway | None:
+    env = _env_gw()
+    if env is not None and ucc and ucc == env.account_id:
+        return env
+    return _linked.get(ucc)
+
+
+def _stored_password(ucc: str) -> str:
+    hit = store.latest_credential(ucc)
+    if hit is None:
+        return ""
+    try:
+        return vault().unseal(hit[1], ucc, hit[0])
+    except VaultError:
+        return ""
+
+
+def _linked_client(ucc: str) -> Client021:
+    cfg = gateway_settings().model_copy(update={"ucc": ucc, "password": SecretStr("")})
+    return Client021(cfg, transport=_transport, password=lambda: _stored_password(ucc), stop_on_rejected=True)
+
+
+def _add_linked(ucc: str, client: Client021) -> Gateway:
+    lookup = _gw.lookup if _gw is not None else None
+    g = Gateway(client.cfg, client=client, lookup=lookup, publish=_publish())
+    _linked[ucc] = g
+    return g
+
+
+def account_key(ucc: str) -> str:
+    """A stable, non-reversible key for one account in the status heartbeat (which never carries a full UCC)."""
+    return hashlib.sha256(ucc.encode()).hexdigest()[:16]
 
 
 def mask(ucc: str) -> str:
@@ -74,8 +142,8 @@ def caller(authorization: str = Header(default=""), x_account: str = Header(defa
     if scope is None:
         # The naive copilot's key is never registered here: the unsafe baseline can never reach a real account.
         raise HTTPException(401, {"code": "UNAUTHENTICATED", "message": "Invalid broker API key for the 021 gateway."})
-    if scope in ("read", "write") and x_account and x_account != gw().account_id:
-        raise HTTPException(403, {"code": "ACCOUNT_FORBIDDEN", "message": "This gateway serves a different 021 account."})
+    if scope in ("read", "write") and x_account and account_gw(x_account) is None:
+        raise HTTPException(403, {"code": "ACCOUNT_FORBIDDEN", "message": "This gateway does not serve that 021 account (it is not configured or linked)."})
     return Caller(scope=scope)
 
 
@@ -88,9 +156,20 @@ def need(*scopes: str):
     return dep
 
 
-def _account_required(x_account: str = Header(default="")) -> None:
+def acct(x_account: str = Header(default="")) -> Gateway:
+    """The session of the account named in X-Account; an unknown or unlinked account is refused (fail closed)."""
     if not x_account:
         raise HTTPException(400, {"code": "ACCOUNT_REQUIRED", "message": "Send X-Account with the 021 account id."})
+    g = account_gw(x_account)
+    if g is None:
+        raise HTTPException(403, {"code": "ACCOUNT_FORBIDDEN", "message": "This gateway does not serve that 021 account (it is not configured or linked)."})
+    return g
+
+
+def _local_only(request: Request) -> None:
+    peer = request.client.host if request.client else ""
+    if peer not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, {"code": "LOCAL_ONLY", "message": "Account linking is accepted from this machine only."})
 
 
 READ = Depends(need("read", "write", "audit"))
@@ -110,13 +189,28 @@ def _gw_exc(_: Request, exc: GatewayError):
 # ------------------------------------------------------------------ lifecycle
 
 
+def _account_status(g: Gateway, source: str) -> dict:
+    c = g.client
+    return {
+        "account": mask(g.account_id),
+        "source": source,
+        "logged_in": c.logged_in,
+        "token_expires_at": datetime.fromtimestamp(c.token_expires_at, UTC).isoformat().replace("+00:00", "Z") if c.token_expires_at else None,
+        "credentials_rejected": c.credentials_rejected,
+        "last_error": c.stats.last_error,
+        "poll_error": _boot.get("poll_errors", {}).get(g.account_id),
+    }
+
+
 def _status() -> dict:
     g = gw()
     st = g.client.stats
+    env = _env_gw()
     return {
         "ok": g.client.logged_in or _boot["error"] is None,
         "broker": "021",
         "account": mask(g.account_id),
+        "accounts": {account_key(x.account_id): _account_status(x, "env" if x is env else "linked") for x in gateways()},
         "logged_in": g.client.logged_in,
         "token_expires_at": datetime.fromtimestamp(g.client.token_expires_at, UTC).isoformat().replace("+00:00", "Z") if g.client.token_expires_at else None,
         "clock_offset_s": round(g.client.clock_offset_s, 2),
@@ -141,15 +235,37 @@ def _heartbeat() -> None:
         time.sleep(2.0)
 
 
-def _poller() -> None:
+def _poller(g: Gateway) -> None:
+    """REST polling of one account's order book every 3 s; stops when the account is unlinked."""
     first = True
-    while True:
+    errors = _boot.setdefault("poll_errors", {})
+    while g is account_gw(g.account_id):
         try:
-            gw().sync(publish_all=first)
+            g.sync(publish_all=first)
             first = False
+            errors.pop(g.account_id, None)
         except Exception as e:  # noqa: BLE001
-            _boot["poll_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+            _boot["poll_error"] = errors[g.account_id] = f"{type(e).__name__}: {str(e)[:200]}"
         time.sleep(3.0)
+
+
+def _start_poller(g: Gateway) -> None:
+    threading.Thread(target=_poller, args=(g,), daemon=True, name=f"g021-poller-{account_key(g.account_id)[:6]}").start()
+
+
+def _ensure_market() -> None:
+    """One market-data websocket for the whole gateway, on the primary account (started when the first account
+    becomes available if none was at startup)."""
+    global _md
+    cfg = gateway_settings()
+    with _lock:
+        if _md is not None or not cfg.market_ws or not gw().account_id:
+            return
+        from countersign.broker021.marketdata import MarketData
+
+        _md = MarketData(gw(), cfg.ws_base, publish_ticks=cfg.publish_ticks, isolated=cfg.isolated, median=cfg.tick_median)
+        _md.books = gateways
+        threading.Thread(target=_md.run_forever, daemon=True, name="g021-market").start()
 
 
 def _daily_instruments() -> None:
@@ -165,36 +281,48 @@ def _daily_instruments() -> None:
             _boot["error"] = f"daily instrument reload failed: {type(e).__name__}: {str(e)[:200]}"
 
 
+def _load_linked() -> None:
+    """Every self-service linked account gets its own session (logged in lazily with its unsealed password)."""
+    env = _env_gw()
+    for ucc in store.linked_uccs():
+        if (env is not None and ucc == env.account_id) or ucc in _linked:
+            continue
+        _add_linked(ucc, _linked_client(ucc))
+
+
 @app.on_event("startup")
 def _startup() -> None:
-    global _md, _ows
+    global _ows
     cfg = gateway_settings()
     _boot["started_at"] = time.time()
-    if not cfg.configured:
-        _boot["error"] = "CS_021_UCC / CS_021_PASSWORD are not configured; the gateway cannot reach 021."
-        return
     from countersign.core.models import create_all
 
     create_all()
     store.init_db()
+    vault().ensure_keys()  # creates the link key pair and the store key once, under .secrets/
+    with _lock:
+        _load_linked()
+    if not cfg.configured and not _linked:
+        _boot["error"] = "No 021 account yet: CS_021_UCC / CS_021_PASSWORD are not configured and no trader has linked one."
+        threading.Thread(target=_heartbeat, daemon=True, name="g021-heartbeat").start()
+        threading.Thread(target=_daily_instruments, daemon=True, name="g021-instruments").start()  # loads once one is linked
+        return
     try:
         _boot["instruments"] = instruments021.ensure_loaded(gw().client, cfg.instruments_cache)
         gw().lookup.refresh()
     except Exception as e:  # noqa: BLE001
         _boot["error"] = f"instrument load failed: {type(e).__name__}: {str(e)[:200]}"
-    try:
-        _boot["recovered"] = gw().recover()
-    except Exception as e:  # noqa: BLE001
-        _boot["error"] = f"startup reconciliation failed: {type(e).__name__}: {str(e)[:200]}"
-    gw().client.drop_next_write_responses = 0
-    threading.Thread(target=_poller, daemon=True, name="g021-poller").start()
+    _boot["recovered"] = []
+    for g in gateways():
+        try:
+            _boot["recovered"] += g.recover()
+        except Exception as e:  # noqa: BLE001
+            _boot["error"] = f"startup reconciliation failed for {mask(g.account_id)}: {type(e).__name__}: {str(e)[:200]}"
+        g.client.drop_next_write_responses = 0
+        _start_poller(g)
     threading.Thread(target=_heartbeat, daemon=True, name="g021-heartbeat").start()
     threading.Thread(target=_daily_instruments, daemon=True, name="g021-instruments").start()
-    if cfg.market_ws:
-        from countersign.broker021.marketdata import MarketData
-
-        _md = MarketData(gw(), cfg.ws_base, publish_ticks=cfg.publish_ticks, isolated=cfg.isolated, median=cfg.tick_median)
-        threading.Thread(target=_md.run_forever, daemon=True, name="g021-market").start()
+    _ensure_market()
     if cfg.orders_ws:
         from countersign.broker021.orders_ws import OrdersSocket
 
@@ -212,42 +340,44 @@ def health() -> dict:
 
 @app.get("/v1/account")
 def account(c: Caller = Depends(need("read", "write", "admin", "audit"))) -> dict:
-    return {"account_id": gw().account_id, "broker": "021", "label": mask(gw().account_id)}
+    """The account configured in .env (the operator-linked account), or null when only linked accounts exist."""
+    env = _env_gw()
+    return {"account_id": env.account_id if env else None, "broker": "021", "label": mask(env.account_id) if env else None}
 
 
-@app.get("/v1/funds", dependencies=[Depends(_account_required)])
-def funds(c: Caller = READ) -> dict:
-    return gw().funds()
+@app.get("/v1/funds")
+def funds(c: Caller = READ, g: Gateway = Depends(acct)) -> dict:
+    return g.funds()
 
 
-@app.get("/v1/holdings", dependencies=[Depends(_account_required)])
-def holdings(c: Caller = READ) -> list[dict]:
-    return gw().holdings()
+@app.get("/v1/holdings")
+def holdings(c: Caller = READ, g: Gateway = Depends(acct)) -> list[dict]:
+    return g.holdings()
 
 
-@app.get("/v1/positions", dependencies=[Depends(_account_required)])
-def positions(c: Caller = READ) -> list[dict]:
-    return gw().positions()
+@app.get("/v1/positions")
+def positions(c: Caller = READ, g: Gateway = Depends(acct)) -> list[dict]:
+    return g.positions()
 
 
-@app.get("/v1/orders", dependencies=[Depends(_account_required)])
-def orders(status: str = "all", tag: str | None = None, c: Caller = READ) -> list[dict]:
-    return gw().orders(status=status, tag=tag)
+@app.get("/v1/orders")
+def orders(status: str = "all", tag: str | None = None, c: Caller = READ, g: Gateway = Depends(acct)) -> list[dict]:
+    return g.orders(status=status, tag=tag)
 
 
-@app.get("/v1/orders/{oid}", dependencies=[Depends(_account_required)])
-def order(oid: str, c: Caller = READ) -> dict:
-    return gw().order(oid)
+@app.get("/v1/orders/{oid}")
+def order(oid: str, c: Caller = READ, g: Gateway = Depends(acct)) -> dict:
+    return g.order(oid)
 
 
-@app.get("/v1/trades", dependencies=[Depends(_account_required)])
-def trades(c: Caller = READ) -> list[dict]:
-    return gw().trades()
+@app.get("/v1/trades")
+def trades(c: Caller = READ, g: Gateway = Depends(acct)) -> list[dict]:
+    return g.trades()
 
 
-@app.get("/v1/attempts/{tag}", dependencies=[Depends(_account_required)])
-def attempt(tag: str, wait_s: float = 0.0, c: Caller = READ) -> dict:
-    a = gw().attempt(tag, wait_s=max(0.0, min(wait_s, 25.0)))
+@app.get("/v1/attempts/{tag}")
+def attempt(tag: str, wait_s: float = 0.0, c: Caller = READ, g: Gateway = Depends(acct)) -> dict:
+    a = g.attempt(tag, wait_s=max(0.0, min(wait_s, 25.0)))
     if a is None:
         raise HTTPException(404, {"code": "TAG_UNKNOWN", "message": f"The gateway never received an order with tag {tag}, so nothing was sent to 021 for it."})
     return a
@@ -271,9 +401,8 @@ class PlaceBody(BaseModel):
     tag: str | None = None
 
 
-@app.post("/v1/orders", dependencies=[Depends(_account_required)])
-def place(body: PlaceBody, c: Caller = Depends(need("write"))) -> dict:
-    g = gw()
+@app.post("/v1/orders")
+def place(body: PlaceBody, c: Caller = Depends(need("write")), g: Gateway = Depends(acct)) -> dict:
     if _faults["fail_before_send"] > 0:
         _faults["fail_before_send"] -= 1
         g.client.fail_next_write_connects = 1
@@ -293,14 +422,14 @@ class ModifyBody(BaseModel):
     trigger_price_paise: int | None = None
 
 
-@app.put("/v1/orders/{oid}", dependencies=[Depends(_account_required)])
-def modify(oid: str, body: ModifyBody, c: Caller = Depends(need("write"))) -> dict:
-    return gw().modify(oid, body.quantity, body.limit_price_paise, body.trigger_price_paise)
+@app.put("/v1/orders/{oid}")
+def modify(oid: str, body: ModifyBody, c: Caller = Depends(need("write")), g: Gateway = Depends(acct)) -> dict:
+    return g.modify(oid, body.quantity, body.limit_price_paise, body.trigger_price_paise)
 
 
-@app.delete("/v1/orders/{oid}", dependencies=[Depends(_account_required)])
-def cancel(oid: str, c: Caller = Depends(need("write"))) -> dict:
-    return gw().cancel(oid)
+@app.delete("/v1/orders/{oid}")
+def cancel(oid: str, c: Caller = Depends(need("write")), g: Gateway = Depends(acct)) -> dict:
+    return g.cancel(oid)
 
 
 # ------------------------------------------------------------------ market data
@@ -423,7 +552,21 @@ def build_option_chain(underlying: str, expiry: str | None, width: int) -> dict:
 
 @app.get("/admin/orders")
 def all_orders(c: Caller = Depends(need("admin", "audit"))) -> list[dict]:
-    return gw().orders(status="all")
+    """Every managed account's order book (each order carries its account_id) for the independent monitor. The
+    primary account failing fails the whole read (fail closed, as before); a linked account that cannot be read
+    (for example its stored password was refused) is skipped and reported in the gateway status."""
+    out: list[dict] = []
+    primary = gw()
+    out += primary.orders(status="all")
+    errors = _boot.setdefault("poll_errors", {})
+    for g in gateways():
+        if g is primary:
+            continue
+        try:
+            out += g.orders(status="all")
+        except GatewayError as e:
+            errors[g.account_id] = f"order book unreadable: {e.code}"
+    return out
 
 
 @app.get("/admin/market/trace")
@@ -458,6 +601,109 @@ def set_faults(body: FaultBody, c: Caller = Depends(need("admin"))) -> dict:
     _faults["drop_after_accept"] = n if body.mode == "drop_after_accept" else 0
     _faults["fail_before_send"] = n if body.mode == "fail_before_send" else 0
     return {"enabled": True, **_faults}
+
+
+# ------------------------------------------------------------------ self-service linking (admin key, this machine only)
+
+
+@app.get("/v1/link-key")
+def link_key(c: Caller = Depends(need("read", "admin"))) -> dict:
+    """The public half of the link key pair (SPKI, base64). The browser encrypts the trader's UCC and password to it."""
+    return {"public_key": vault().public_key_spki_b64(), "alg": "RSA-OAEP-256", "max_plaintext_bytes": 190}
+
+
+class LinkBody(BaseModel):
+    ciphertext: str
+    nonce: str
+    user_id: str
+
+
+def _fresh_nonce(nonce: str) -> bool:
+    now = time.time()
+    for k, at in list(_used_nonces.items()):
+        if now - at > 900:
+            _used_nonces.pop(k, None)
+    if nonce in _used_nonces:
+        return False
+    _used_nonces[nonce] = now
+    return True
+
+
+def _refuse(status: int, code: str, message: str):
+    raise HTTPException(status, {"code": code, "message": message})
+
+
+@app.post("/admin/link")
+def link(body: LinkBody, request: Request, c: Caller = Depends(need("admin"))) -> dict:
+    """Opens the browser's ciphertext, checks it carries the nonce and user id the API expected, validates the UCC and
+    verifies the password with exactly one 021 login. Only a verified password is stored (sealed). Returns the account
+    id (the UCC, which is the 021 account id everywhere in Countersign), its mask and the session status; never the
+    password, the token or the ciphertext."""
+    _local_only(request)
+    if len(body.ciphertext) > 2048 or not body.nonce or not body.user_id:
+        _refuse(400, "LINK_INVALID", "The link request is malformed.")
+    try:
+        data = vault().open_link(body.ciphertext)
+    except VaultError:
+        _refuse(400, "LINK_DECRYPT_FAILED", "The encrypted credentials could not be opened. Reload the page and try again.")
+    if not (hmac.compare_digest(str(data.get("nonce") or ""), body.nonce) and hmac.compare_digest(str(data.get("user_id") or ""), body.user_id)):
+        _refuse(400, "LINK_NONCE_MISMATCH", "These encrypted credentials were not made for this request. Reload the page and try again.")
+    if not _fresh_nonce(body.nonce):
+        _refuse(400, "LINK_REPLAYED", "These encrypted credentials were already used. Reload the page and try again.")
+    ucc = str(data.get("ucc") or "").strip().upper()
+    password = data.get("password")
+    del data
+    if not UCC_RE.match(ucc):
+        _refuse(422, "UCC_INVALID", "The UCC (021 client code) must be 4 to 16 letters or digits.")
+    if not isinstance(password, str) or not 1 <= len(password) <= 128:
+        _refuse(422, "PASSWORD_INVALID", "Enter your 021 password.")
+    with _lock:
+        existing = account_gw(ucc)
+        client = existing.client if existing is not None else _linked_client(ucc)
+        # One login with the entered password. For an account this gateway already serves, the same client takes the
+        # new token, so there is never a second session of the same account in this process.
+        kind, detail = client.verify_login(password)
+        if kind != "ok":
+            if existing is None:
+                client.close()
+            if kind == "rejected":
+                _refuse(401, "LINK_WRONG_CREDENTIALS", "021 did not accept that UCC and password. Check both and try again. Nothing was stored.")
+            if kind == "refused":
+                _refuse(422, "LINK_REFUSED", f"021 refused the login ({detail}). Nothing was stored.")
+            _refuse(503, "LINK_021_UNAVAILABLE", "021 did not answer, try again. Nothing was stored.")
+        store.save_credential(ucc, body.user_id, vault().seal(password, ucc, body.user_id))
+        del password
+        env = _env_gw()
+        g = existing
+        if g is None:
+            g = _add_linked(ucc, client)
+            _start_poller(g)
+        elif g is not env:
+            g.client.credentials_rejected = False
+    _ensure_market()
+    return {"account_id": ucc, "masked": mask(ucc), "status": "linked", "source": "env" if g is env else "linked", "logged_in": g.client.logged_in, "token_expires_at": _account_status(g, "")["token_expires_at"]}
+
+
+class UnlinkBody(BaseModel):
+    account_id: str
+    user_id: str
+
+
+@app.post("/admin/unlink")
+def unlink(body: UnlinkBody, request: Request, c: Caller = Depends(need("admin"))) -> dict:
+    """Deletes the trader's stored credential for this account. When no linked trader is left, the account's session is
+    dropped (its token forgotten, polling stops). The .env account always keeps its session."""
+    _local_only(request)
+    ucc = body.account_id.strip().upper()
+    with _lock:
+        deleted = store.delete_credential(ucc, body.user_id)
+        env = _env_gw()
+        dropped = False
+        if ucc in _linked and not store.has_credential(ucc):
+            g = _linked.pop(ucc)
+            g.client.drop_token()
+            dropped = True
+    return {"account": mask(ucc), "deleted": deleted, "session_dropped": dropped, "env_account": env is not None and env.account_id == ucc}
 
 
 def main() -> None:

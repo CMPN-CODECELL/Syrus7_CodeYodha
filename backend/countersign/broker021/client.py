@@ -77,9 +77,14 @@ def error_text(r: httpx.Response) -> str:
 
 
 class Client021:
-    def __init__(self, cfg: GatewaySettings, transport: httpx.BaseTransport | None = None, sleep: Callable[[float], None] = time.sleep):
+    def __init__(self, cfg: GatewaySettings, transport: httpx.BaseTransport | None = None, sleep: Callable[[float], None] = time.sleep, password: Callable[[], str] | None = None, stop_on_rejected: bool = False):
         self.cfg = cfg
         self._sleep = sleep
+        # The .env account reads its password from settings; a self-service linked account unseals its stored password
+        # only for the moment of a login (vault.py), so the clear password is not kept on this object.
+        self._password = password or (lambda: cfg.password.get_secret_value())
+        self.stop_on_rejected = stop_on_rejected  # linked accounts: a refused stored password is never tried again
+        self.credentials_rejected = False
         self._http = httpx.Client(base_url=cfg.rest_base, timeout=cfg.read_timeout_s, transport=transport, headers={"Accept": "application/json"})
         self._token: str | None = None
         self._expires_at = 0.0
@@ -108,19 +113,31 @@ class Client021:
             return self._token
 
     def _login(self) -> None:
-        if not self.cfg.configured:
+        if self.credentials_rejected:
+            raise LoginFailed("021 refused the stored password for this account; connect it again with the current password.")
+        password = self._password() if self.cfg.ucc else ""
+        if not password:
             raise LoginFailed("021 credentials are not configured (CS_021_UCC / CS_021_PASSWORD).")
         try:
-            r = self._http.post("/auth/token", json={"username": self.cfg.ucc, "password": self.cfg.password.get_secret_value()})
+            r = self._http.post("/auth/token", json={"username": self.cfg.ucc, "password": password})
         except httpx.HTTPError as e:
             raise LoginFailed(f"021 login request failed: {type(e).__name__}") from None
         self._note_clock(r)
         if r.status_code != 200:
+            if r.status_code in (401, 403) and self.stop_on_rejected:
+                self.credentials_rejected = True  # never retry a refused password on its own: it could lock the account
             raise LoginFailed(f"021 login refused: HTTP {r.status_code} {error_text(r)}")
-        data = (r.json() or {}).get("data") or {}
-        tok = data.get("accessToken")
-        if not tok:
+        if not self._install(r):
             raise LoginFailed("021 login answered without an access token.")
+
+    def _install(self, r: httpx.Response) -> bool:
+        try:
+            data = (r.json() or {}).get("data") or {}
+        except ValueError:
+            return False
+        tok = data.get("accessToken") if isinstance(data, dict) else None
+        if not tok:
+            return False
         exp = time.time() + float(data.get("expiresIn") or 3600)
         try:
             exp = datetime.fromisoformat(str(data["expiresAt"])).timestamp()
@@ -128,6 +145,35 @@ class Client021:
             pass
         self._token, self._expires_at = tok, exp
         self.stats.logins += 1
+        return True
+
+    def verify_login(self, password: str) -> tuple[str, str | None]:
+        """One login with a password the trader just entered (self-service linking). It goes through this account's
+        single-flight lock, so on success the new token replaces this client's own token (021 keeps one live token per
+        account). Returns (kind, detail): ok | rejected (401 / 403: wrong UCC or password) | refused (other 4xx) |
+        unavailable (429, 5xx, timeout, no token). Never retried; detail never contains the password."""
+        with self._login_lock:
+            try:
+                r = self._http.post("/auth/token", json={"username": self.cfg.ucc, "password": password})
+            except httpx.HTTPError as e:
+                return "unavailable", type(e).__name__
+            self._note_clock(r)
+            if r.status_code in (401, 403):
+                return "rejected", error_text(r)
+            if r.status_code == 429 or r.status_code >= 500:
+                return "unavailable", f"HTTP {r.status_code}"
+            if r.status_code != 200:
+                return "refused", f"HTTP {r.status_code} {error_text(r)}"
+            if not self._install(r):
+                return "unavailable", "021 answered without an access token"
+            self.credentials_rejected = False
+            return "ok", None
+
+    def drop_token(self) -> None:
+        """Forgets the access token (unlink). 021 has no logout endpoint; the token simply ends at 05:00 IST."""
+        with self._login_lock:
+            self._token = None
+            self._expires_at = 0.0
 
     def _invalidate(self, used: str) -> None:
         with self._login_lock:

@@ -1,14 +1,17 @@
-"""The gateway's own records (broker database, next to the paper broker's tables): one row per placement attempt.
+"""The gateway's own records (broker database, next to the paper broker's tables): one row per placement attempt, and
+the sealed credentials of self-service linked 021 accounts.
 
 021 has no client order tag, so the gateway keeps tag -> 021 orderId itself. The row is written BEFORE the order is
-sent (write-ahead), so a tag is never sent twice, and an ambiguous outcome is always reconciled from a known send time."""
+sent (write-ahead), so a tag is never sent twice, and an ambiguous outcome is always reconciled from a known send time.
+g021_credentials holds one row per (UCC, linking Countersign user): the password sealed with the gateway's AES-GCM
+data key (vault.py), never in clear. Both tables are created with CREATE TABLE IF NOT EXISTS (metadata.create_all)."""
 
 from __future__ import annotations
 
 import time
 from functools import lru_cache
 
-from sqlalchemy import BigInteger, Float, Integer, String, Text, create_engine, select
+from sqlalchemy import BigInteger, Float, Integer, String, Text, create_engine, delete, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -41,6 +44,14 @@ class Attempt(G):
     sent_at: Mapped[float] = mapped_column(Float)
     resolved_at: Mapped[float | None] = mapped_column(Float)
     created_ms: Mapped[int] = mapped_column(BigInteger)
+
+
+class Credential(G):
+    __tablename__ = "g021_credentials"
+    ucc: Mapped[str] = mapped_column(String(32), primary_key=True)
+    linked_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    password_enc: Mapped[str] = mapped_column(Text)  # AES-256-GCM (12-byte nonce + ciphertext + tag), base64
+    created_at: Mapped[float] = mapped_column(Float)
 
 
 @lru_cache
@@ -162,6 +173,42 @@ def delete_tags(prefix: str) -> None:
     with _sf()() as s:
         s.query(Attempt).filter(Attempt.tag.like(prefix + "%")).delete(synchronize_session=False)
         s.commit()
+
+
+# ------------------------------------------------------------------ sealed credentials of linked accounts
+
+
+def save_credential(ucc: str, user_id: str, password_enc: str) -> None:
+    with _sf()() as s:
+        row = s.get(Credential, (ucc, user_id))
+        if row is None:
+            s.add(Credential(ucc=ucc, linked_user_id=user_id, password_enc=password_enc, created_at=time.time()))
+        else:
+            row.password_enc, row.created_at = password_enc, time.time()
+        s.commit()
+
+
+def latest_credential(ucc: str) -> tuple[str, str] | None:
+    """(linked user id, sealed password) of the most recent link of this UCC, or None."""
+    with _sf()() as s:
+        row = s.execute(select(Credential).where(Credential.ucc == ucc).order_by(Credential.created_at.desc()).limit(1)).scalar_one_or_none()
+        return (row.linked_user_id, row.password_enc) if row else None
+
+
+def linked_uccs() -> list[str]:
+    with _sf()() as s:
+        return sorted(set(s.execute(select(Credential.ucc)).scalars()))
+
+
+def has_credential(ucc: str) -> bool:
+    return latest_credential(ucc) is not None
+
+
+def delete_credential(ucc: str, user_id: str) -> int:
+    with _sf()() as s:
+        n = s.execute(delete(Credential).where(Credential.ucc == ucc, Credential.linked_user_id == user_id)).rowcount
+        s.commit()
+        return int(n or 0)
 
 
 def session() -> Session:
