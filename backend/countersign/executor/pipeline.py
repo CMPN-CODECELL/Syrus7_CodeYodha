@@ -1,5 +1,16 @@
 """Executor pipeline. Runs ONLY in the executor process, which alone holds the broker write key and never imports
-any LLM code. Every check is repeated here from first principles; nothing upstream is trusted."""
+any LLM code. Every check is repeated here from first principles; nothing upstream is trusted.
+
+Broker policy:
+- Paper accounts: an ambiguous outcome is reconciled against the broker by tag, then at most one safe retry with the
+  same tag when the broker confirms the order is absent (the paper broker never deduplicates tags).
+- 021 accounts (accounts.broker_kind = '021'): a placement, modification or cancellation is NEVER retried
+  automatically. The 021 gateway reconciles an ambiguous placement itself; the executor records its verdict:
+  accepted, rejected, NOT_PLACED (nothing was sent twice; the trader countersigns again to resend) or NEEDS_REVIEW
+  (several matching orders, or the outcome could not be confirmed; no kill switch, surfaced to the trader).
+- Every broker: a 5xx / 429 / 504 is never treated as a definite rejection without reconciling; a MODIFY or CANCEL is
+  confirmed on the target order's real state (never by looking up the modification's own tag); and after a crash an
+  order is never resent when it belongs to a previous IST trading day or its approval has expired."""
 
 from __future__ import annotations
 
@@ -11,12 +22,13 @@ from sqlalchemy import select
 
 from countersign.core import audit, capabilities, events, market, state
 from countersign.core.approval_crypto import CountersignError, payload_hash, verify_server_attestation, verify_webauthn
-from countersign.core.broker_client import BrokerError, BrokerTimeout, BrokerUnavailable, OrderExecutionProvider
+from countersign.core.broker_client import BrokerError, BrokerTimeout, BrokerUnavailable, OrderExecutionProvider, broker_kind
 from countersign.core.canonical import canonical_hash
 from countersign.core.config import settings
 from countersign.core.db import session_scope
 from countersign.core.models import (
     Account,
+    AccountMember,
     Approval,
     Capability,
     DeviceCredential,
@@ -31,6 +43,12 @@ from countersign.core.money import inr
 from countersign.core.schemas import CanonicalMandate, CanonicalOrder, CanonicalPlan
 
 _brokers: dict[str, OrderExecutionProvider] = {}
+# Jobs whose preflight ran in THIS process. A step of any other job is being re-run by crash recovery (DBOS replays
+# the checkpointed preflight result without calling it), which is when the resend guards below apply.
+_live_jobs: set[str] = set()
+OPEN_STATUSES = ("OPEN", "TRIGGER_PENDING", "PARTIALLY_FILLED")
+FINAL_OUTBOX = ("ACKED", "RECONCILED_FOUND", "REJECTED_BY_BROKER", "FAILED", "NOT_PLACED", "NEEDS_REVIEW")
+IST_OFFSET_S = 19800
 
 
 def broker(account_id: str) -> OrderExecutionProvider:
@@ -154,7 +172,14 @@ def preflight(job_id: str) -> dict:
             if cap.account_id != p.account_id or a.account_id != p.account_id or a.payload["account_id"] != p.account_id:
                 raise Blocked("PAYLOAD_MISMATCH", "Capability, approval and order belong to different accounts.", True)
             owner = s.get(Account, p.account_id)
-            if owner is None or owner.user_id != a.user_id or p.user_id != a.user_id:
+            operates = owner is not None and (owner.user_id == a.user_id or s.get(AccountMember, (p.account_id, a.user_id)) is not None)
+            if operates and owner.broker_kind == "021":
+                # The 021 account is operated only by users still listed in CS_021_OWNER_EMAILS.
+                from countersign.core.models import User
+
+                approver = s.get(User, a.user_id)
+                operates = approver is not None and bool(approver.email) and approver.email.strip().lower() in settings().owners_021
+            if not operates or p.user_id != a.user_id:
                 raise Blocked("PAYLOAD_MISMATCH", "The approving trader does not own the account this order is for. Execution refused.", True)
             if canonical_hash(p.canonical) != cap.canonical_hash or cap.canonical_hash != a.payload["canonical_hash"] or p.canonical_hash != cap.canonical_hash:
                 raise Blocked("TAMPERED_ORDER", "The order was modified after approval: its canonical hash no longer matches the signed hash. Execution refused.", True)
@@ -192,6 +217,7 @@ def preflight(job_id: str) -> dict:
             audit.record(s, "executor", "PLAN_STATE", "plan", p.id, {"to": "EXECUTING"})
         audit.record(s, "executor", "EXECUTION_STARTED", "job", job.id, {"capability_id": cap.id, "proposal_id": p.id, "verified": ["canonical_hash", "payload_hash", "signature", "expiry", "account_binding", "single_use"]})
         events.emit_proposal(p)
+        _live_jobs.add(job.id)
         return {"ok": True, "steps": _steps_for(s, job, p)}
 
 
@@ -238,8 +264,23 @@ def send_step(job_id: str, step: dict) -> dict:
         a = s.get(Approval, s.get(Capability, job.capability_id).approval_id)
         tag = client_order_id(job.capability_id, step_no)
         ob = s.execute(select(OutboxEntry).where(OutboxEntry.capability_id == job.capability_id, OutboxEntry.step_no == step_no)).scalar_one_or_none()
-        if ob is not None and ob.state in ("ACKED", "RECONCILED_FOUND", "REJECTED_BY_BROKER", "FAILED"):
+        if ob is not None and ob.state in FINAL_OUTBOX:
             return {"ok": ob.state in ("ACKED", "RECONCILED_FOUND"), "outbox_id": ob.id, "broker_order_id": ob.broker_order_id, "state": ob.state}
+        recovered = job.id not in _live_jobs
+        stale = _resend_block_reason(s, job, a) if recovered else None
+        if stale and (ob is None or ob.state == "PREPARED"):
+            # Crash recovery found a step that was never sent, but its approval has expired or it belongs to a
+            # previous trading day: it is never sent now.
+            if ob is not None:
+                ob.state = "FAILED"
+                ob.reject_reason = stale
+            if job.kind == "PLAN":
+                _set_step(s, p.id, step_no, state="FAILED", reason=stale)
+            audit.record(s, "executor", "RECOVERY_NOT_SENT", "job", job.id, {"step_no": step_no, "reason": stale})
+            state.outcome(s, "EXECUTION_BLOCKED", "Not sent after restart", stale, "warning", proposal_id=p.id, account_id=p.account_id)
+            if job.kind != "PLAN":
+                _block_job(s, job, p, "APPROVAL_EXPIRED", stale)
+            return {"ok": False, "code": "APPROVAL_EXPIRED", "message": stale}
         if ob is None:
             try:
                 if state.kill_switch(s)["engaged"]:
@@ -282,9 +323,36 @@ def send_step(job_id: str, step: dict) -> dict:
             audit.record(s, "executor", "OUTBOX_PREPARED", "outbox", ob.id, {"client_order_id": tag, "idempotency_key": ob.idempotency_key, "step_no": step_no})
         outbox_id = ob.id
         prior_state = ob.state
+        acct_kind = broker_kind(p.account_id)
     if prior_state in ("SENDING", "UNKNOWN", "RECONCILED_ABSENT"):
-        return reconcile(outbox_id, allow_retry=True)
+        # A previous run may have sent it: reconcile, never blindly resend.
+        if acct_kind == "021":
+            return _resolve_021(outbox_id, order) if order.action == "PLACE" else _confirm_target(outbox_id, order, sent_ok=False, allow_retry=False)
+        return reconcile(outbox_id, allow_retry=not stale)
+    if acct_kind == "021":
+        return _send_021(outbox_id, order)
     return _send(outbox_id, order)
+
+
+def _ist_day(ts: datetime | float) -> str:
+    secs = ts.timestamp() if isinstance(ts, datetime) else float(ts)
+    return datetime.fromtimestamp(secs + IST_OFFSET_S, UTC).date().isoformat()
+
+
+def _resend_block_reason(s, job: ExecJob, a: Approval) -> str | None:
+    """Why a recovered job must not send (or resend) anything now, or None when it still may."""
+    now = datetime.now(UTC)
+    started = job.started_at or job.created_at or now
+    if _ist_day(started) != _ist_day(now):
+        return f"Not sent after a restart: this order was approved on {_ist_day(started)} (IST), a previous trading day. Nothing was sent; countersign again if you still want it."
+    if job.kind == "MANDATE":
+        m = s.get(StandingMandate, job.mandate_id) if job.mandate_id else None
+        if m is None or now >= m.expires_at:
+            return "Not sent after a restart: the standing instruction expired. Nothing was sent."
+        return None
+    if now >= a.expires_at:
+        return "Not sent after a restart: the 60-second approval had expired by the time the executor recovered. Nothing was sent; countersign again if you still want it."
+    return None
 
 
 def _send(outbox_id: str, order: CanonicalOrder) -> dict:
@@ -297,15 +365,12 @@ def _send(outbox_id: str, order: CanonicalOrder) -> dict:
         if ob.proposal_id:
             _set_step(s, ob.proposal_id, ob.step_no, state="SUBMITTED", client_order_id=ob.client_order_id)
         body = dict(ob.request)
+    if order.action != "PLACE":
+        return _modify_or_cancel(outbox_id, order, allow_retry=True)
     try:
-        if order.action == "PLACE":
-            body.pop("action", None)
-            body.pop("target_broker_order_id", None)
-            resp = broker(acct).place(body)
-        elif order.action == "MODIFY":
-            resp = broker(acct).modify(order.target_broker_order_id, {"limit_price_paise": order.limit_price_paise})
-        else:
-            resp = broker(acct).cancel(order.target_broker_order_id)
+        body.pop("action", None)
+        body.pop("target_broker_order_id", None)
+        resp = broker(acct).place(body)
     except BrokerTimeout:
         with session_scope() as s:
             ob = s.get(OutboxEntry, outbox_id)
@@ -314,12 +379,14 @@ def _send(outbox_id: str, order: CanonicalOrder) -> dict:
             state.outcome(s, "RECONCILED", "Broker response lost", f"Order {ob.client_order_id}: no response from the broker. Reconciling against the order book instead of resending.", "warning", proposal_id=ob.proposal_id)
         return reconcile(outbox_id, allow_retry=True)
     except (BrokerUnavailable, BrokerError) as e:
-        not_accepted = isinstance(e, BrokerUnavailable) or (isinstance(e, BrokerError) and e.code == "NOT_ACCEPTED")
+        # A 5xx, 429 or 504 says nothing definite about the order: it is reconciled like a timeout, never treated as
+        # a rejection.
+        not_accepted = isinstance(e, BrokerUnavailable) or (isinstance(e, BrokerError) and (e.code == "NOT_ACCEPTED" or _ambiguous_http(e)))
         with session_scope() as s:
             ob = s.get(OutboxEntry, outbox_id)
             if not_accepted:
                 ob.state = "UNKNOWN"
-                audit.record(s, "executor", "BROKER_RESPONSE", "outbox", ob.id, {"result": "NOT_ACCEPTED", "detail": str(e)})
+                audit.record(s, "executor", "BROKER_RESPONSE", "outbox", ob.id, {"result": "NOT_ACCEPTED" if not isinstance(e, BrokerError) or e.code == "NOT_ACCEPTED" else f"HTTP_{e.status}", "detail": str(e)})
             else:
                 ob.state = "REJECTED_BY_BROKER"
                 ob.reject_reason = e.message
@@ -327,9 +394,256 @@ def _send(outbox_id: str, order: CanonicalOrder) -> dict:
                 _set_step(s, ob.proposal_id, ob.step_no, state="REJECTED", reason=e.message)
                 state.outcome(s, "ORDER_REJECTED", "Broker refused the order", e.message, "danger", proposal_id=ob.proposal_id)
         if not_accepted:
-            return reconcile(outbox_id, allow_retry=True, window_s=1.5)
+            definite = isinstance(e, BrokerUnavailable) or e.code == "NOT_ACCEPTED"
+            return reconcile(outbox_id, allow_retry=True, window_s=1.5 if definite else None)
         return {"ok": False, "outbox_id": outbox_id, "state": "REJECTED_BY_BROKER"}
     return _record_ack(outbox_id, resp, reconciled=False)
+
+
+def _ambiguous_http(e: BrokerError) -> bool:
+    return e.status >= 500 or e.status in (408, 429)
+
+
+# ---------------------------------------------------------------- MODIFY / CANCEL: confirmed on the target order
+
+
+def _modify_body(order: CanonicalOrder) -> dict:
+    """The signed new state (CanonicalOrder for MODIFY carries the full new order: quantity, limit and trigger)."""
+    limit = order.limit_price_paise if order.limit_price_paise is not None else order.protection_price_paise
+    body: dict = {"quantity": order.quantity, "limit_price_paise": limit}
+    if order.trigger_price_paise is not None:
+        body["trigger_price_paise"] = order.trigger_price_paise
+    return body
+
+
+def _target_state(acct: str, order: CanonicalOrder) -> tuple[bool | None, dict | None]:
+    """True when the target order shows the signed change, False when it can no longer get it (it completed or was
+    cancelled / rejected another way), None while still undecided or unreadable."""
+    try:
+        o = broker(acct).order(order.target_broker_order_id)
+    except (BrokerTimeout, BrokerUnavailable, BrokerError):
+        return None, None
+    if order.action == "CANCEL":
+        if o.get("status") == "CANCELLED":
+            return True, o
+        if o.get("status") in ("COMPLETE", "REJECTED"):
+            return False, o
+        return None, o
+    want = _modify_body(order)
+    applied = (o.get("limit_price_paise") or o.get("protection_price_paise") or None) == (want["limit_price_paise"] or None) and int(o.get("quantity") or 0) == int(want["quantity"])
+    if "trigger_price_paise" in want:
+        applied = applied and (o.get("trigger_price_paise") or None) == (want["trigger_price_paise"] or None)
+    if applied:
+        return True, o
+    if o.get("status") not in OPEN_STATUSES:
+        return False, o
+    return None, o
+
+
+def _modify_or_cancel(outbox_id: str, order: CanonicalOrder, *, allow_retry: bool) -> dict:
+    acct = order.account_id
+    sent_ok = False
+    try:
+        if order.action == "MODIFY":
+            broker(acct).modify(order.target_broker_order_id, _modify_body(order))
+        else:
+            broker(acct).cancel(order.target_broker_order_id)
+        sent_ok = True
+    except BrokerTimeout:
+        pass
+    except BrokerUnavailable as e:
+        if broker_kind(acct) == "021":
+            return _not_placed(outbox_id, f"The 021 gateway was unreachable ({e}); the {order.action.lower()} was not sent.")
+    except BrokerError as e:
+        if not _ambiguous_http(e) or e.code in ("MODIFY_NOT_SENT", "CANCEL_NOT_SENT"):
+            if e.code in ("MODIFY_NOT_SENT", "CANCEL_NOT_SENT"):
+                return _not_placed(outbox_id, e.message)
+            return _refused(outbox_id, e)
+    return _confirm_target(outbox_id, order, sent_ok=sent_ok, allow_retry=allow_retry and broker_kind(acct) != "021")
+
+
+def _confirm_target(outbox_id: str, order: CanonicalOrder, *, sent_ok: bool, allow_retry: bool) -> dict:
+    acct = order.account_id
+    deadline = time.time() + settings().reconcile_window_s
+    verdict, o = _target_state(acct, order)
+    while verdict is None and time.time() < deadline:
+        time.sleep(0.5)
+        verdict, o = _target_state(acct, order)
+    what = "modification" if order.action == "MODIFY" else "cancellation"
+    if verdict is True:
+        return _record_ack(outbox_id, o, reconciled=not sent_ok)
+    if verdict is False:
+        reason = f"Order {order.target_broker_order_id} is {o.get('status')} at the broker, so the {what} did not apply."
+        with session_scope() as s:
+            ob = s.get(OutboxEntry, outbox_id)
+            ob.state = "REJECTED_BY_BROKER"
+            ob.broker_order_id = order.target_broker_order_id
+            ob.broker_status = o.get("status")
+            ob.reject_reason = reason
+            audit.record(s, "executor", "BROKER_RESPONSE", "outbox", ob.id, {"result": "TARGET_NOT_OPEN", "status": o.get("status")})
+            _set_step(s, ob.proposal_id, ob.step_no, state="REJECTED", reason=reason)
+            state.outcome(s, "ORDER_REJECTED", f"{what.capitalize()} not applied", reason, "warning", proposal_id=ob.proposal_id, broker_order_id=order.target_broker_order_id)
+        return {"ok": False, "outbox_id": outbox_id, "state": "REJECTED_BY_BROKER"}
+    if sent_ok and o is not None:
+        # The broker accepted the request but the order does not show it yet (021 applies them asynchronously).
+        with session_scope() as s:
+            ob = s.get(OutboxEntry, outbox_id)
+            audit.record(s, "executor", "RECONCILIATION", "outbox", ob.id, {"result": "ACCEPTED_NOT_YET_VISIBLE", "target": order.target_broker_order_id})
+            state.outcome(s, "RECONCILED", f"{what.capitalize()} accepted, not yet visible", f"The broker accepted the {what} of order {order.target_broker_order_id}; the order does not show it yet. Live updates will report it.", "info", proposal_id=ob.proposal_id, broker_order_id=order.target_broker_order_id)
+        return _record_ack(outbox_id, o, reconciled=False)
+    if allow_retry:
+        with session_scope() as s:
+            ob = s.get(OutboxEntry, outbox_id)
+            if ob.attempts < 2:
+                ob.state = "RECONCILED_ABSENT"
+                audit.record(s, "executor", "RETRY", "outbox", ob.id, {"reason": f"The target order does not show the {what}; one safe retry (it is idempotent on the paper broker)."})
+                retry = True
+            else:
+                retry = False
+        if retry:
+            with session_scope() as s:
+                ob = s.get(OutboxEntry, outbox_id)
+                ob.state = "SENDING"
+                ob.attempts += 1
+            return _modify_or_cancel(outbox_id, order, allow_retry=False)
+    if broker_kind(acct) == "021":
+        return _not_placed(outbox_id, f"The {what} was not confirmed and order {order.target_broker_order_id} still shows its previous state.")
+    with session_scope() as s:
+        ob = s.get(OutboxEntry, outbox_id)
+        ob.state = "FAILED"
+        ob.reject_reason = f"The {what} could not be confirmed on order {order.target_broker_order_id}; not retried again. Check the order before trying again."
+        _set_step(s, ob.proposal_id, ob.step_no, state="FAILED", reason=ob.reject_reason)
+        state.outcome(s, "EXECUTION_BLOCKED", "Outcome unknown", ob.reject_reason, "danger", proposal_id=ob.proposal_id)
+    return {"ok": False, "outbox_id": outbox_id, "state": "FAILED"}
+
+
+def _refused(outbox_id: str, e: BrokerError) -> dict:
+    with session_scope() as s:
+        ob = s.get(OutboxEntry, outbox_id)
+        ob.state = "REJECTED_BY_BROKER"
+        ob.reject_reason = e.message
+        audit.record(s, "executor", "BROKER_RESPONSE", "outbox", ob.id, {"result": "ERROR", "code": e.code, "message": e.message, "http_status": e.status})
+        _set_step(s, ob.proposal_id, ob.step_no, state="REJECTED", reason=e.message)
+        state.outcome(s, "ORDER_REJECTED", "Broker refused the order", e.message, "danger", proposal_id=ob.proposal_id)
+    return {"ok": False, "outbox_id": outbox_id, "state": "REJECTED_BY_BROKER", "code": e.code}
+
+
+# ---------------------------------------------------------------- 021: sent once, never retried
+
+
+def _not_placed(outbox_id: str, message: str, data: dict | None = None) -> dict:
+    reason = f"{message} Nothing was sent twice; countersign again to resend."
+    with session_scope() as s:
+        ob = s.get(OutboxEntry, outbox_id)
+        ob.state = "NOT_PLACED"
+        ob.reject_reason = reason
+        audit.record(s, "executor", "BROKER_RESPONSE", "outbox", ob.id, {"result": "NOT_PLACED", "detail": message, **(data or {})})
+        _set_step(s, ob.proposal_id, ob.step_no, state="NOT_PLACED", reason=reason)
+        state.outcome(s, "ORDER_NOT_PLACED", "Order not placed", reason, "warning", proposal_id=ob.proposal_id)
+    return {"ok": False, "outbox_id": outbox_id, "state": "NOT_PLACED", "message": reason}
+
+
+def _needs_review(outbox_id: str, message: str, data: dict | None = None) -> dict:
+    reason = f"{message} Countersign did not retry and did not guess. Review the 021 order book before placing it again."
+    with session_scope() as s:
+        ob = s.get(OutboxEntry, outbox_id)
+        ob.state = "NEEDS_REVIEW"
+        ob.reject_reason = reason
+        audit.record(s, "executor", "RECONCILIATION", "outbox", ob.id, {"result": "NEEDS_REVIEW", "detail": message, **(data or {})})
+        _set_step(s, ob.proposal_id, ob.step_no, state="NEEDS_REVIEW", reason=reason)
+        state.outcome(s, "ORDER_NEEDS_REVIEW", "Order outcome needs review", reason, "danger", proposal_id=ob.proposal_id)
+    return {"ok": False, "outbox_id": outbox_id, "state": "NEEDS_REVIEW", "message": reason}
+
+
+NOT_PLACED_CODES = {"NOT_PLACED", "DUPLICATE_IN_FLIGHT", "INSTRUMENT_NOT_ON_021", "UNMAPPABLE_ORDER", "TAG_REQUIRED", "TAG_ALREADY_USED", "ACCOUNT_FORBIDDEN", "SCOPE_FORBIDDEN", "UNAUTHENTICATED", "ACCOUNT_REQUIRED"}
+REVIEW_CODES = {"AMBIGUOUS", "UNCONFIRMED"}
+
+
+def _send_021(outbox_id: str, order: CanonicalOrder) -> dict:
+    acct = order.account_id
+    with session_scope() as s:
+        ob = s.get(OutboxEntry, outbox_id)
+        ob.state = "SENDING"
+        ob.attempts += 1
+        audit.record(s, "executor", "BROKER_REQUEST", "outbox", ob.id, {"client_order_id": ob.client_order_id, "attempt": ob.attempts, "action": order.action, "broker": "021"})
+        if ob.proposal_id:
+            _set_step(s, ob.proposal_id, ob.step_no, state="SUBMITTED", client_order_id=ob.client_order_id)
+        body = dict(ob.request)
+    if order.action != "PLACE":
+        return _modify_or_cancel(outbox_id, order, allow_retry=False)
+    body.pop("action", None)
+    body.pop("target_broker_order_id", None)
+    try:
+        resp = broker(acct).place(body)
+    except BrokerUnavailable as e:
+        return _not_placed(outbox_id, f"The 021 gateway was unreachable ({e}), so nothing reached 021.")
+    except BrokerTimeout:
+        with session_scope() as s:
+            ob = s.get(OutboxEntry, outbox_id)
+            ob.state = "UNKNOWN"
+            audit.record(s, "executor", "BROKER_RESPONSE", "outbox", ob.id, {"result": "TIMEOUT", "note": "Waiting for the gateway's reconciliation verdict; never resent."})
+        return _resolve_021(outbox_id, order)
+    except BrokerError as e:
+        if e.code in NOT_PLACED_CODES:
+            return _not_placed(outbox_id, e.message, {"code": e.code, "broker_error": e.body.get("broker_error")})
+        if e.code in REVIEW_CODES:
+            return _needs_review(outbox_id, e.message, {"code": e.code, "candidates": e.body.get("candidates")})
+        if _ambiguous_http(e):
+            with session_scope() as s:
+                ob = s.get(OutboxEntry, outbox_id)
+                ob.state = "UNKNOWN"
+                audit.record(s, "executor", "BROKER_RESPONSE", "outbox", ob.id, {"result": f"HTTP_{e.status}", "detail": e.message})
+            return _resolve_021(outbox_id, order)
+        return _refused(outbox_id, e)
+    if resp.get("reconciled"):
+        with session_scope() as s:
+            ob = s.get(OutboxEntry, outbox_id)
+            audit.record(s, "executor", "RECONCILIATION", "outbox", ob.id, {"result": "FOUND", "broker_order_id": resp.get("broker_order_id"), "retried": False, "by": "gateway021", "original_error": resp.get("original_error")})
+            state.outcome(s, "RECONCILED", "Reconciled: not retried", f"021's answer was lost ({resp.get('original_error')}); the gateway found the order in 021's order book ({resp.get('broker_order_id')}) and nothing was resent.", "success", proposal_id=ob.proposal_id, broker_order_id=resp.get("broker_order_id"))
+    return _record_ack(outbox_id, resp, reconciled=bool(resp.get("reconciled")))
+
+
+def _resolve_021(outbox_id: str, order: CanonicalOrder) -> dict:
+    """The executor lost the gateway's answer: ask the gateway what happened to the tag (it reconciles on its side)."""
+    acct = order.account_id
+    with session_scope() as s:
+        tag = s.get(OutboxEntry, outbox_id).client_order_id
+    deadline = time.time() + settings().executor_021_timeout_s
+    last_err = None
+    while time.time() < deadline:
+        try:
+            att = broker(acct).attempt(tag, wait_s=10.0)
+        except BrokerError as e:
+            if e.status == 404:
+                return _not_placed(outbox_id, "The 021 gateway never received this order, so nothing reached 021.")
+            last_err = e.message
+            time.sleep(1.0)
+            continue
+        except (BrokerTimeout, BrokerUnavailable) as e:
+            last_err = str(e)
+            time.sleep(1.0)
+            continue
+        st = att.get("state")
+        if st == "SENDING":
+            continue
+        if st in ("ACCEPTED", "REJECTED") and att.get("broker_order_id"):
+            try:
+                o = broker(acct).order(att["broker_order_id"])
+            except (BrokerTimeout, BrokerUnavailable, BrokerError) as e:
+                last_err = str(e)
+                time.sleep(1.0)
+                continue
+            with session_scope() as s:
+                ob = s.get(OutboxEntry, outbox_id)
+                audit.record(s, "executor", "RECONCILIATION", "outbox", ob.id, {"result": "FOUND", "broker_order_id": o["broker_order_id"], "retried": False, "by": "gateway021"})
+                state.outcome(s, "RECONCILED", "Reconciled: not retried", f"The gateway's answer was lost; 021 holds the order ({o['broker_order_id']}, tag {tag}). Nothing was resent.", "success", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"])
+            return _record_ack(outbox_id, o, reconciled=True)
+        if st == "REJECTED":
+            return _refused(outbox_id, BrokerError(422, "REJECTED_BY_021", att.get("error") or "Rejected by 021."))
+        if st == "NOT_PLACED":
+            return _not_placed(outbox_id, f"021 did not place it ({att.get('error')}).")
+        return _needs_review(outbox_id, f"021's outcome for tag {tag} is {st}: {att.get('error')}.", {"candidates": att.get("candidates")})
+    return _needs_review(outbox_id, f"The outcome of tag {tag} could not be confirmed with the 021 gateway ({last_err}).")
 
 
 def _record_ack(outbox_id: str, resp: dict, *, reconciled: bool) -> dict:
@@ -362,6 +676,9 @@ def reconcile(outbox_id: str, *, allow_retry: bool, window_s: float | None = Non
             order = CanonicalOrder.model_validate(_order_from_request(s, ob))
         except Exception:  # noqa: BLE001
             order = None
+    if order is not None and order.action != "PLACE":
+        # A modification or cancellation has no order of its own: it is confirmed on the target order.
+        return _confirm_target(outbox_id, order, sent_ok=False, allow_retry=allow_retry)
     deadline = time.time() + window_s
     found = None
     while time.time() < deadline:
@@ -415,7 +732,7 @@ def wait_for_fill(job_id: str, depends_on: int, timeout_s: float = 20.0) -> dict
                 return {"filled": False, "reason": f"Step {depends_on} was never sent."}
             if ob.broker_status == "COMPLETE":
                 return {"filled": True}
-            if ob.broker_status in ("REJECTED", "CANCELLED") or ob.state in ("REJECTED_BY_BROKER", "FAILED"):
+            if ob.broker_status in ("REJECTED", "CANCELLED") or ob.state in ("REJECTED_BY_BROKER", "FAILED", "NOT_PLACED", "NEEDS_REVIEW"):
                 return {"filled": False, "reason": f"Step {depends_on} ended {ob.broker_status or ob.state} (filled {ob.filled_quantity})."}
             if state.kill_switch(s)["engaged"]:
                 return {"filled": False, "reason": "Kill switch engaged."}

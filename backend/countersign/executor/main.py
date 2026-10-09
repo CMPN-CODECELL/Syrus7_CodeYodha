@@ -27,6 +27,8 @@ def _assert_isolation() -> None:
     cfg = settings()
     if not cfg.broker_write_key:
         sys.exit("executor: CS_BROKER_WRITE_KEY is required (the executor is the only process that may hold it).")
+    if os.environ.get("CS_021_PASSWORD"):
+        sys.exit("executor: refusing to run with the 021 password in its environment (it belongs only to gateway021).")
     forbidden = [m for m in ("pydantic_ai", "countersign.llm", "countersign.api") if m in sys.modules]
     if forbidden:
         sys.exit(f"executor: refusing to run with AI/API modules loaded: {forbidden}")

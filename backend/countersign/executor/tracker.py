@@ -47,6 +47,14 @@ def apply_order_update(s: Session, o: dict) -> None:
         s.merge(OrderFill(trade_id=f"T{o['broker_order_id']}-{o['filled_quantity']}", broker_order_id=o["broker_order_id"], quantity=o["filled_quantity"] - prev_filled, price_paise=o.get("avg_fill_price_paise") or 0, filled_at=datetime.now(UTC)))
     if ob is None:
         return
+    if ob.state in ("NOT_PLACED", "NEEDS_REVIEW", "UNKNOWN") and not ob.broker_order_id:
+        # The broker now shows an order for a placement that was reported as not placed or unresolved (021 accepted
+        # it late, or the gateway resolved an ambiguity). Report it plainly; nothing was resent automatically.
+        was = ob.state
+        ob.state = "RECONCILED_FOUND"
+        ob.reconciled = True
+        audit.record(s, "executor", "RECONCILIATION", "outbox", ob.id, {"result": "LATE_FOUND", "was": was, "broker_order_id": o["broker_order_id"]})
+        state.outcome(s, "RECONCILED", "Order found after all", f"The broker now shows order {o['broker_order_id']} (tag {tag}), which had been reported {was.replace('_', ' ').lower()}. It was not resent automatically; check that you did not place it again.", "warning", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"])
     ob.broker_order_id = ob.broker_order_id or o["broker_order_id"]
     ob.broker_status = o["status"]
     ob.filled_quantity = o["filled_quantity"]
@@ -76,6 +84,10 @@ def apply_order_update(s: Session, o: dict) -> None:
         else:
             state.outcome(s, "ORDER_CANCELLED", f"Remainder cancelled: {o['filled_quantity']}/{o['quantity']} {sym} filled", o.get("reject_reason") or "Remaining quantity cancelled.", "warning", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"], account_id=acct)
             audit.record(s, "broker", "ORDER_CANCELLED", "order", o["broker_order_id"], {"filled": o["filled_quantity"]})
+    elif st == "COMPLETE" and prev_status == "CANCELLED":
+        # Seen on the 021 sandbox: an order confirmed Cancelled later shows Executed. Reported as the broker states it.
+        state.outcome(s, "ORDER_FILLED", f"Filled after its cancellation: {o['side']} {o['quantity']} {sym}", f"The broker had confirmed order {o['broker_order_id']} as cancelled and now reports it executed at an average of {inr(o.get('avg_fill_price_paise'))}. Check your position; nothing was resent.", "warning", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"], account_id=acct)
+        audit.record(s, "broker", "FILL_AFTER_CANCEL", "order", o["broker_order_id"], {"filled": o["filled_quantity"], "avg_price_paise": o.get("avg_fill_price_paise")})
     elif st == "COMPLETE":
         state.outcome(s, "ORDER_FILLED", f"Filled: {o['side']} {o['quantity']} {sym}", f"Average {inr(o.get('avg_fill_price_paise'))} (order {o['broker_order_id']}).", "success", proposal_id=ob.proposal_id, broker_order_id=o["broker_order_id"], account_id=acct)
         audit.record(s, "broker", "FILL", "order", o["broker_order_id"], {"filled": o["filled_quantity"], "avg_price_paise": o.get("avg_fill_price_paise")})
@@ -105,8 +117,8 @@ def refresh_proposal_status(s: Session, proposal_id: str) -> None:
                     audit.record(s, "executor", "MANDATE_FIRED", "mandate", m.id, {"broker_order_id": ob.broker_order_id, "trigger_event_id": m.trigger_event_id})
             if ob.broker_status == "COMPLETE":
                 m.state = "COMPLETED"
-            if ob.broker_status == "REJECTED" or ob.state in ("REJECTED_BY_BROKER", "FAILED"):
-                m.state = "FAILED"
+            if ob.broker_status == "REJECTED" or ob.state in ("REJECTED_BY_BROKER", "FAILED", "NOT_PLACED", "NEEDS_REVIEW"):
+                m.state = "NEEDS_REVIEW" if ob.state == "NEEDS_REVIEW" else "FAILED"
                 m.reason = ob.reject_reason
             events.emit_mandate(m)
         return
@@ -118,7 +130,7 @@ def refresh_proposal_status(s: Session, proposal_id: str) -> None:
         new = p.status
         if ob.broker_status == "COMPLETE":
             new = "COMPLETED"
-        elif ob.broker_status == "REJECTED" or ob.state in ("REJECTED_BY_BROKER", "FAILED"):
+        elif ob.broker_status == "REJECTED" or ob.state in ("REJECTED_BY_BROKER", "FAILED", "NOT_PLACED", "NEEDS_REVIEW"):
             new = "FAILED"
         elif ob.broker_status == "CANCELLED":
             new = "PARTIALLY_COMPLETED" if ob.filled_quantity > 0 else ("COMPLETED" if s.get(Proposal, p.id).canonical.get("action") == "CANCEL" else "FAILED")
@@ -142,7 +154,7 @@ def refresh_proposal_status(s: Session, proposal_id: str) -> None:
         new_plan, new_p = "COMPLETED", "COMPLETED"
     elif any(x in ("FILLED", "PARTIALLY_FILLED", "OPEN") for x in states) or filled_like:
         new_plan, new_p = ("PARTIALLY_COMPLETED", "PARTIALLY_COMPLETED")
-        if any(x in ("REJECTED", "FAILED") for x in states):
+        if any(x in ("REJECTED", "FAILED", "NOT_PLACED", "NEEDS_REVIEW") for x in states):
             new_plan = "PARTIALLY_FAILED"
     else:
         new_plan, new_p = "PARTIALLY_FAILED", "FAILED"
