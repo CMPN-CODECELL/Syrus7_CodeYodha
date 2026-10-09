@@ -65,6 +65,8 @@ With `CS_021_UCC` and `CS_021_PASSWORD` set, `scripts/dev.py` starts the `gatewa
 
 **One live token per account.** 021 allows one access token per account: a new login revokes the previous one, and there is no refresh token. While the stack runs, do not log in to the same 021 account from another script (for example the API probe): the gateway's token would be revoked and it would log in again. Tokens expire at 05:00 IST; the gateway logs in again when needed. To run without 021 even when it is configured: `scripts/dev.py --no-021`.
 
+**Traders connecting their own 021 account.** With the gateway running, any signed-in trader can connect their own 021 account in the Security Center (Broker connection, "Connect your 021 account") or in the optional last onboarding step: they enter their UCC and 021 password, confirm with their passkey, app PIN or authenticator code, and the account becomes their active account. Nothing is added to `.env`. On first start the gateway creates `.secrets/gateway021_link_key.pem` (RSA-2048, the browser encrypts the credentials to it) and `.secrets/gateway021_store.key` (the AES-256-GCM key that seals stored passwords in the gateway's `g021_credentials` table). Keep both with the database: deleting the store key makes every stored password unreadable (those traders connect again), and anyone who can read both the key file and the table can decrypt the passwords. Connecting an account logs out other API sessions on that 021 account. **Disconnect** deletes the stored password.
+
 ## 4. Start it
 
 1. Open **Docker Desktop** and wait until it shows "Engine running".
@@ -94,7 +96,7 @@ With `CS_021_UCC` and `CS_021_PASSWORD` set, `scripts/dev.py` starts the `gatewa
 ## 6. Check that everything works (optional)
 
 ```
-cd backend; uv run pytest -q; cd ..                      # expect: all passed (292 on 2026-10-09); run one suite at a time
+cd backend; uv run pytest -q; cd ..                      # expect: all passed (307 on 2026-10-09); run one suite at a time
 uv run --project backend python scripts/smoke.py         # end-to-end order over HTTP
 ```
 The browser test needs a one-time `pip install playwright httpx` and `playwright install chromium`. Then run `python scripts/e2e_browser.py` (desktop) or `python scripts/e2e_browser.py --device "Pixel 7"` (phone layout); every check should pass. It creates two throwaway accounts (`e2e.*@example.test`), walks the whole journey from the landing page and revokes the test passkey at the end. Run the smoke and browser tests while the app is running.
@@ -108,6 +110,9 @@ The browser test needs a one-time `pip install playwright httpx` and `playwright
 | `! api exited with code 1` (or another process) | Open `.logs/api.log` (or that process's log); the last lines say why. |
 | Chat takes 15+ seconds | No AI key and Ollama is running on the CPU. Add a Groq key, or quit Ollama so the built-in engine answers instantly. |
 | Passkey prompt fails | Open the app at `http://localhost:3000` (or the HTTPS address you registered the passkey on), or use the App PIN tab instead. |
+| "Wrong UCC or password" when connecting a 021 account | 021 refused the login (HTTP 401 or 403). Nothing was stored. Check the client code and password; after 5 attempts in 15 minutes the form waits (rate limit). |
+| "021 did not answer, try again" when connecting | 021 answered 429 or 5xx or timed out during the one verification login. Nothing was stored; try again. |
+| A connected 021 account shows "021 refused the stored password" | The password was changed at 021. The gateway does not retry it on its own (to avoid locking the account): disconnect and connect it again. |
 | `021` health shows `logged_in: false` or `BROKER_AUTH_FAILED` | Check `CS_021_UCC` and `CS_021_PASSWORD` in `.env`, and that nothing else logged in to the same 021 account (one live token per account). See `.logs/gateway021.log`. |
 | "Order not placed" on the 021 account | The connection to 021 failed before the order was sent, or 021's answer was lost and the order is not in its order book. Nothing was sent twice; countersign the order again to resend. |
 | "Needs your review" on the 021 account | 021's answer was lost and the order book showed several matching orders, or could not be read. Countersign did not guess or resend; open the order book and check. |

@@ -371,7 +371,7 @@ interface PublicStatus {
 ```
 
 ### Account (read-only gateway; uses the broker READ key only)
-Every read uses the caller's **active** account: their paper account, or the 021 sandbox account when they are a listed owner and it is active.
+Every read uses the caller's **active** account: their paper account, or a 021 account they may operate (the operator-linked account when they are a listed owner, or a 021 account they connected themselves) when it is active.
 
 | GET | `/api/account/summary` | `AccountSummary` |
 |---|---|---|
@@ -380,23 +380,28 @@ Every read uses the caller's **active** account: their paper account, or the 021
 | GET | `/api/account/orders?status=open\|all\|rejected` | `BrokerOrder[]` (021 adds `status_021`, `price_021_paise`, `trigger_021_paise`, `token_021`, `exchange_021`, `exchange_order_number`, `side_known` and `origin`: `"countersign"` or `"external"` for orders placed outside Countersign) |
 | GET | `/api/account/funds` | `{ estimate: boolean; cash_paise; used_margin_paise; available_paise; basis?: string; account_id }`. On 021 `estimate` is `true` (021 has no funds API) and `basis` explains the estimate; `account_id` is masked there |
 
-### Broker accounts (021 sandbox linking)
+### Broker accounts (021 linking)
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/api/broker/accounts` | | `BrokerAccount[]`: the caller's paper account and, for users listed in `CS_021_OWNER_EMAILS`, the 021 sandbox account |
-| POST | `/api/broker/active` | `{ account_id: string }` | `{ active_account_id: string; accounts: BrokerAccount[] }`; `404 ACCOUNT_NOT_FOUND` if the caller cannot operate that account (also when their email was removed from the owner list) |
-| GET | `/api/broker/status` | | `{ active_kind: "paper" \| "021"; gateway021_enabled: boolean; gateway021: null \| { up: boolean; logged_in?; token_expires_at?; account? /* masked */; instruments?; market_socket?; orders_socket?; http? /* 429, 5xx, timeouts, read retries, re-logins */; last_reconciliation? } }`. Never contains a credential, a token or the unmasked account id |
+| GET | `/api/broker/accounts` | | `BrokerAccount[]`: the caller's paper account, the operator-linked 021 account for users listed in `CS_021_OWNER_EMAILS`, and every 021 account the caller connected themselves |
+| POST | `/api/broker/active` | `{ account_id: string }` | `{ active_account_id: string; accounts: BrokerAccount[] }`; `404 ACCOUNT_NOT_FOUND` if the caller cannot operate that account (also when their email was removed from the owner list, or after they disconnected it) |
+| GET | `/api/broker/status` | | `{ active_kind: "paper" \| "021"; gateway021_enabled: boolean; gateway021: null \| { up: boolean; logged_in?; token_expires_at?; account? /* masked */; instruments?; market_socket?; orders_socket?; http? /* 429, 5xx, timeouts, read retries, re-logins */; last_reconciliation? } }`. `logged_in`, `token_expires_at` and `account` describe the caller's own 021 account (the active one, else the first they may operate). Never contains a credential, a token or the unmasked account id |
+| GET | `/api/broker/021/link-key` | | `{ public_key: string /* SPKI DER, base64 */; alg: "RSA-OAEP-256"; nonce: string; user_id: string; expires_at: ISO; max_plaintext_bytes: 190 }`. The nonce is single use, lives 5 minutes and is stored server side; asking again retires any earlier unused nonce. `503 GATEWAY021_OFF` when the gateway is not running, `503 GATEWAY021_UNAVAILABLE` when it does not answer |
+| POST | `/api/broker/021/link` | `{ ciphertext: string }` | Self-service linking. `ciphertext` is the standard base64 of WebCrypto RSA-OAEP (SHA-256) over the UTF-8 JSON `{ ucc, password, nonce, user_id }`, encrypted to `public_key` with the nonce and user id from `link-key`. Returns `{ masked_ucc: string; account: BrokerAccount; accounts: BrokerAccount[]; active_account_id: string }` and the linked account becomes active. Needs a fresh step-up (`403 STEP_UP_REQUIRED` with `methods`; with no approval method yet, `methods` is empty). Errors: `400 LINK_NONCE_INVALID` (no unused nonce younger than 5 minutes), `400 LINK_NONCE_MISMATCH` / `LINK_REPLAYED` / `LINK_DECRYPT_FAILED` (from the gateway), `401 LINK_WRONG_CREDENTIALS` (021 answered 401 or 403), `422 UCC_INVALID` (4 to 16 letters or digits) / `PASSWORD_INVALID` / `LINK_REFUSED` (another 4xx from 021), `503 LINK_021_UNAVAILABLE` ("021 did not answer, try again": 429, 5xx or timeout), `409 UCC_LINKED_ELSEWHERE` (already connected by another Countersign user; the operator-linked account is the exception, see below), `409 UCC_CONFLICT` (the id belongs to a paper account), `429 RATE_LIMITED` (`retry_after_s`; 5 attempts per user and 10 per client IP in 15 minutes, counted after the step-up check). Nothing is stored unless 021 accepted the password |
+| DELETE | `/api/broker/021/link` | `{ account_id: string }` | `{ ok: true; active_account_id: string; accounts: BrokerAccount[] }`. Disconnects a 021 account the caller connected: the gateway deletes the stored credential (and drops that account's session when no other trader linked it; the `.env` account keeps its session), the link is removed and the caller is moved back to their paper account. Needs a fresh step-up. `404 ACCOUNT_NOT_FOUND` (not connected by the caller), `409 LINK_OPERATOR_MANAGED` (the operator-linked account), `503 GATEWAY021_UNAVAILABLE` (the gateway could not delete the credential; nothing was changed) |
 
 ```ts
 interface BrokerAccount {
-  account_id: string;            // for POST /api/broker/active only; display label or masked_id
+  account_id: string;            // for POST /api/broker/active and DELETE /api/broker/021/link only; display label or masked_id
   kind: "paper" | "021";
   label: string;                 // "Paper trading account" | "021 sandbox HACK***3"
   masked_id: string;
   active: boolean;
+  linked_by: "self" | "operator" | null;   // 021 only: connected by this trader, or by the operator (CS_021_OWNER_EMAILS)
   status: { connected: boolean; token_expires_at: ISO | null; market_data: "live" | "replay"; last_error: string | null };
 }
 ```
+A UCC already connected by another Countersign user is refused, except the operator-linked `.env` account: a trader who proves its password is linked to it as a member (the listed owners keep it). The API never sees the UCC or password in clear: it relays the ciphertext with the nonce it issued and the caller's user id to `gateway021` (`POST /admin/link`, admin key, loopback only), and it never logs or stores the ciphertext. Link, refusal and unlink are audited with the masked UCC only (`ACCOUNT_LINKED_021`, `ACCOUNT_LINK_021_REFUSED`, `ACCOUNT_UNLINKED_021`) and listed in the trader's Security events.
 `GET /api/me` also returns `account: { id, label, kind }` for the active account, and `GET /api/security/status` adds `kind` and `label` to `broker`.
 
 ### Market
