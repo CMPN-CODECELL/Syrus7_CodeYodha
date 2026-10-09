@@ -167,12 +167,9 @@ def _live_021_chain(expiry: str | None, width: int) -> dict | None:
 
     if not getattr(settings(), "gateway021_enabled", False):
         return None
-    from countersign.broker021 import linking
+    from countersign.core.broker_client import market_gateway021
 
-    ucc = linking.gateway_account_id()
-    if not ucc:
-        return None
-    return read_gateway(ucc).option_chain("NIFTY", expiry, width)
+    return market_gateway021().option_chain("NIFTY", expiry, width)
 
 
 def get_option_chain(d: ChatDeps, expiry: str | None = None, width: int = 6) -> dict:

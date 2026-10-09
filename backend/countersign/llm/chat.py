@@ -101,6 +101,21 @@ def _clean_history(messages: list) -> list:
     return out
 
 
+def _deterministic(deps: ChatDeps) -> str:
+    """The deterministic engine, with a broker that is slow or refusing (the 021 sandbox injects timeouts, rate limits
+    and 5xx on purpose) answered as what it is instead of a failed assistant. Read-only paths never retry writes."""
+    from countersign.core.broker_client import BrokerError, BrokerTimeout, BrokerUnavailable
+
+    try:
+        return router.handle(deps)
+    except (BrokerTimeout, BrokerUnavailable) as e:
+        deps.emit({"kind": "notice", "tone": "warning", "title": "The broker did not answer in time", "message": f"{type(e).__name__}: nothing was changed. Ask again in a few seconds."})
+        return "The broker did not answer in time, so I cannot answer that reliably right now. Nothing was changed; please ask again in a few seconds."
+    except BrokerError as e:
+        deps.emit({"kind": "notice", "tone": "warning", "title": "The broker refused the request", "message": f"{e.code}: {e.message}"[:300]})
+        return "The broker refused that request, so I cannot answer it right now. Nothing was changed."
+
+
 async def stream(user_id: str, account_id: str, conversation_id: str | None, message: str, engine: str = "auto") -> AsyncIterator[dict]:
     conversation_id = conversation_id or str(uuid.uuid4())
     message = message.strip()[:2000]
@@ -129,7 +144,7 @@ async def stream(user_id: str, account_id: str, conversation_id: str | None, mes
 
     if model is None:
         yield {"type": "tool", "id": "det", "name": "deterministic_interpreter", "label": "Interpreting your request (deterministic engine)", "status": "running"}
-        text = await asyncio.to_thread(router.handle, deps)
+        text = await asyncio.to_thread(_deterministic, deps)
         yield {"type": "tool", "id": "det", "name": "deterministic_interpreter", "label": "Interpreted", "status": "done"}
         async for e in flush():
             yield e
@@ -186,7 +201,7 @@ async def stream(user_id: str, account_id: str, conversation_id: str | None, mes
         if failed is not None and not deps.proposal_ids and not cards:
             yield {"type": "card", "card": {"kind": "notice", "tone": "warning", "title": "AI engine unavailable", "message": f"{label} did not respond ({type(failed).__name__}). Answered with the deterministic engine instead; safety is unchanged."}}
             deps.engine = "deterministic"
-            text = await asyncio.to_thread(router.handle, deps)
+            text = await asyncio.to_thread(_deterministic, deps)
             async for e in flush():
                 yield e
             text_parts = [text]
