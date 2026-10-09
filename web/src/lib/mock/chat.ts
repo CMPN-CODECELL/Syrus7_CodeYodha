@@ -2,7 +2,7 @@
 // read-only questions return cards; trade instructions become proposals in the mock engine.
 // The chat never "places" anything; it can only create a proposal that needs a countersignature.
 
-import type { Card, ChatEngine, ChatEvent, ChatHistoryItem, Proposal } from "../types";
+import type { Card, ChatEngine, ChatEvent, ChatHistoryItem, FieldRow, Issue, Proposal, ProposalStep } from "../types";
 import { engine, rs, sleep } from "./engine";
 import {
   EXPIRIES,
@@ -157,6 +157,226 @@ export async function simulateChat(
 
   const holdings = () => s.holdings.map((h) => buildHolding(h, s.prices[h.symbol].ltp, s.prices[h.symbol].prev));
 
+  // Computed plans (L4) ---------------------------------------------------------
+  if (/\b(exit|close|square off)\b.*\blos(ing|ers?)\b.*\b(intraday|mis)\b/i.test(lower)) {
+    await tool("get_positions", "Reading positions...", 380);
+    await tool("get_quotes", "Reading live prices...", 300);
+    const all = s.positions.map((p) => ({ seed: p, pos: buildPosition(p, s.prices[p.inst.symbol]?.ltp ?? p.avg) }));
+    const intraday = all.filter((x) => x.seed.product === "MIS" || x.seed.product === "INTRADAY");
+    const losers = intraday.filter((x) => x.pos.pnl_paise < 0);
+    if (!losers.length) {
+      await say(intraday.length ? `None of your ${intraday.length} intraday positions is losing right now, so there is nothing to exit.` : "You have no open intraday positions, so there is nothing to exit.");
+      return finish();
+    }
+    await tool("draft_plan", "Drafting exit plan for verification...", 480);
+    await tool("verify", "Verifier checking every step...", 520);
+    const steps = losers.map((x, i) =>
+      buildStep(
+        engine.specFor({ side: x.pos.quantity > 0 ? "SELL" : "BUY", symbol: x.seed.inst.symbol, qty: Math.abs(x.pos.quantity), orderType: "MARKET", product: "MIS", userText: msg }),
+        i + 1,
+        null,
+      ),
+    ).map((st, i): ProposalStep => {
+      const x = losers[i];
+      const field: FieldRow = {
+        key: "unrealised_pnl",
+        label: "Unrealised P&L now",
+        display: sign(x.pos.pnl_paise),
+        source: "live_market_feed",
+        flagged: false,
+        note: `(live ${rs(x.pos.ltp_paise)} - average ${rs(x.seed.avg)}) x ${x.pos.quantity > 0 ? "+" : ""}${x.pos.quantity}`,
+      };
+      return { ...st, fields: [st.fields[0], st.fields[1], st.fields[2], field, ...st.fields.slice(3)] };
+    });
+    const notes: Issue[] = [
+      {
+        code: "EXIT_SCOPE",
+        severity: "INFO",
+        message: `Exits every intraday (MIS) position whose unrealised P&L is below zero at the live price: ${losers.length} of ${intraday.length} checked. Each step closes one position in full. Holdings are not touched. NRML positions are not touched. Steps are independent (none waits for another) and ordered by loss, largest first.`,
+      },
+    ];
+    const p = planProposal(msg, eng, steps, `Exit ${losers.length} losing intraday (MIS) position(s)`, notes);
+    engine.addProposal(p);
+    await say(`I drafted a ${steps.length}-step exit plan from your positions. **Nothing is sent until you countersign it.** The arithmetic is shown on the card.`);
+    out({ type: "card", card: { kind: "proposal", proposal_id: p.id, status: p.status } });
+    return finish();
+  }
+  if (/\brebalance\b/i.test(lower)) {
+    const capM = lower.match(/(\d+(?:\.\d+)?)\s*%/);
+    const capPct = capM ? Number(capM[1]) : 20;
+    const capBps = Math.round(capPct * 100);
+    await tool("get_holdings", "Reading holdings...", 400);
+    await tool("get_quotes", "Reading live prices...", 300);
+    const hs = holdings();
+    const total = hs.reduce((a, h) => a + h.value_paise, 0);
+    // Size each sale against the total that remains after all sales, so every stock ends at or below the cap.
+    let sold = 0;
+    let sells = new Map<string, number>();
+    for (let round = 0; round < 20; round++) {
+      const capValue = ((total - sold) * capBps) / 10_000;
+      const next = new Map<string, number>();
+      for (const h of hs) {
+        const q = Math.max(0, Math.ceil((h.value_paise - capValue) / h.ltp_paise));
+        if (q > 0) next.set(h.instrument.symbol, Math.min(q, h.quantity));
+      }
+      const nextSold = hs.reduce((a, h) => a + (next.get(h.instrument.symbol) ?? 0) * h.ltp_paise, 0);
+      sells = next;
+      if (nextSold === sold) break;
+      sold = nextSold;
+    }
+    if (!sells.size) {
+      await say(`No single holding is above ${capPct}% of your holdings value (${rs(total)}), so there is nothing to rebalance.`);
+      return finish();
+    }
+    await tool("draft_plan", "Drafting rebalance plan for verification...", 480);
+    await tool("verify", "Verifier checking every step...", 520);
+    const remaining = total - sold;
+    const over = hs.filter((h) => sells.has(h.instrument.symbol));
+    const w = (bps: number) => `${(bps / 100).toFixed(2)}%`;
+    const before = (h: (typeof hs)[number]) => Math.round((h.value_paise / total) * 10_000);
+    const after = (h: (typeof hs)[number]) => Math.round(((h.value_paise - (sells.get(h.instrument.symbol) ?? 0) * h.ltp_paise) / remaining) * 10_000);
+    const steps = over.map((h, i): ProposalStep => {
+      const q = sells.get(h.instrument.symbol) as number;
+      const st = buildStep(engine.specFor({ side: "SELL", symbol: h.instrument.symbol, qty: q, orderType: "MARKET", product: "CNC", userText: msg }), i + 1, null);
+      const field: FieldRow = {
+        key: "weight",
+        label: "Weight",
+        display: `${w(before(h))} → ${w(after(h))}`,
+        source: "live_market_feed",
+        flagged: false,
+        note: `Value at live ${rs(h.ltp_paise)}: ${rs(h.value_paise)} → ${rs(h.value_paise - q * h.ltp_paise)}`,
+      };
+      return { ...st, fields: [st.fields[0], st.fields[1], st.fields[2], field, ...st.fields.slice(3)] };
+    });
+    const notes: Issue[] = [
+      {
+        code: "REBALANCE_METHOD",
+        severity: "INFO",
+        message: `Method: portfolio value = sum of quantity x live price over your holdings only (cash and positions are not counted). Sells only, no buys. Each stock above ${capPct}% is sold down by the fewest whole shares so that it is at most ${capPct}% of the holdings value that remains after all the sells. Holdings value ${rs(total)} → ${rs(remaining)}. Fills at market can differ slightly from the live prices used here.`,
+      },
+      {
+        code: "REBALANCE_RESULT",
+        severity: "INFO",
+        message: `Weights now → after this plan, at live prices: ${[...hs]
+          .sort((a, b) => after(b) - after(a))
+          .map((h) => `${h.instrument.symbol} ${w(before(h))} → ${w(after(h))}`)
+          .join(", ")}.`,
+      },
+    ];
+    const p = planProposal(msg, eng, steps, `Rebalance to at most ${capPct}% per stock`, notes);
+    engine.addProposal(p);
+    await say(`I drafted a ${steps.length}-step rebalance plan. **Nothing is sent until you countersign it.** The weights and the sale sizes are on the card.`);
+    out({ type: "card", card: { kind: "proposal", proposal_id: p.id, status: p.status } });
+    return finish();
+  }
+  // Stop-loss modify (L2) --------------------------------------------------------
+  if (/\b(stop[- ]?loss|sl)\b/i.test(lower) && /\b(move|modify|change|raise|lower|trail|shift)\b/i.test(lower)) {
+    const sym = findSymbol(msg);
+    const priceM = lower.match(/\bto\s*(?:rs\.?|₹)?\s*(\d[\d,]*(?:\.\d+)?)/);
+    await tool("get_orders", "Reading open orders...", 380);
+    const order = s.orders.find(
+      (o) => o.instrument.symbol === sym && (o.order_type === "SL" || o.order_type === "SL-M") && (o.status === "TRIGGER_PENDING" || o.status === "OPEN"),
+    );
+    if (!sym || !priceM) {
+      out({ type: "card", card: { kind: "clarify", question: "Which stop-loss, and to what trigger price?", options: ["Move my stop-loss on HDFC Bank up to 1640"] } });
+      await say("I need the stock and the new trigger price. Nothing was drafted.");
+      return finish();
+    }
+    if (!order) {
+      out({ type: "card", card: { kind: "notice", tone: "info", title: `No open stop-loss on ${sym}`, message: `There is no pending stop-loss order on ${sym} to move, so nothing was drafted.` } });
+      return finish();
+    }
+    await tool("draft_proposal", "Drafting the modified order for verification...", 480);
+    await tool("verify", "Verifier checking trigger rules and price band...", 520);
+    const trigger = Math.round(parseNum(priceM[1]) * 100);
+    const gap = (order.trigger_price_paise ?? trigger) - (order.limit_price_paise ?? trigger);
+    const limit = trigger - gap;
+    const base = buildStep(engine.specFor({ side: order.side, symbol: sym, qty: order.quantity, orderType: "LIMIT", limit, userText: msg }), 1, null);
+    const fields: FieldRow[] = [
+      { key: "action", label: "Action", display: `Modify order ${order.broker_order_id}`, source: "account", flagged: false, note: `Your pending stop-loss on ${sym}` },
+      { key: "side", label: "Side", display: order.side, source: "account", flagged: false, note: "Unchanged" },
+      { key: "quantity", label: "Quantity", display: order.quantity.toLocaleString("en-IN"), source: "account", flagged: false, note: "Unchanged" },
+      { key: "trigger_price", label: "Trigger price", display: rs(trigger), source: "trader_instruction", flagged: false, note: `Was ${rs(order.trigger_price_paise ?? 0)}` },
+      { key: "limit_price", label: "Limit price", display: rs(limit), source: "account", flagged: false, note: `Keeps the ${rs(gap)} gap below the trigger from your existing order` },
+    ];
+    const step: ProposalStep = {
+      ...base,
+      canonical: { ...base.canonical, action: "MODIFY", order_type: "SL", trigger_price_paise: trigger, limit_price_paise: limit, protection_price_paise: null, target_broker_order_id: order.broker_order_id },
+      summary: `MODIFY ${order.broker_order_id}: ${order.side} ${order.quantity} ${sym} SL trigger ${rs(trigger)} limit ${rs(limit)} (${order.product}, ${order.validity})`,
+      fields,
+    };
+    const id = newProposalId();
+    const p = finalizeProposal({
+      id,
+      kind: "ORDER",
+      status: "AWAITING_APPROVAL",
+      summary: step.summary,
+      steps: [step],
+      mandate: null,
+      failure_policy: null,
+      issues: step.issues,
+      can_approve: !step.issues.some((i) => i.severity === "BLOCK"),
+      interpretation: { user_text: msg, engine: eng, disagreements: [] },
+      approval: null,
+      execution: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    engine.addProposal(p);
+    await say(`I drafted the change to your stop-loss on **${sym}**: trigger ${rs(order.trigger_price_paise ?? 0)} to **${rs(trigger)}**. It is sent only after you countersign this exact order.`);
+    out({ type: "card", card: { kind: "proposal", proposal_id: p.id, status: p.status } });
+    return finish();
+  }
+  // Portfolio-wide alert (ALL_HOLDINGS scope, change from the previous close).
+  if (/\b(any|all|every)\b.*\bholdings?\b/i.test(lower) && /\b(tell me|alert|notify|warn me)\b/i.test(lower)) {
+    const pctM = lower.match(/(\d+(?:\.\d+)?)\s*%/);
+    if (!pctM) {
+      out({ type: "card", card: { kind: "clarify", question: "By how much should a holding fall in a day before I tell you?", options: ["Tell me when any holding falls 3% in a day"] } });
+      return finish();
+    }
+    await tool("get_holdings", "Reading holdings...", 380);
+    await tool("draft_mandate", "Drafting standing alert for verification...", 480);
+    const bps = Math.round(Number(pctM[1]) * 100);
+    const id = newProposalId();
+    const condition = `Any holding down ${pctM[1]}% or more from its previous close`;
+    const p = finalizeProposal({
+      id,
+      kind: "MANDATE",
+      status: "AWAITING_APPROVAL",
+      summary: `ALERT WHEN ${condition}`,
+      steps: [],
+      mandate: null,
+      failure_policy: null,
+      issues: [{ code: "ALERT_ONLY", severity: "INFO", message: "Alert only: it notifies you and never places an order." }],
+      can_approve: true,
+      interpretation: { user_text: msg, engine: eng, disagreements: [] },
+      approval: null,
+      execution: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    const all = { ...INSTRUMENTS.NIFTY, instrument_id: "PORTFOLIO:HOLDINGS", segment: "EQ" as const, symbol: "All holdings", display_name: "Every stock you hold", lot_size: 1 };
+    p.mandate = {
+      ...mandateView(`mnd_${id.slice(4)}`, all, {
+        kind: "ALERT",
+        op: "LTE",
+        threshold: -bps,
+        template: null,
+        state: "PENDING_APPROVAL",
+        createdAgo: 0,
+        expiresIn: 7 * 86_400_000,
+        conditionText: condition,
+        proposal_id: id,
+      }),
+      predicate: { field: "DAY_CHANGE_BPS", op: "LTE", threshold: -bps },
+      one_shot: false,
+    };
+    engine.addProposal(p);
+    await say(`I drafted a standing alert on **all ${s.holdings.length} holdings**. It only notifies you and cannot trade. Countersign it to arm it.`);
+    out({ type: "card", card: { kind: "proposal", proposal_id: p.id, status: p.status } });
+    return finish();
+  }
+
   // Read-only intents ---------------------------------------------------------
   if (/\b(p&l|pnl|p and l|profit|loss today|how am i doing)\b/i.test(lower) && !/\b(buy|sell)\b/i.test(lower)) {
     await tool("get_account_summary", "Reading account summary...", 380);
@@ -182,7 +402,7 @@ export async function simulateChat(
     } else {
       await say(`Nothing in your holdings or positions is down more than ${pct}% from its average price.`);
     }
-  } else if (/\baverage\b.*\bprice\b|\bavg\b|\bbought at\b/i.test(lower)) {
+  } else if (/\baverage\b|\bavg\b|\bbought at\b|\bpay\b.*\bfor\b/i.test(lower) && !/\b(buy|sell)\b/i.test(lower)) {
     const sym = findSymbol(msg) ?? "RELIANCE";
     await tool("get_holdings", "Reading holdings...", 400);
     const h = holdings().find((x) => x.instrument.symbol === sym);
@@ -289,7 +509,17 @@ export async function simulateChat(
       return finish();
     }
     const cond = lower.match(/\b(?:if|when)\b[^0-9]*?\b(below|under|above|over)\s*(?:rs\.?|₹)?\s*(\d[\d,]*(?:\.\d+)?)/);
-    const legs = parseLegs(cond ? msg.split(/\b(?:if|when)\b/i)[0] : msg);
+    const head = cond ? msg.split(/\b(?:if|when)\b/i)[0] : msg;
+    const legs = parseLegs(head.trim() ? head : msg.replace(/^.*?(?:,|\bthen\b)/i, ""));
+    for (const l of legs) l.symbol = l.symbol ?? findSymbol(msg);
+    // "Sell half my TCS": half of the shares you hold, rounded down to a whole share.
+    const halfM = /\bhalf\b/i.test(msg);
+    for (const l of legs) {
+      if (halfM && l.qty === null && l.symbol) {
+        const held = s.holdings.find((h) => h.symbol === l.symbol)?.qty ?? 0;
+        if (held >= 2) l.qty = Math.floor(held / 2);
+      }
+    }
     const missingSym = legs.find((l) => !l.symbol);
     const missingQty = legs.find((l) => l.symbol && !l.qty);
     if (!legs.length || missingSym) {
@@ -424,6 +654,26 @@ export async function simulateChat(
     list.push({ id: message_id, role: "assistant", text, cards, created_at: new Date().toISOString() });
     store.history.set(conversation_id, list);
   }
+}
+
+/** A plan the verifier computed from the account, shaped like the backend's: title in the summary, notes as issues. */
+function planProposal(msg: string, eng: string, steps: ProposalStep[], title: string, notes: Issue[]): Proposal {
+  return finalizeProposal({
+    id: newProposalId(),
+    kind: "PLAN",
+    status: "AWAITING_APPROVAL",
+    summary: `${title}: ${steps.map((st) => `(${st.step_no}) ${st.summary}`).join(" ; ")}`,
+    steps: steps.map((st, i) => (i === 0 ? { ...st, issues: [...notes, ...st.issues] } : st)),
+    mandate: null,
+    failure_policy: "STOP_ON_FAILURE",
+    issues: [...notes, ...steps.flatMap((st) => st.issues)],
+    can_approve: !steps.some((st) => st.issues.some((i) => i.severity === "BLOCK")),
+    interpretation: { user_text: msg, engine: eng, disagreements: [] },
+    approval: null,
+    execution: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
 }
 
 function sign(paise: number): string {

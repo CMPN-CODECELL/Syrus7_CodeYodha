@@ -34,6 +34,16 @@ import type {
 } from "../types";
 
 export const ACCOUNT_ID = "DEMO1";
+/** The simulated 021 Sandbox account in mock mode. Not a real UCC. */
+export const MOCK_UCC = "HACK4821";
+
+/** Next 05:00 IST, when a 021 access token expires. */
+export function next5amIst(now = Date.now()): string {
+  const IST = 5.5 * 3_600_000;
+  const local = new Date(now + IST);
+  const target = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), 5, 0, 0) - IST;
+  return new Date(target > now ? target : target + 86_400_000).toISOString();
+}
 
 // ---------------------------------------------------------------------------
 // Deterministic helpers
@@ -193,7 +203,7 @@ export interface HoldingSeed {
 }
 
 export const HOLDING_SEEDS: HoldingSeed[] = [
-  { symbol: "RELIANCE", qty: 40, avg: 264000 },
+  { symbol: "RELIANCE", qty: 70, avg: 264000 },
   { symbol: "INFY", qty: 60, avg: 148825 },
   { symbol: "TCS", qty: 15, avg: 328040 },
   { symbol: "HDFCBANK", qty: 50, avg: 160210 },
@@ -331,6 +341,32 @@ export function seedOrders(): BrokerOrder[] {
       status: "CANCELLED",
       placed_at: isoAgo(5 * HOUR),
       updated_at: isoAgo(4 * HOUR),
+    }),
+    base({
+      broker_order_id: "PB-260109-000702",
+      client_order_id: "CS-6b1d93e0f2-1",
+      instrument: INSTRUMENTS.HDFCBANK,
+      side: "SELL",
+      quantity: 20,
+      order_type: "SL",
+      limit_price_paise: 159500,
+      trigger_price_paise: 160000,
+      status: "TRIGGER_PENDING",
+      placed_at: isoAgo(70 * MIN),
+      updated_at: isoAgo(70 * MIN),
+    }),
+    base({
+      broker_order_id: "256159",
+      client_order_id: null,
+      instrument: INSTRUMENTS.ITC,
+      side: "BUY",
+      quantity: 1,
+      product: "MIS",
+      limit_price_paise: 45000,
+      status: "CANCELLED",
+      origin: "external",
+      placed_at: isoAgo(50 * MIN),
+      updated_at: isoAgo(49 * MIN),
     }),
     base({
       broker_order_id: "PB-260108-000611",
@@ -789,6 +825,7 @@ export function seedOutcomes(): OutcomeEvent[] {
     ...extra,
   });
   return [
+    o(48 * MIN, "EXTERNAL_ORDER", "info", "Order placed outside Countersign: BUY 1 ITC", "Found in the 021 order book (order 256159, now cancelled). Shown for information only: Countersign did not place it.", { broker_order_id: "256159" }),
     o(3 * MIN, "MANDATE_ARMED", "info", "Mandate armed: TATAMOTORS", "BUY 100 TATAMOTORS @ ₹900.00 LIMIT when LTP <= ₹900.00. One-shot, expires in 5 d."),
     o(9 * MIN, "MANDATE_NEEDS_REVIEW", "warning", "Mandate needs review: SBIN", "Price crossed ₹830.00 while the system was offline; it will not fire stale."),
     o(41 * MIN, "ORDER_ACCEPTED", "info", "Order accepted: BUY 50 SBIN", "Broker acknowledged PB-260108-000587 for client tag CS-a41f0d3c88-1.", { broker_order_id: "PB-260108-000587" }),

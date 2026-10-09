@@ -48,7 +48,7 @@ function me(): Me {
   return {
     ...m,
     email: u?.email ?? null,
-    account: { id: m.account_id, label: "Paper trading account" },
+    account: { id: m.account_id, label: "Paper trading account", kind: "paper" },
     onboarding: { pin_set: s.hasPin, passkeys, totp: s.hasTotp, complete: s.hasPin },
     demo_mode: true,
   };
@@ -337,11 +337,14 @@ export const mockApi: CountersignApi = {
     ),
   orders: (status) =>
     authed(() => {
-      const all = engine.s.orders;
+      // Orders placed outside Countersign only exist in the (simulated) 021 order book.
+      const all = engine.s.activeBroker === "021" ? engine.s.orders : engine.s.orders.filter((o) => o.origin !== "external");
       if (status === "open") return all.filter((o) => o.status === "OPEN" || o.status === "PARTIALLY_FILLED" || o.status === "TRIGGER_PENDING");
       if (status === "rejected") return all.filter((o) => o.status === "REJECTED");
       return all;
     }),
+  brokerAccounts: () => authed(() => engine.brokerAccounts(), [60, 140]),
+  setActiveBroker: (account_id) => authed(() => engine.setActiveBroker(account_id), [250, 450]),
 
   instruments: (q) =>
     authed(() => {
@@ -432,7 +435,16 @@ export const mockApi: CountersignApi = {
         detail: `All ${engine.s.audit.length} events link to their predecessor by SHA-256 prev_hash.`,
       };
     }, [500, 900]),
-  securityStatus: () => authed(() => engine.s.security, [50, 120]),
+  securityStatus: () =>
+    authed(() => {
+      const on021 = engine.s.activeBroker === "021";
+      const sec = engine.s.security;
+      return {
+        ...sec,
+        broker: { ...sec.broker, kind: engine.s.activeBroker, label: on021 ? "021 Sandbox" : "Paper broker" },
+        feed: { ...sec.feed, mode: on021 ? "live" : "replay" },
+      };
+    }, [50, 120]),
   securityEvents: (scope = "mine") =>
     authed(() => engine.s.securityEvents.filter((e) => scope === "all" || e.scope !== "drill")),
   killSwitch: (engaged, pin) => authed(() => engine.killSwitch(engaged, pin), [200, 380]),

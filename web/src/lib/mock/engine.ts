@@ -5,7 +5,9 @@ import { ApiError } from "../errors";
 import type {
   AttackRun,
   AuditEvent,
+  BrokerAccount,
   BrokerFault,
+  BrokerKind,
   BrokerOrder,
   Device,
   ExecutionState,
@@ -28,6 +30,8 @@ import {
   BASE,
   HOLDING_SEEDS,
   INSTRUMENTS,
+  MOCK_UCC,
+  next5amIst,
   OPTION_POSITION,
   SCENARIOS,
   WATCHLIST,
@@ -127,6 +131,8 @@ interface State {
   scoreboard: Scoreboard;
   runs: AttackRun[];
   pendingDeviceLabel: string;
+  /** Which linked broker account is active: the simulated 021 Sandbox or the paper account. */
+  activeBroker: BrokerKind;
 }
 
 const LOGIN_KEY = "cs_mock_logged_in";
@@ -391,6 +397,9 @@ function initialState(): State {
     positions: [
       { inst: OPTION_POSITION, product: "NRML", qty: 65, avg: 14250, prev: 13890 },
       { inst: INSTRUMENTS.SBIN, product: "MIS", qty: -50, avg: 81500, prev: 80890 },
+      { inst: INSTRUMENTS.RELIANCE, product: "MIS", qty: 25, avg: 283550, prev: 279510 },
+      { inst: INSTRUMENTS.HDFCBANK, product: "MIS", qty: -30, avg: 168000, prev: 168275 },
+      { inst: INSTRUMENTS.INFY, product: "MIS", qty: 40, avg: 151800, prev: 154105 },
     ],
     orders: seedOrders(),
     proposals: new Map(),
@@ -407,6 +416,7 @@ function initialState(): State {
     scoreboard: { unapproved_executions: 0, naive_unapproved_executions: 11, attacks_attempted: 18, attacks_blocked: 18, last_run_at: isoAgo(2 * HOUR) },
     runs: [],
     pendingDeviceLabel: "This device",
+    activeBroker: "021",
   };
   s.proposals = seedProposals(s);
   s.runs = [makeRun(SCENARIOS.map((sc) => sc.id), Date.now() - 2 * HOUR, s.scoreboard)];
@@ -445,6 +455,7 @@ class MockEngine {
     const saved = loadState();
     if (saved) {
       this.s = saved;
+      this.s.activeBroker = saved.activeBroker ?? "021";
       // Heartbeats saved before a reload are old news; the simulated processes are alive now.
       const now = new Date().toISOString();
       this.s.security.executor = { ...this.s.security.executor, last_heartbeat: now };
@@ -707,7 +718,48 @@ class MockEngine {
     this.s.proposals.set(id, { ...fn(p), updated_at: new Date().toISOString() });
   }
 
-  addProposal(p: Proposal) {
+  /** Account id that new proposals are drafted for: the mock UCC or the user's paper account. */
+  activeAccountId(): string {
+    return this.s.activeBroker === "021" ? MOCK_UCC : (findUser(this.s.userId)?.account_id ?? ACCOUNT_ID);
+  }
+
+  brokerAccounts(): BrokerAccount[] {
+    const paperId = findUser(this.s.userId)?.account_id ?? ACCOUNT_ID;
+    return [
+      {
+        account_id: MOCK_UCC,
+        kind: "021",
+        label: "021 Sandbox",
+        active: this.s.activeBroker === "021",
+        status: { connected: true, token_expires_at: next5amIst(), market_data: "live", last_error: null },
+      },
+      {
+        account_id: paperId,
+        kind: "paper",
+        label: "Paper trading account",
+        active: this.s.activeBroker !== "021",
+        status: { connected: true, token_expires_at: null, market_data: "replay", last_error: null },
+      },
+    ];
+  }
+
+  setActiveBroker(accountId: string) {
+    const acc = this.brokerAccounts().find((a) => a.account_id === accountId);
+    if (!acc) throw new ApiError(404, "ACCOUNT_NOT_FOUND", "That broker account is not linked to your Countersign account.");
+    this.s.activeBroker = acc.kind;
+    this.audit(`user:${this.s.userId ?? "demo"}`, "BROKER_ACCOUNT_SWITCHED", "account", acc.kind);
+    this.scheduleSave();
+    return { ok: true as const, account_id: acc.account_id };
+  }
+
+  addProposal(p0: Proposal) {
+    // Drafts belong to the active account, which is part of the signed canonical order.
+    const acct = this.activeAccountId();
+    const p: Proposal = {
+      ...p0,
+      steps: p0.steps.map((st) => ({ ...st, canonical: { ...st.canonical, account_id: acct } })),
+      mandate: p0.mandate?.template ? { ...p0.mandate, template: { ...p0.mandate.template, account_id: acct } } : p0.mandate,
+    };
     this.s.proposals.set(p.id, p);
     this.audit("api", "PROPOSAL_CREATED", "proposal", p.id);
     this.audit("verifier", p.status === "BLOCKED" ? "VERIFIER_BLOCKED" : "VERIFIER_PASSED", "proposal", p.id);
@@ -929,36 +981,86 @@ class MockEngine {
         results.push("SKIPPED");
         continue;
       }
+      const on021 = st.canonical.account_id === MOCK_UCC;
+      // 021 has no client order tag: the outbox id stays inside Countersign and is never sent to the broker.
       const tag = `CS-${p0.short_hash}-${st.step_no}`;
-      this.setStep(id, st.step_no, { state: "SUBMITTED", client_order_id: tag }, { client_order_id: tag, state: "SUBMITTED", attempts: 1 });
+      this.setStep(id, st.step_no, { state: "SUBMITTED", client_order_id: on021 ? null : tag }, { client_order_id: tag, state: "SUBMITTED", attempts: 1 });
       this.audit("executor", "ORDER_SUBMITTED", "order", tag);
       await sleep(700);
-      const fault = this.consumeFault();
       const label = `${st.canonical.side} ${st.canonical.quantity} ${st.canonical.instrument.symbol}`;
+      if (st.canonical.action === "MODIFY" && st.canonical.target_broker_order_id) {
+        const target = st.canonical.target_broker_order_id;
+        const c = st.canonical;
+        this.s.orders = this.s.orders.map((o) =>
+          o.broker_order_id === target
+            ? { ...o, trigger_price_paise: c.trigger_price_paise, limit_price_paise: c.limit_price_paise, updated_at: new Date().toISOString() }
+            : o,
+        );
+        this.setStep(id, st.step_no, { state: "OPEN", broker_order_id: target, reason: "Modify accepted. The stop-loss order stays pending until its trigger." }, { state: "OPEN", broker_order_id: target });
+        this.outcome("ORDER_ACCEPTED", "info", `Modify accepted: ${label}`, `Order ${target} now triggers at ${rs(c.trigger_price_paise ?? 0)}.`, { proposal_id: id, broker_order_id: target });
+        results.push("FILLED");
+        continue;
+      }
+      const fault = this.consumeFault();
+      if (fault === "unavailable_503") {
+        const reason = on021
+          ? "The broker returned 503 and the order is not in the 021 order book. Nothing was sent twice. Countersign again to resend."
+          : "The broker returned 503 and the order is not in its order book. Nothing was sent twice. Countersign again to resend.";
+        this.setStep(id, st.step_no, { state: "NOT_PLACED", reason }, { state: "NOT_PLACED", reconciled: true });
+        this.outcome("ORDER_NOT_PLACED", "danger", `Not placed: ${label}`, reason, { proposal_id: id });
+        this.audit("executor", "ORDER_NOT_PLACED", "order", tag);
+        results.push("NOT_PLACED");
+        continue;
+      }
+      if (fault === "timeout_unmatched") {
+        const reason = on021
+          ? "021 timed out and the executor could not match the order in the 021 order book. Countersign did not resend it. Check the order book before you place it again."
+          : "The broker timed out and the executor could not find the order in its order book. Countersign did not resend it. Check the order book before you place it again.";
+        this.setStep(id, st.step_no, { state: "NEEDS_REVIEW", reason }, { state: "NEEDS_REVIEW" });
+        this.outcome("ORDER_NEEDS_REVIEW", "warning", `Needs your review: ${label}`, reason, { proposal_id: id });
+        this.audit("executor", "ORDER_AMBIGUOUS", "order", tag);
+        results.push("NEEDS_REVIEW");
+        continue;
+      }
       if (fault === "connection_failure") {
-        this.setStep(id, st.step_no, { state: "FAILED", reason: "Broker connection failed. Reconciled by tag: no order exists at the broker, so nothing to retry." }, { state: "FAILED", reconciled: true });
-        this.outcome("ORDER_REJECTED", "danger", `Broker unreachable: ${label}`, `Connection failed for ${tag}. Reconciled: not at broker. Not retried automatically.`, { proposal_id: id });
+        const how = on021 ? "Matched against the 021 order book" : "Reconciled by tag";
+        this.setStep(id, st.step_no, { state: "FAILED", reason: `Broker connection failed. ${how}: no order exists at the broker, so nothing to retry.` }, { state: "FAILED", reconciled: true });
+        this.outcome("ORDER_REJECTED", "danger", `Broker unreachable: ${label}`, `Connection failed. ${how}: not at broker. Not retried automatically.`, { proposal_id: id });
         results.push("FAILED");
         continue;
       }
       if (fault === "reject") {
-        const brokerId = `PB-${fakeHash(tag).slice(0, 6).toUpperCase()}`;
+        const brokerId = on021 ? String(256160 + (parseInt(fakeHash(tag).slice(0, 4), 16) % 9000)) : `PB-${fakeHash(tag).slice(0, 6).toUpperCase()}`;
         this.setStep(id, st.step_no, { state: "REJECTED", broker_order_id: brokerId, reason: "RMS: Order price outside daily circuit band (simulated broker fault)." }, { state: "REJECTED", broker_order_id: brokerId });
-        this.pushOrder(st, brokerId, tag, "REJECTED", 0, "RMS: Order price outside daily circuit band (simulated broker fault).");
+        this.pushOrder(st, brokerId, on021 ? null : tag, "REJECTED", 0, "RMS: Order price outside daily circuit band (simulated broker fault).");
         this.outcome("ORDER_REJECTED", "danger", `Rejected by broker: ${label}`, "RMS rejected the order. Not retried; no compensating trade.", { proposal_id: id, broker_order_id: brokerId });
         results.push("REJECTED");
         continue;
       }
-      const brokerId = `PB-${fakeHash(tag).slice(0, 6).toUpperCase()}`;
+      const brokerId = on021 ? String(256160 + (parseInt(fakeHash(tag).slice(0, 4), 16) % 9000)) : `PB-${fakeHash(tag).slice(0, 6).toUpperCase()}`;
       if (fault === "accept_then_drop") {
         await sleep(1100);
         this.setStep(id, st.step_no, { state: "OPEN", broker_order_id: brokerId }, { state: "OPEN", broker_order_id: brokerId, reconciled: true });
-        this.outcome("RECONCILED", "info", `Reconciled, not retried: ${label}`, `Broker ack was lost. Executor found ${brokerId} by tag ${tag} and did not resend.`, { proposal_id: id, broker_order_id: brokerId });
-        this.audit("executor", "RECONCILED_BY_TAG", "order", tag);
+        this.outcome(
+          "RECONCILED",
+          "info",
+          `Reconciled, not retried: ${label}`,
+          on021
+            ? `Broker ack was lost. Executor matched order ${brokerId} in the 021 order book by its details and did not resend.`
+            : `Broker ack was lost. Executor found ${brokerId} by tag ${tag} and did not resend.`,
+          { proposal_id: id, broker_order_id: brokerId },
+        );
+        this.audit("executor", on021 ? "RECONCILED_BY_MATCH" : "RECONCILED_BY_TAG", "order", tag);
       } else {
         if (fault === "delay_ack") await sleep(1800);
         this.setStep(id, st.step_no, { state: "OPEN", broker_order_id: brokerId }, { state: "OPEN", broker_order_id: brokerId });
-        this.outcome("ORDER_ACCEPTED", "info", `Order accepted: ${label}`, `Broker acknowledged ${brokerId} for client tag ${tag}.`, { proposal_id: id, broker_order_id: brokerId });
+        this.outcome(
+          "ORDER_ACCEPTED",
+          "info",
+          `Order accepted: ${label}`,
+          on021 ? `021 accepted order ${brokerId}.` : `Broker acknowledged ${brokerId} for client tag ${tag}.`,
+          { proposal_id: id, broker_order_id: brokerId },
+        );
       }
       this.audit("broker", "ORDER_ACKNOWLEDGED", "order", brokerId);
       await sleep(900);
@@ -966,14 +1068,14 @@ class MockEngine {
       if (fault === "partial_fill") {
         const filled = Math.max(1, Math.floor(st.canonical.quantity / 2));
         this.setStep(id, st.step_no, { state: "PARTIALLY_FILLED", filled_quantity: filled, avg_fill_price_paise: fillPrice, reason: `Broker filled ${filled} of ${st.canonical.quantity}; remainder open.` }, { state: "PARTIALLY_FILLED" });
-        this.pushOrder(st, brokerId, tag, "PARTIALLY_FILLED", filled, null, fillPrice);
+        this.pushOrder(st, brokerId, on021 ? null : tag, "PARTIALLY_FILLED", filled, null, fillPrice);
         this.applyFill(st, filled, fillPrice);
         this.outcome("ORDER_PARTIALLY_FILLED", "warning", `Partially filled: ${label}`, `${filled} of ${st.canonical.quantity} filled @ ${rs(fillPrice)}. The rest stays open; nothing is retried.`, { proposal_id: id, broker_order_id: brokerId });
         results.push("PARTIALLY_FILLED");
         continue;
       }
       this.setStep(id, st.step_no, { state: "FILLED", filled_quantity: st.canonical.quantity, avg_fill_price_paise: fillPrice }, { state: "FILLED" });
-      this.pushOrder(st, brokerId, tag, "COMPLETE", st.canonical.quantity, null, fillPrice);
+      this.pushOrder(st, brokerId, on021 ? null : tag, "COMPLETE", st.canonical.quantity, null, fillPrice);
       this.applyFill(st, st.canonical.quantity, fillPrice);
       this.audit("broker", "ORDER_FILLED", "order", brokerId);
       this.outcome("ORDER_FILLED", "success", `Filled: ${label}`, `${st.canonical.quantity} @ ${rs(fillPrice)} avg.${opts.fromMandate ? " Fired by your standing mandate." : ""}`, { proposal_id: id, broker_order_id: brokerId });
@@ -981,24 +1083,47 @@ class MockEngine {
     }
     const allFilled = results.every((r) => r === "FILLED");
     const anyFilled = results.some((r) => r === "FILLED" || r === "PARTIALLY_FILLED");
-    const status: ProposalStatus = allFilled ? "COMPLETED" : anyFilled ? "PARTIALLY_COMPLETED" : "FAILED";
+    const anyReview = results.includes("NEEDS_REVIEW");
+    const independent = p0.failure_policy === "CONTINUE_ON_FAILURE" || (p0.steps.length > 1 && p0.steps.every((st) => !st.depends_on));
+    const status: ProposalStatus = allFilled ? "COMPLETED" : anyReview ? "NEEDS_REVIEW" : anyFilled ? "PARTIALLY_COMPLETED" : "FAILED";
     const p1 = this.s.proposals.get(id);
     this.setStatus(id, opts.fromMandate ? "COMPLETED" : status, {
-      execution: p1?.execution ? { ...p1.execution, status: allFilled ? "DONE" : anyFilled ? "DONE" : "REJECTED", reason: allFilled ? null : "Stopped on failure. No automatic compensating trades." } : null,
+      execution: p1?.execution
+        ? {
+            ...p1.execution,
+            status: allFilled || anyFilled ? "DONE" : "REJECTED",
+            reason: allFilled ? null : independent ? "Independent steps: each result reported, nothing retried or reversed." : "Stopped on failure. No automatic compensating trades.",
+          }
+        : null,
     });
     if (p0.kind === "PLAN") {
       const kind = allFilled ? "PLAN_COMPLETED" : anyFilled ? "PLAN_PARTIALLY_COMPLETED" : "PLAN_FAILED";
+      const count = (s: StepState) => results.filter((r) => r === s).length;
+      const parts = [
+        `${count("FILLED")} filled`,
+        count("PARTIALLY_FILLED") ? `${count("PARTIALLY_FILLED")} partially filled` : "",
+        count("REJECTED") + count("FAILED") ? `${count("REJECTED") + count("FAILED")} rejected` : "",
+        count("NOT_PLACED") ? `${count("NOT_PLACED")} not placed` : "",
+        count("NEEDS_REVIEW") ? `${count("NEEDS_REVIEW")} need review` : "",
+        count("SKIPPED") ? `${count("SKIPPED")} skipped` : "",
+      ].filter(Boolean);
       this.outcome(
         kind,
         allFilled ? "success" : anyFilled ? "warning" : "danger",
-        allFilled ? `Plan completed: ${results.length} of ${results.length} steps filled` : `Plan stopped: ${results.filter((r) => r === "FILLED").length} of ${results.length} steps filled`,
-        allFilled ? "One signature bound every step." : "Stop on failure: remaining steps skipped, no automatic compensating trades.",
+        allFilled
+          ? `Plan completed: ${results.length} of ${results.length} steps filled`
+          : `Plan ${independent ? "finished" : "stopped"}: ${parts.join(", ")} of ${results.length} step${results.length === 1 ? "" : "s"}`,
+        allFilled
+          ? "One signature bound every step."
+          : independent
+            ? `${parts.join(", ")}. Independent steps: nothing was retried or reversed for you.`
+            : "Stop on failure: remaining steps skipped, no automatic compensating trades.",
         { proposal_id: id },
       );
     }
   }
 
-  private pushOrder(st: ProposalStep, brokerId: string, tag: string, status: BrokerOrder["status"], filled: number, reason: string | null, avg?: number) {
+  private pushOrder(st: ProposalStep, brokerId: string, tag: string | null, status: BrokerOrder["status"], filled: number, reason: string | null, avg?: number) {
     const now = new Date().toISOString();
     const c = st.canonical;
     this.s.orders = [
@@ -1028,6 +1153,18 @@ class MockEngine {
 
   private applyFill(st: ProposalStep, qty: number, price: number) {
     const sym = st.canonical.instrument.symbol;
+    if (st.canonical.product === "MIS" || st.canonical.product === "INTRADAY") {
+      // Intraday: the fill moves the open position, not delivery holdings.
+      const signed = st.canonical.side === "BUY" ? qty : -qty;
+      const pos = this.s.positions.find((x) => x.inst.symbol === sym && (x.product === "MIS" || x.product === "INTRADAY"));
+      if (pos) {
+        pos.qty += signed;
+        if (pos.qty === 0) this.s.positions = this.s.positions.filter((x) => x !== pos);
+      } else if (INSTRUMENTS[sym]) {
+        this.s.positions.push({ inst: INSTRUMENTS[sym], product: "MIS", qty: signed, avg: price, prev: this.s.prices[sym]?.prev ?? price });
+      }
+      return;
+    }
     const h = this.s.holdings.find((x) => x.symbol === sym);
     if (st.canonical.side === "BUY") {
       if (h) {

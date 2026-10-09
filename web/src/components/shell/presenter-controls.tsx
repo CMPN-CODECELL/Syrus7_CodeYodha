@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Eyebrow } from "@/components/ui/panel";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { IS_MOCK } from "@/lib/env";
 import { errorMessage } from "@/lib/errors";
 import { useDemoActions, useDemoMode, useDemoState } from "@/lib/queries";
 import { useUiStore } from "@/lib/store";
@@ -39,6 +40,13 @@ const FAULTS: { id: BrokerFault; label: string; hint: string }[] = [
   { id: "reject", label: "Reject", hint: "RMS rejects the order" },
   { id: "partial_fill", label: "Partial fill", hint: "Half fills; plan stops" },
   { id: "connection_failure", label: "Connection fail", hint: "Broker unreachable" },
+  // Simulated in mock mode only: the outcomes the 021 gateway reports when the sandbox misbehaves.
+  ...(IS_MOCK
+    ? ([
+        { id: "unavailable_503", label: "503, not placed", hint: "Not in the order book: draft it again" },
+        { id: "timeout_unmatched", label: "Timeout, no match", hint: "Order needs your review" },
+      ] as const)
+    : []),
 ];
 
 const SYMBOLS = ["TATAMOTORS", "RELIANCE", "INFY", "TCS", "HDFCBANK", "SBIN", "ITC", "NIFTY"];
