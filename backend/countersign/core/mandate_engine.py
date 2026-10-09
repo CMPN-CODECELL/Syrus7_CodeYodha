@@ -19,12 +19,12 @@ from datetime import UTC, date, datetime, timedelta
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from countersign.core import audit, events, state
+from countersign.core import audit, events, market, state
 from countersign.core.broker_client import ReadGateway, read_gateway
 from countersign.core.config import settings
 from countersign.core.db import session_scope
 from countersign.core.market import IST, Tick
-from countersign.core.models import ExecJob, StandingMandate
+from countersign.core.models import Account, ExecJob, StandingMandate
 from countersign.core.money import inr
 from countersign.core.schemas import ALL_HOLDINGS_ID, CanonicalOrder
 from countersign.core.verifier import AccountState, verify_order
@@ -42,6 +42,11 @@ def predicate_true(m: StandingMandate, tick: Tick, avg_price: int | None) -> boo
     return False
 
 
+def _is_021(s: Session, account_id: str) -> bool:
+    acct = s.get(Account, account_id)
+    return acct is not None and acct.broker_kind == "021"
+
+
 def evaluate(
     s: Session, m: StandingMandate, tick: Tick, *, gateway: ReadGateway | None = None, engine_id: str = "engine-1", held: dict[str, dict] | None = None
 ) -> str:
@@ -54,6 +59,10 @@ def evaluate(
         audit.record(s, "mandate_engine", "MANDATE_EXPIRED", "mandate", m.id, {})
         return "EXPIRED"
     if tick.stale:
+        return "NONE"
+    if market.scenario_driven(tick.instrument_id) and _is_021(s, m.account_id):
+        # A demo scenario drives this price: a 021-account instruction never fires on simulated prices.
+        s.execute(text("UPDATE mandates SET last_evaluated_at=:ts WHERE id=:id AND state='ACTIVE'"), {"id": m.id, "ts": tick.ts})
         return "NONE"
     avg = None
     if m.predicate["field"] == "DROP_FROM_AVG_BPS" and (held is not None or gateway is not None):
@@ -155,7 +164,7 @@ def evaluate_holdings_alert(s: Session, m: StandingMandate, tick: Tick, held: di
         audit.record(s, "mandate_engine", "MANDATE_EXPIRED", "mandate", m.id, {})
         events.emit_mandate(m, "EXPIRED")
         return "EXPIRED"
-    if tick.stale or not held:
+    if tick.stale or not held or (market.scenario_driven(tick.instrument_id) and _is_021(s, m.account_id)):
         return "NONE"
     h = held.get(tick.instrument_id)
     if h is None or int(h.get("quantity") or 0) <= 0:

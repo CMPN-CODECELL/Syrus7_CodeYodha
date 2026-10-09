@@ -107,6 +107,20 @@ def latest(instrument_id: str) -> Tick | None:
     return Tick.from_json(raw) if raw else None
 
 
+SCENARIO_KEY = "cs:feed:override:{}"  # set by the replay feed while a demo scenario drives a 021-priced instrument
+
+
+def scenario_driven(instrument_id: str) -> bool:
+    """True while a demo scenario (presenter or Attack Lab) drives this instrument's price instead of the 021 feed.
+    Real 021 orders and 021-account standing instructions never act on those simulated prices. Fails closed."""
+    if not settings().gateway021_enabled:
+        return False
+    try:
+        return bool(events.client().exists(SCENARIO_KEY.format(instrument_id)))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def latest_many(instrument_ids: list[str]) -> dict[str, Tick]:
     if not instrument_ids:
         return {}
