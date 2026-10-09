@@ -46,6 +46,8 @@ def _price_refs(p: Proposal) -> list[PriceRef]:
     refs: dict[str, PriceRef] = {}
     band = settings().price_band_bps
     if p.kind == "MANDATE" and not p.steps_view:
+        if p.canonical.get("scope") == "ALL_HOLDINGS":
+            return []  # an alert over every holding never trades, so there is no single instrument price to bind
         iid = p.canonical["instrument"]["instrument_id"]
         tick = market.latest(iid)
         if tick is None:
