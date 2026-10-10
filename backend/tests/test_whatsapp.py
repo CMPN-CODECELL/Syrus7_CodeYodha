@@ -128,7 +128,7 @@ def test_link_and_verify_sends_code_then_welcome(api, tw):
     assert r.status_code == 200, r.text
     assert r.json()["phone_masked"] == "+91******3210" and r.json()["delivery"]["status"] == "SENT"
     assert tw.sent[-1]["To"] == "whatsapp:" + PHONE and tw.sent[-1]["From"] == "whatsapp:+14155238886"
-    assert tw.sent[-1]["Body"].startswith("Your Countersign verification code is ") and tw.sent[-1]["Body"].endswith("It expires in 10 minutes.")
+    assert tw.sent[-1]["Body"].startswith("*Countersign verification code*") and "It expires in 10 minutes." in tw.sent[-1]["Body"]
     st = c.get("/api/whatsapp").json()
     assert st["link"] == {"phone_masked": "+91******3210", "verified": False, "opted_in": True, "paused_until": None, "window_hint": None}
     assert st["mode"] == "live" and st["configured"] is True and st["sandbox"]["number"] == "+1 415 523 8886"
@@ -176,7 +176,7 @@ def test_log_only_mode_records_without_sending(api, tw, capsys):
     assert tw.sent == []
     out = capsys.readouterr().out
     assert "+91******3210" in out and PHONE not in out
-    code = re.search(r"code is (\d{6})", out).group(1)
+    code = re.search(r"code is \*?(\d{6})", out).group(1)
     assert c.post("/api/whatsapp/verify", json={"code": code}, headers=csrf(c)).json()["welcome"]["status"] == "LOGGED"
     st = c.get("/api/whatsapp").json()
     assert st["mode"] == "log_only" and st["configured"] is False
@@ -221,7 +221,7 @@ def test_unlink_prefs_and_test_message(api, tw):
     r = c.put("/api/whatsapp/prefs", json={"orders": False, "mandates": True, "security": True, "digests": True}, headers=csrf(c))
     assert r.json() == {"orders": False, "mandates": True, "security": True, "digests": True}
     assert c.post("/api/whatsapp/test", headers=csrf(c)).json()["status"] == "SENT"
-    assert tw.sent[-1]["Body"] == "Countersign test message: alerts are working."
+    assert tw.sent[-1]["Body"] == "*Countersign test message*\nYour WhatsApp alerts are working."
     assert c.put("/api/whatsapp/prefs", json={"orders": True}, headers={}).status_code == 403  # CSRF still applies
     assert c.delete("/api/whatsapp/link", headers=csrf(c)).json() == {"unlinked": True}
     assert c.get("/api/whatsapp").json()["link"] is None
@@ -274,7 +274,7 @@ def test_trading_verbs_are_refused(api, tw, verb):
     main, _ = api
     linked(main, tw)
     msg = reply_of(inbound(main, verb))
-    assert msg == "WhatsApp can't place or approve orders. Open Countersign to draft and countersign: https://countersign.everyrepo.me/copilot"
+    assert msg == "*WhatsApp can't place or approve orders*\n\nFor your safety, trades are drafted and countersigned only in the app:\nhttps://countersign.everyrepo.me/copilot"
 
 
 def test_read_only_commands(api, tw, monkeypatch):
@@ -286,28 +286,28 @@ def test_read_only_commands(api, tw, monkeypatch):
     set_tick("NSE:EQ:INFY", 186000, prev=185000)
     set_tick("NSE:EQ:RELIANCE", 120760, prev=121245)
     assert "PNL" in reply_of(inbound(main, "help"))
-    assert "P&L today" in reply_of(inbound(main, "PNL"))
+    assert "*Your P&L*" in reply_of(inbound(main, "PNL")) and "- Today: *" in reply_of(inbound(main, "PNL"))
     h = reply_of(inbound(main, "HOLDINGS"))
-    assert "INFY 100 @ ₹1,820.40" in h and "LTP ₹1,860.00" in h
-    assert reply_of(inbound(main, "POSITIONS")) == "No open positions."
-    assert reply_of(inbound(main, "ORDERS")) == "No orders today."
-    assert reply_of(inbound(main, "PRICE RELIANCE")) == "RELIANCE ₹1,207.60 (−0.4% today)"
-    assert reply_of(inbound(main, "MANDATES")) == "No active standing instructions."
-    assert "Watching RELIANCE every 5 minutes, only when it moves 0.5% or more" in reply_of(inbound(main, "WATCH RELIANCE 5 0.5%"))
+    assert "*INFY* · 100 shares" in h and "Avg ₹1,820.40" in h and "LTP ₹1,860.00" in h
+    assert reply_of(inbound(main, "POSITIONS")) == "*Positions*\nNo open positions."
+    assert reply_of(inbound(main, "ORDERS")) == "*Orders*\nNo orders today."
+    assert reply_of(inbound(main, "PRICE RELIANCE")) == "*RELIANCE* ₹1,207.60\n−0.4% today"
+    assert reply_of(inbound(main, "MANDATES")) == "*Standing instructions*\nYou have no active standing instructions."
+    assert reply_of(inbound(main, "WATCH RELIANCE 5 0.5%")) == "*Watching RELIANCE*\nAn update every 5 minutes, only when it moves 0.5% or more.\nSend *UNWATCH RELIANCE* to stop."
     assert "2, 5, 10, 15 or 30" in reply_of(inbound(main, "WATCH RELIANCE 7"))
     assert "No instrument" in reply_of(inbound(main, "WATCH NOSUCHSYMBOLX 5")) or "match" in reply_of(inbound(main, "WATCH NOSUCHSYMBOLX 5"))
-    assert reply_of(inbound(main, "WATCHES")) == "Watches:\nRELIANCE every 5 min, min move 0.5%"
+    assert reply_of(inbound(main, "WATCHES")) == "*Your price watches* (1)\n\n- *RELIANCE* every 5 min, on a 0.5% move"
     assert c.get("/api/whatsapp").json()["watches"][0]["symbol"] == "RELIANCE"
-    assert reply_of(inbound(main, "UNWATCH RELIANCE")) == "Stopped watching RELIANCE."
+    assert reply_of(inbound(main, "UNWATCH RELIANCE")) == "*Watch stopped*\nNo more updates for RELIANCE."
     assert "No watches" in reply_of(inbound(main, "WATCHES"))
     assert "paused for 2 hours" in reply_of(inbound(main, "PAUSE 2H"))
     assert c.get("/api/whatsapp").json()["link"]["paused_until"] is not None
-    assert reply_of(inbound(main, "RESUME")) == "Alerts resumed."
+    assert reply_of(inbound(main, "RESUME")) == "*Alerts resumed*\nYou will get alerts again."
     assert c.get("/api/whatsapp").json()["link"]["paused_until"] is None
     assert "Alerts stopped" in reply_of(inbound(main, "STOP"))
     assert c.get("/api/whatsapp").json()["link"]["opted_in"] is False
     assert c.post("/api/whatsapp/test", headers=csrf(c)).json()["status"] == "OPTED_OUT"
-    assert "Send START" in reply_of(inbound(main, "PNL"))
+    assert "Send *START*" in reply_of(inbound(main, "PNL"))
     assert "back on" in reply_of(inbound(main, "START"))
     assert "Unknown command" in reply_of(inbound(main, "FOO"))
     with session_scope() as s:
@@ -346,21 +346,21 @@ def test_mandate_armed_triggered_filled_and_cancelled_notifications(tw, account)
     mid, pid = _lab_mandate(account)
     assert _pump() == 1
     body = tw.sent[-1]["Body"]
-    assert body.startswith("Armed: if INFY falls to ₹1,800.00 or below, buy 10 (limit ₹")
-    assert "Fires once. Expires " in body
+    assert body.startswith("*Standing instruction armed*\n\nIf INFY falls to ₹1,800.00 or below, buy 10 (limit ₹")
+    assert "Fires once · expires " in body
     assert _pump() == 0 and len(tw.sent) == 1  # exactly once
     with session_scope() as s:
         m = s.get(StandingMandate, mid)
         tick = Tick(instrument_id="NSE:EQ:INFY", symbol="INFY", ltp_paise=179500, bid_paise=179495, ask_paise=179505, volume=1, prev_close_paise=186000, ts=datetime.now(UTC), seq=5)
         assert evaluate(s, m, tick, gateway=FakeGateway()) == "TRIGGERED"
     _pump()
-    assert tw.sent[-1]["Body"].startswith("Triggered: INFY at ₹1,795.00.")
+    assert tw.sent[-1]["Body"].startswith("*Standing instruction triggered*\nINFY at ₹1,795.00")
     with session_scope() as s:
         state.outcome(s, "ORDER_FILLED", "Filled: BUY 10 INFY", "Average ₹1,795.00 (order B000001).", "success", proposal_id=pid, account_id="LAB1")
         state.outcome(s, "ORDER_REJECTED", "Rejected: BUY 10 INFY", "RMS: insufficient funds", "danger", proposal_id=pid, account_id="LAB1")
     _pump()
-    assert tw.sent[-2]["Body"] == "Standing instruction: Filled: BUY 10 INFY. Average ₹1,795.00 (order B000001)."
-    assert tw.sent[-1]["Body"] == "Standing instruction: Rejected: BUY 10 INFY. RMS: insufficient funds"
+    assert tw.sent[-2]["Body"] == "*Order filled*\nBUY 10 INFY\n\nAverage ₹1,795.00 (order B000001).\n\n_From your standing instruction._"
+    assert tw.sent[-1]["Body"] == "*Order rejected*\nBUY 10 INFY\n\nRMS: insufficient funds\n\n_From your standing instruction._"
     # Expired and cancelled come from the audit chain.
     mid2, _ = _lab_mandate(account)
     with session_scope() as s:
@@ -369,7 +369,7 @@ def test_mandate_armed_triggered_filled_and_cancelled_notifications(tw, account)
 
         audit.record(s, "trader", "MANDATE_CANCELLED", "mandate", mid2, {})
     _pump()
-    assert tw.sent[-1]["Body"] == "Cancelled: your standing instruction on INFY was cancelled and can no longer fire."
+    assert tw.sent[-1]["Body"] == "*Standing instruction cancelled*\nYour instruction on INFY can no longer fire."
 
 
 def test_prefs_pause_and_opt_out_filter_alerts(tw, account):
@@ -381,7 +381,7 @@ def test_prefs_pause_and_opt_out_filter_alerts(tw, account):
         state.outcome(s, "ORDER_FILLED", "Filled: BUY 5 INFY", "Average ₹1,860.00.", "success", account_id="LAB1")
         state.outcome(s, "KILL_SWITCH", "Kill switch engaged", "Trader engaged it", "danger", account_id="*")
     _pump()
-    assert [b["Body"][:40] for b in tw.sent] == ["Security: kill switch engaged. Countersi"]
+    assert [b["Body"][:22] for b in tw.sent] == ["*Kill switch engaged*\n"]
     with session_scope() as s:
         s.get(WhatsAppLink, uid).paused_until = datetime.now(UTC) + timedelta(hours=1)
         state.outcome(s, "KILL_SWITCH", "Kill switch released", "ok", "info", account_id="*")
@@ -415,9 +415,9 @@ def test_security_events_and_sign_in(api, tw):
         audit.record(s, "trader", "SESSION_CREATED", "session", sid, {"method": "password"})
     _pump()
     bodies = [b["Body"] for b in tw.sent]
-    assert any(b.startswith("Security: ") and "PIN" in b for b in bodies)
-    assert any("new sign-in to Countersign (Chrome on Windows, password)" in b for b in bodies)
-    assert sum("new sign-in" in b for b in bodies) == 1  # the sign-up session predates the cursor: never replayed
+    assert any(b.startswith("*Security alert*") and "PIN" in b for b in bodies)
+    assert any("*New sign-in to Countersign*\nChrome on Windows · password" in b for b in bodies)
+    assert sum("New sign-in" in b for b in bodies) == 1  # the sign-up session predates the cursor: never replayed
 
 
 def test_rate_limit_per_user(api, tw):
@@ -470,18 +470,18 @@ def test_watch_schedule_interval_min_move_and_market_hours(api, tw):
     with session_scope() as s:
         assert service.watches_once(s, t0) == 1
     assert len(tw.sent) == n + 1  # one message per user with every due watch
-    assert tw.sent[-1]["Body"] == "RELIANCE ₹1,207.60 (−0.4% today)\nINFY ₹1,860.00 (+0.5% today)"
+    assert tw.sent[-1]["Body"] == "*Price update*\n\n*RELIANCE* ₹1,207.60\n−0.4% today\n\n*INFY* ₹1,860.00\n+0.5% today"
     with session_scope() as s:
         assert service.watches_once(s, t0 + timedelta(minutes=1)) == 0  # not due yet
     set_tick("NSE:EQ:RELIANCE", 121000, prev=121245)
     set_tick("NSE:EQ:INFY", 186500, prev=185000)  # +0.27%: under INFY's 1% minimum move
     with session_scope() as s:
         assert service.watches_once(s, t0 + timedelta(minutes=2)) == 1
-    assert tw.sent[-1]["Body"] == "RELIANCE ₹1,210.00 (−0.2% today, +0.2% since last update)"
+    assert tw.sent[-1]["Body"] == "*Price update*\n\n*RELIANCE* ₹1,210.00\n−0.2% today · +0.2% since last update"
     set_tick("NSE:EQ:INFY", 190000, prev=185000)  # +2.2% since the last sent price
     with session_scope() as s:
         assert service.watches_once(s, t0 + timedelta(minutes=5, seconds=1)) == 1
-    assert "INFY ₹1,900.00 (+2.7% today, +2.2% since last update)" in tw.sent[-1]["Body"]
+    assert "*INFY* ₹1,900.00\n+2.7% today · +2.2% since last update" in tw.sent[-1]["Body"]
     # market_hours_only: nothing on a Saturday; sent on a weekday inside 09:15 to 15:30 IST.
     with session_scope() as s:
         s.execute(text("UPDATE whatsapp_watches SET market_hours_only = true, last_sent_at = NULL"))
@@ -545,11 +545,11 @@ def test_alert_texts_are_short_and_plain():
     from countersign.core.models import OutcomeRow
 
     r = OutcomeRow(id="o1", kind="ALERT", title="Alert: ITC is down 3.10% today", detail="ITC is down 3.10% today (vs previous close). This alert fires at most once per holding per trading day (event e1). No order was placed.", severity="warning", account_id="X")
-    assert service.outcome_text(r, None) == "Alert: ITC is down 3.10% today. No order was placed."
+    assert service.outcome_text(r, None) == "*Price alert*\nITC is down 3.10% today\n\n_No order was placed._"
     m = StandingMandate(instrument_id="PORTFOLIO:HOLDINGS", kind="ALERT", predicate={"field": "DAY_CHANGE_BPS", "op": "LTE", "threshold": -300}, expires_at=datetime(2026, 10, 17, 10, 0, tzinfo=UTC))
-    assert service.armed_text(m) == "Armed: if any holding is down 3.0% or more today, alert you (no order is placed). At most once per holding per day. Expires 17 Oct."
+    assert service.armed_text(m) == "*Standing instruction armed*\n\nIf any holding is down 3.0% or more today, alert you (no order is placed).\nAt most once per holding per day · expires 17 Oct"
     m = StandingMandate(instrument_id="NSE:EQ:RELIANCE", kind="ORDER", predicate={"field": "LTP", "op": "LTE", "threshold": 115000}, template={"side": "BUY", "quantity": 10, "limit_price_paise": 115000}, expires_at=datetime(2026, 10, 17, 10, 0, tzinfo=UTC))
-    assert service.armed_text(m) == "Armed: if RELIANCE falls to ₹1,150.00 or below, buy 10 (limit ₹1,150.00). Fires once. Expires 17 Oct."
+    assert service.armed_text(m) == "*Standing instruction armed*\n\nIf RELIANCE falls to ₹1,150.00 or below, buy 10 (limit ₹1,150.00).\nFires once · expires 17 Oct"
 
 
 def test_api_health_reports_no_twilio_credentials(api):
