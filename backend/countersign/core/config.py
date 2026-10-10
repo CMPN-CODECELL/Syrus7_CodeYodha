@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     executor_021_timeout_s: float = 45.0
     funds_021_daily_paise: int = 10_00_000_00  # virtual funds 021 tops up every trading day (no funds API exists)
 
+    # WhatsApp alerts. The Twilio account SID, auth token and sender live ONLY in the notifier process
+    # (notifier/settings.py); every other process reaches it over loopback with the shared notifier key.
+    notifier_url: str = "http://127.0.0.1:8300"
+    notifier_key: str = ""  # shared secret between the API and the notifier (scripts/dev.py generates it)
+    whatsapp_public_url: str = "https://countersign.everyrepo.me/api/whatsapp/inbound"  # the URL Twilio signs
+    whatsapp_join_code: str = ""  # optional: the sandbox join code ("join <code>"), shown to traders; not a secret
+
     @property
     def owners_021(self) -> set[str]:
         return {e.strip().lower() for e in self.owner_emails_021.split(",") if e.strip()}

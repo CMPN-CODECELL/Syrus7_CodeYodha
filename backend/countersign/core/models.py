@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -485,6 +486,86 @@ class AttackRunRow(Base):
     finished_at: Mapped[datetime | None] = mapped_column(TS)
     results: Mapped[list] = mapped_column(JSONB, default=list)
     scoreboard: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+# ------------------------------------------------------------------ WhatsApp alerts (notification and read-only channel)
+
+
+class WhatsAppLink(Base):
+    """A trader's WhatsApp number. Messages go only to a verified, opted-in, unpaused link. WhatsApp can never approve,
+    place, modify or cancel anything."""
+
+    __tablename__ = "whatsapp_links"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    phone_e164: Mapped[str] = mapped_column(String(20), index=True)
+    verified_at: Mapped[datetime | None] = mapped_column(TS)
+    opted_in: Mapped[bool] = mapped_column(Boolean, default=True)
+    paused_until: Mapped[datetime | None] = mapped_column(TS)
+    last_inbound_at: Mapped[datetime | None] = mapped_column(TS)  # a message from the trader reopens the 24-hour window
+    window_closed_at: Mapped[datetime | None] = mapped_column(TS)  # last Twilio 63016 (outside the 24-hour window)
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+
+
+class WhatsAppCode(Base):
+    """Single-use 6-digit verification code (stored hashed), valid for 10 minutes and at most 5 attempts."""
+
+    __tablename__ = "whatsapp_codes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    phone_e164: Mapped[str] = mapped_column(String(20))
+    code_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(TS)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    used_at: Mapped[datetime | None] = mapped_column(TS)
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+
+
+class WhatsAppPrefs(Base):
+    __tablename__ = "whatsapp_prefs"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    orders: Mapped[bool] = mapped_column(Boolean, default=True)
+    mandates: Mapped[bool] = mapped_column(Boolean, default=True)
+    security: Mapped[bool] = mapped_column(Boolean, default=True)
+    digests: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class WhatsAppWatch(Base):
+    __tablename__ = "whatsapp_watches"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    instrument_id: Mapped[str] = mapped_column(String(64))
+    symbol: Mapped[str] = mapped_column(String(64))
+    interval_min: Mapped[int] = mapped_column(Integer)
+    min_move_pct: Mapped[float | None] = mapped_column(Float)
+    market_hours_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_sent_at: Mapped[datetime | None] = mapped_column(TS)
+    last_price_paise: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(TS, server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("interval_min in (2,5,10,15,30)", name="ck_wa_watch_interval"),
+        UniqueConstraint("user_id", "instrument_id", name="uq_wa_watch_user_instrument"),
+    )
+
+
+class WhatsAppMessage(Base):
+    """Log of every WhatsApp message (out and in). Phones are stored masked; bodies only as a hash and a short preview."""
+
+    __tablename__ = "whatsapp_messages"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    ts: Mapped[datetime] = mapped_column(TS, server_default=func.now(), index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    direction: Mapped[str] = mapped_column(String(3), default="out")  # out | in
+    kind: Mapped[str] = mapped_column(String(24))
+    phone_masked: Mapped[str] = mapped_column(String(24))
+    body_hash: Mapped[str] = mapped_column(String(64))
+    preview: Mapped[str] = mapped_column(String(96))
+    status: Mapped[str] = mapped_column(String(24))
+    twilio_sid: Mapped[str | None] = mapped_column(String(64))
+    error_code: Mapped[int | None] = mapped_column(Integer)
+    source_ref: Mapped[str | None] = mapped_column(String(96))  # the event a notification came from (exactly once per user)
+    checked_at: Mapped[datetime | None] = mapped_column(TS)  # when the delivery status was last read back from Twilio
+    __table_args__ = (UniqueConstraint("user_id", "source_ref", name="uq_wa_message_source"),)
 
 
 AUDIT_GUARD_SQL = """
