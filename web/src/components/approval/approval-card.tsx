@@ -165,7 +165,7 @@ export function ApprovalCard({ proposal, className }: { proposal: Proposal; clas
             {proposal.execution && <span className="num text-[11px] text-subtle">job {proposal.execution.job_id}</span>}
           </div>
           <ExecutionTimeline proposal={proposal} />
-          {delivery && <DeliveryNotice proposal={proposal} step={step} className="mt-3" />}
+          {(delivery || step.state === "PARTIALLY_FILLED") && <DeliveryNotice proposal={proposal} step={step} className="mt-3" />}
         </div>
       )}
 

@@ -66,7 +66,7 @@ function fillItem(step: ProposalStep | undefined, delivery: "NOT_PLACED" | "AMBI
       key: "fill",
       title: "Partially filled",
       state: "warn",
-      detail: step?.reason ?? `${qty(step?.filled_quantity ?? 0)} of ${qty(q)} filled; remainder open, nothing retried.`,
+      detail: step?.reason ?? `${qty(step?.filled_quantity ?? 0)} of ${qty(q)} filled. The broker is holding the rest; nothing is resent or topped up.`,
     };
   if (st === "REJECTED") return { key: "fill", title: "Rejected by broker", state: "failed", detail: step?.reason ?? "Broker rejected the order. Not retried." };
   if (st === "FAILED") return { key: "fill", title: "Failed", state: "failed", detail: step?.reason ?? "Execution failed. Not retried automatically." };

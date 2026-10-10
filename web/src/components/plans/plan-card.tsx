@@ -112,7 +112,7 @@ function StepRow({ step, proposal, defaultOpen }: { step: ProposalStep; proposal
           {step.preview && <PriceBandMeter preview={step.preview} instrumentId={c.instrument.instrument_id} active={awaiting} />}
           {issues.length > 0 && <IssuesList issues={issues} />}
           {SIGNED.includes(proposal.status) && <ExecutionTimeline proposal={proposal} stepNo={step.step_no} />}
-          {delivery ? (
+          {delivery || step.state === "PARTIALLY_FILLED" ? (
             <DeliveryNotice proposal={proposal} step={step} />
           ) : (
             step.reason && <p className="text-xs text-warning">{step.reason}</p>
