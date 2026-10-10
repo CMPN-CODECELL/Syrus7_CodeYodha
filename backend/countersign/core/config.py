@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     owner_emails_021: str = Field("", validation_alias=AliasChoices("CS_021_OWNER_EMAILS"))
     strict_monitor_021: bool = Field(False, validation_alias=AliasChoices("CS_021_STRICT_MONITOR"))
     executor_021_timeout_s: float = 45.0
+    # 021's sandbox fills about half of any order above one share and holds the rest, so orders on a 021 account are
+    # signed once and sent as one-share orders (never more in total than signed). Off: send each order whole.
+    slice_021: bool = Field(True, validation_alias=AliasChoices("CS_021_SLICE"))
     funds_021_daily_paise: int = 10_00_000_00  # virtual funds 021 tops up every trading day (no funds API exists)
 
     # WhatsApp alerts. The Twilio account SID, auth token and sender live ONLY in the notifier process

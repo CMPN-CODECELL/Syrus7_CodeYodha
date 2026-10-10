@@ -17,9 +17,10 @@ from countersign.core import audit, events, state
 from countersign.core.canonical import canonical_hash, short
 from countersign.core.models import Approval, ExecJob, OutboxEntry, Plan, PlanStep, Proposal, StandingMandate
 from countersign.core.parser import Facts, detect_cancel_all, detect_exit_losers, detect_rebalance, extract_facts
-from countersign.core.schemas import CanonicalMandate, CanonicalOrder, CanonicalPlan, MandateIntent, OrderIntent, PlanIntent, iso
+from countersign.core.schemas import CanonicalMandate, CanonicalOrder, CanonicalPlan, FieldRow, Issue, MandateIntent, OrderIntent, OrderType, PlanIntent, iso
 from countersign.core.verifier import (
     MAX_GENERATED_PLAN_STEPS,
+    MAX_PLAN_STEPS,
     AccountState,
     PlanDraft,
     build_cancel_all_plan,
@@ -34,6 +35,92 @@ from countersign.core.verifier import (
     verify_order,
     verify_plan,
 )
+
+
+MAX_SLICED_ORDERS = 20  # one-share orders per signature when an order is sliced for 021
+
+
+@dataclass
+class Sliced:
+    orders: list[CanonicalOrder]
+    depends: list[int | None]
+    origin: list[int]  # index of the step each one-share order came from
+    note: Issue
+
+
+def _sliceable(o: CanonicalOrder) -> bool:
+    return o.action == "PLACE" and o.quantity > 1 and o.instrument.segment == "EQ" and o.order_type in (OrderType.MARKET, OrderType.LIMIT)
+
+
+def slice_for_021(orders: list[CanonicalOrder], depends: list[int | None], account_id: str) -> Sliced | None:
+    """021's sandbox fills only about half of an order above one share and holds the rest open, while a one-share
+    order fills whole. On a 021 account each such step is signed as one-share steps that run one after another and
+    stop at the first that does not fill, so the total sent never exceeds what was asked for and nothing is resent."""
+    from countersign.core.broker_client import broker_kind
+    from countersign.core.config import settings
+
+    if not settings().slice_021 or broker_kind(account_id) != "021" or not any(_sliceable(o) for o in orders):
+        return None
+    if sum(o.quantity if _sliceable(o) else 1 for o in orders) > MAX_SLICED_ORDERS:
+        return None
+    out: list[CanonicalOrder] = []
+    deps: list[int | None] = []
+    origin: list[int] = []
+    last_of: dict[int, int] = {}  # original step number -> new step number of its last order
+    for i, o in enumerate(orders):
+        n = o.quantity if _sliceable(o) else 1
+        first_dep = last_of.get(depends[i]) if depends[i] else None
+        for k in range(n):
+            out.append(o.model_copy(update={"quantity": 1}) if n > 1 else o)
+            deps.append(first_dep if k == 0 else len(out) - 1)
+            origin.append(i)
+        last_of[i + 1] = len(out)
+    parts = [f"{o.side.value.lower()} {o.quantity} {o.instrument.symbol}" for o in orders if _sliceable(o)]
+    note = Issue(
+        code="SLICE_021",
+        severity="INFO",
+        message=f"021's sandbox fills only part of any order above one share and holds the rest, so {', '.join(parts)} is sent as one-share orders, "
+        "each after the previous one fills. You sign once; the total never exceeds what you asked for, and if one does not fill the rest are not sent.",
+    )
+    return Sliced(out, deps, origin, note)
+
+
+def _slice_fields(fields: list[FieldRow], k: int, n: int) -> list[FieldRow]:
+    if n <= 1:
+        return fields
+    return [f.model_copy(update={"display": f"1 (share {k} of {n})", "note": f"Your {n} are sent as {n} one-share orders to 021."}) if f.key == "quantity" else f for f in fields]
+
+
+def _persist_sliced(
+    s: Session,
+    sl: Sliced,
+    originals: list[CanonicalOrder],
+    builds: list,
+    *,
+    user_id: str,
+    account: AccountState,
+    engine: str,
+    user_text: str,
+    conversation_id: str | None,
+    origin: str,
+) -> Proposal:
+    plan = build_plan(sl.orders, account.account_id, sl.depends)
+    per_issues, previews, plan_issues = verify_plan(s, plan, account, max_steps=MAX_SLICED_ORDERS)
+    seen: set[str] = set()
+    plan_issues = [sl.note] + [i for i in plan_issues if not (i.code in seen or seen.add(i.code))]
+    counts = [sum(1 for j in sl.origin if j == i) for i in range(len(originals))]
+    nth: dict[int, int] = {}
+    steps_view = []
+    for idx, st in enumerate(plan.steps):
+        i = sl.origin[idx]
+        nth[i] = nth.get(i, 0) + 1
+        steps_view.append(_step_view(st.step_no, st.order, _slice_fields(builds[i].fields, nth[i], counts[i]), previews[idx], builds[i].issues + per_issues[idx], st.depends_on))
+    disagreements = [d.model_dump() for b in builds for d in b.disagreements]
+    said = " ; then ".join(summarize(o) for o in originals)
+    return _persist_plan(
+        s, plan, steps_view, plan_issues, f"{said}, sent to 021 as {len(plan.steps)} one-share orders", disagreements,
+        user_id=user_id, account=account, engine=engine, user_text=user_text, conversation_id=conversation_id, origin=origin,
+    )
 
 
 @dataclass
@@ -116,6 +203,10 @@ def create_order(
     br = build_order(s, intent, facts, account, engine=engine)
     if br.clarify and br.canonical is None:
         return Outcome(clarify=br.clarify)
+    sl = slice_for_021([br.canonical], [None], account.account_id) if not [i for i in br.issues if i.severity == "BLOCK"] else None
+    if sl is not None:
+        p = _persist_sliced(s, sl, [br.canonical], [br], user_id=user_id, account=account, engine=engine, user_text=user_text, conversation_id=conversation_id, origin=origin)
+        return Outcome(proposal=p)
     issues = list(br.issues)
     v_issues, preview = verify_order(s, br.canonical, account)
     issues += v_issues
@@ -184,6 +275,10 @@ def create_plan(
         builds.append(br)
         prev_sell = idx > 0 and orders[idx - 1].side.value == "SELL" and orders[idx - 1].action == "PLACE"
         depends.append(idx if (plan_intent.sequential and idx > 0 and (prev_sell or orders[idx - 1].action == "CANCEL")) else None)
+    sl = slice_for_021(orders, depends, account.account_id) if len(orders) <= MAX_PLAN_STEPS else None
+    if sl is not None:
+        p = _persist_sliced(s, sl, orders, builds, user_id=user_id, account=account, engine=engine, user_text=user_text, conversation_id=conversation_id, origin=origin)
+        return Outcome(proposal=p)
     plan = build_plan(orders, account.account_id, depends)
     per_issues, previews, plan_issues = verify_plan(s, plan, account)
     steps_view = []
