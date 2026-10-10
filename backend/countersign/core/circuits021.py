@@ -63,6 +63,9 @@ def day_start(now: float | None = None) -> float:
     return start - IST_OFFSET_S
 
 
+HOLD_S = 300  # a learned limit blocks for 5 minutes: 021's sandbox has refused a price once and accepted it minutes later
+
+
 def next_reset(now: float | None = None) -> float:
     """When learned limits expire: the next 08:00 IST."""
     return day_start(now) + 86400
@@ -95,7 +98,7 @@ def learn(instrument_id: str, *, lower: int | None = None, upper: int | None = N
     if not instrument_id or not (lower or upper) or at < day_start(now):
         return None
     key = KEY.format(instrument_id)
-    expire_at = int(next_reset(now))
+    expire_at = int(min(next_reset(now), at + HOLD_S))
     result: dict = {}
 
     def _update(pipe) -> None:
@@ -138,9 +141,10 @@ def learned(instrument_id: str, now: float | None = None) -> dict | None:
         return None
     if not val:
         return None
-    start = day_start(now)
+    now = time.time() if now is None else now
+    start = max(day_start(now), now - HOLD_S)
     out = dict(val)
     for side in ("lower", "upper"):
         if out.get(f"{side}_paise") and float(out.get(f"{side}_learned_at") or 0) < start:
-            out.pop(f"{side}_paise", None)  # learned on an earlier trading day: never applies today
+            out.pop(f"{side}_paise", None)  # learned more than HOLD_S ago or on an earlier trading day
     return out if (out.get("lower_paise") or out.get("upper_paise")) else None

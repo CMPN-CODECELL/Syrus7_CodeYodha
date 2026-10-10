@@ -77,7 +77,7 @@ def test_merge_never_widens():
     assert ch and down["upper_paise"] == 220000 and down["lower_paise"] == 211000
 
 
-def test_learn_never_widens_and_expires_at_the_next_8am_ist():
+def test_learn_never_widens_and_holds_for_five_minutes():
     iid = "NSE:EQ:TCS"
     assert circuits021.learn_from_refusal(iid, LIVE, source="t")["lower_paise"] == 210400
     circuits021.learn_from_refusal(iid, "Price 2,000.00 must be higher than the lower circuit limit 2,050.00", source="t")
@@ -86,7 +86,8 @@ def test_learn_never_widens_and_expires_at_the_next_8am_ist():
     got = circuits021.learned(iid)
     assert got["lower_paise"] == 210400 and got["upper_paise"] == 220000
     ttl = events.client().ttl(circuits021.KEY.format(iid))
-    assert abs(ttl - (circuits021.next_reset() - time.time())) < 5
+    assert abs(ttl - min(circuits021.HOLD_S, circuits021.next_reset() - time.time())) < 5
+    assert circuits021.learned(iid, now=time.time() + circuits021.HOLD_S + 1) is None  # a passing refusal stops blocking
 
 
 def test_trading_day_boundaries():
