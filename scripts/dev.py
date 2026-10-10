@@ -6,6 +6,10 @@ Credential zones are enforced at process launch: each process receives only the 
   api      : READ key + demo admin key + sandbox-only naive key; never the write key (it refuses to start if given one)
   monitor  : AUDIT (read-all) key only
   feed     : no keys
+  notifier : WhatsApp alerts (Twilio). The ONLY process that holds CS_TWILIO_ACCOUNT_SID, CS_TWILIO_AUTH_TOKEN and
+             CS_TWILIO_WHATSAPP_FROM (it reads them from .env itself; they are stripped from every other process). No
+             broker key. Without the Twilio settings it runs in log-only mode (messages are recorded, not sent).
+             The API reaches it on 127.0.0.1:8300 with the shared notifier key (.secrets/broker_keys.json "notifier").
   gateway021 (only when CS_021_UCC and CS_021_PASSWORD are set in .env): the 021 sandbox adapter. It verifies the
              read / write / admin / audit keys like the paper broker and is the ONLY process that loads the 021 UCC,
              password and access token (it reads them from .env itself; they are stripped from every other process).
@@ -37,8 +41,13 @@ def keys() -> dict:
     SECRETS.mkdir(exist_ok=True)
     p = SECRETS / "broker_keys.json"
     if not p.exists():
-        p.write_text(json.dumps({k: "cs_" + k + "_" + secrets.token_urlsafe(24) for k in ("read", "write", "admin", "naive", "audit")}, indent=2))
-    return json.loads(p.read_text())
+        p.write_text(json.dumps({k: "cs_" + k + "_" + secrets.token_urlsafe(24) for k in ("read", "write", "admin", "naive", "audit", "notifier")}, indent=2))
+    data = json.loads(p.read_text())
+    if "notifier" not in data:
+        # Installations created before WhatsApp alerts: add the shared API-to-notifier secret once.
+        data["notifier"] = "cs_notifier_" + secrets.token_urlsafe(24)
+        p.write_text(json.dumps(data, indent=2))
+    return data
 
 
 def has_021_credentials() -> bool:
@@ -102,7 +111,7 @@ def main() -> None:
     args = set(sys.argv[1:])
     k = keys()
     LOGS.mkdir(exist_ok=True)
-    base = {kk: v for kk, v in os.environ.items() if not kk.startswith(("CS_BROKER_", "CS_021_UCC", "CS_021_PASSWORD"))}
+    base = {kk: v for kk, v in os.environ.items() if not kk.startswith(("CS_BROKER_", "CS_021_UCC", "CS_021_PASSWORD", "CS_TWILIO_", "CS_NOTIFIER_KEY"))}
     base["PYTHONIOENCODING"] = "utf-8"
     base["PYTHONUNBUFFERED"] = "1"
     offline = "--offline" in args
@@ -132,8 +141,10 @@ def main() -> None:
     plan += [
         ("feed", ["-m", "countersign.feed.main"], {}, None),
         ("executor", ["-m", "countersign.executor.main"], {"CS_BROKER_WRITE_KEY": k["write"]}, None),
-        ("api", ["-m", "countersign.api.main"], {"CS_BROKER_READ_KEY": k["read"], "CS_BROKER_ADMIN_KEY": k["admin"], "CS_BROKER_NAIVE_KEY": k["naive"]}, 8000),
+        ("api", ["-m", "countersign.api.main"], {"CS_BROKER_READ_KEY": k["read"], "CS_BROKER_ADMIN_KEY": k["admin"], "CS_BROKER_NAIVE_KEY": k["naive"], "CS_NOTIFIER_KEY": k["notifier"]}, 8000),
         ("monitor", ["-m", "countersign.monitor.main"], {"CS_BROKER_AUDIT_KEY": k["audit"]}, None),
+        # Twilio values (if set in the shell) go to this process only; it also reads them from .env itself.
+        ("notifier", ["-m", "countersign.notifier.main"], {"CS_NOTIFIER_KEY": k["notifier"], **{kk: v for kk, v in os.environ.items() if kk.startswith("CS_TWILIO_")}}, 8300),
     ]
     procs: list[tuple[str, subprocess.Popen]] = []
     # Windows: no console window for any child (the stack runs hidden; nothing pops up on the screen).
@@ -142,8 +153,9 @@ def main() -> None:
         log = open(LOGS / f"{name}.log", "w", encoding="utf-8")
         p = subprocess.Popen([py(), *argv], cwd=BACKEND, env={**base, **env_extra}, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
         procs.append((name, p))
-        note = "; holds the 021 credentials" if name == "gateway021" else ""
-        print(f"  {name:9s} pid {p.pid}  (keys: {', '.join(x.split('_')[2].lower() for x in env_extra) or 'none'}{note})")
+        note = "; holds the 021 credentials" if name == "gateway021" else "; holds the Twilio credentials (log-only without them)" if name == "notifier" else ""
+        held = [x.split("_")[2].lower() if x.startswith("CS_BROKER_") else "notifier" for x in env_extra if x.startswith("CS_BROKER_") or x == "CS_NOTIFIER_KEY"]
+        print(f"  {name:9s} pid {p.pid}  (keys: {', '.join(held) or 'none'}{note})")
         if port:
             if not wait_port(port, 150 if name == "gateway021" else 90):
                 print(f"  ! {name} did not open port {port}; see .logs/{name}.log")
@@ -157,6 +169,7 @@ def main() -> None:
     print("  Web app   http://localhost:3000")
     print("  API       http://127.0.0.1:8000/docs")
     print("  Broker    http://127.0.0.1:8100/health")
+    print("  Notifier  http://127.0.0.1:8300/health   (WhatsApp alerts; log-only until CS_TWILIO_* are set in .env)")
     if use_021:
         print("  021       http://127.0.0.1:8200/health   (021 sandbox gateway)")
         owners = os.environ.get("CS_021_OWNER_EMAILS") or next((ln.split("=", 1)[1].strip() for f in (ROOT / ".env", ROOT / ".env.local") if f.exists() for ln in f.read_text(encoding="utf-8").splitlines() if ln.startswith("CS_021_OWNER_EMAILS=")), "")
