@@ -1041,7 +1041,7 @@ def verify_plan(
                 if o.product == Product.CNC:
                     adjust[o.instrument.instrument_id] = adjust.get(o.instrument.instrument_id, 0) - o.quantity
                 if not independent and any(x.side == Side.BUY for x in (p.order for p in plan.steps[st.step_no:])):
-                    plan_issues.append(Issue(code="PLAN_USES_PROCEEDS", severity="INFO", message=f"Later buy steps run only after step {st.step_no} fills (dependency is part of the signed plan)."))
+                    plan_issues.append(Issue(code="PLAN_USES_PROCEEDS", severity="INFO", message=f"Later buy steps run only after step {st.step_no} fills, fully or partly; if it fills nothing they are not sent (the dependency is part of the signed plan)."))
         per_issues.append(iss)
         previews.append(prev)
     for i, st in enumerate(plan.steps):

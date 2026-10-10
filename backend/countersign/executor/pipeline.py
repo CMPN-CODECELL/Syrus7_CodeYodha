@@ -723,8 +723,14 @@ def _order_from_request(s, ob: OutboxEntry) -> dict:
     raise KeyError(ob.step_no)
 
 
-def wait_for_fill(job_id: str, depends_on: int, timeout_s: float = 20.0) -> dict:
+def wait_for_fill(job_id: str, depends_on: int, timeout_s: float = 30.0) -> dict:
+    """A dependent step runs once the step it depends on has filled, fully or partly: 021's sandbox fills only part of
+    an order and holds the rest, and a step that filled nothing stops the plan. The broker is asked directly every
+    2 s, so a missed order update cannot hold the plan back."""
+    from countersign.executor import tracker
+
     deadline = time.time() + timeout_s
+    next_ask = time.time() + 1.0
     while time.time() < deadline:
         with session_scope() as s:
             job = s.get(ExecJob, job_id)
@@ -733,10 +739,21 @@ def wait_for_fill(job_id: str, depends_on: int, timeout_s: float = 20.0) -> dict
                 return {"filled": False, "reason": f"Step {depends_on} was never sent."}
             if ob.broker_status == "COMPLETE":
                 return {"filled": True}
+            if ob.broker_status == "PARTIALLY_FILLED" and (ob.filled_quantity or 0) > 0:
+                audit.record(s, "executor", "DEPENDENCY_PARTLY_FILLED", "job", job.id, {"step_no": depends_on, "filled": ob.filled_quantity})
+                return {"filled": True, "partial": True}
             if ob.broker_status in ("REJECTED", "CANCELLED") or ob.state in ("REJECTED_BY_BROKER", "FAILED", "NOT_PLACED", "NEEDS_REVIEW"):
                 return {"filled": False, "reason": f"Step {depends_on} ended {ob.broker_status or ob.state} (filled {ob.filled_quantity})."}
             if state.kill_switch(s)["engaged"]:
                 return {"filled": False, "reason": "Kill switch engaged."}
+            tag, acct = ob.client_order_id, s.get(Proposal, ob.proposal_id).account_id
+        if time.time() >= next_ask:
+            next_ask = time.time() + 2.0
+            try:
+                for o in broker(acct).orders(status="all", tag=tag):
+                    tracker.apply_with_retry(o)
+            except Exception:  # noqa: BLE001
+                pass  # the tracker's own updates still arrive; the deadline bounds the wait
         time.sleep(0.5)
     return {"filled": False, "reason": f"Step {depends_on} did not fill within {int(timeout_s)}s; dependent steps were not executed."}
 
