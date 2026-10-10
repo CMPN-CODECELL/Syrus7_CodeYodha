@@ -471,7 +471,10 @@ function SymbolSearch({ value, onChange }: { value: string; onChange: (v: string
     enabled: open && q.length >= 1,
     staleTime: 60_000,
   });
-  const hits = (res.data ?? []).filter((i) => i.segment === "EQ").slice(0, 6);
+  // The Attack Lab's look-alike stocks (a Greek letter inside "RELIANCE") are never offered for a watch.
+  const hits = (res.data ?? [])
+    .filter((i) => i.segment === "EQ" && !(i.flags ?? []).includes("LOOKALIKE_SYMBOL") && /^[\x20-\x7E]+$/.test(i.symbol))
+    .slice(0, 6);
   return (
     <div className="relative min-w-0 flex-1">
       <Input
