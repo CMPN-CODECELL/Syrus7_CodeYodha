@@ -18,6 +18,9 @@ import type {
   ProposalKind,
   ProposalStatus,
   SecurityEventScope,
+  WhatsAppPrefs,
+  WhatsAppState,
+  WhatsAppWatchBody,
 } from "./types";
 
 export const qk = {
@@ -47,6 +50,7 @@ export const qk = {
   demo: ["demo", "state"] as const,
   brokerAccounts: ["broker", "accounts"] as const,
   brokerStatus: ["broker", "status"] as const,
+  whatsapp: ["whatsapp"] as const,
 };
 
 export const ACTIVE_STATUSES: ProposalStatus[] = ["APPROVED", "EXECUTING"];
@@ -364,6 +368,67 @@ export function useDemoActions() {
     fault: useMutation({
       mutationFn: ({ mode, count }: { mode: BrokerFault; count?: number }) => api.demoBrokerFault(mode, count),
       onSuccess: () => void qc.invalidateQueries({ queryKey: qk.demo }),
+    }),
+  };
+}
+
+// WhatsApp alerts
+
+/** The server has no WhatsApp endpoints yet (or they are switched off): the UI shows one plain message instead. */
+export function whatsappUnavailable(e: unknown): boolean {
+  return isApiError(e) && [404, 405, 501, 503].includes(e.status);
+}
+
+/**
+ * GET /api/whatsapp. Resolves to null when this server does not offer WhatsApp alerts (404 or 503), so pages can show
+ * a plain "not available" state and the mandate card can stay quiet.
+ */
+export function useWhatsApp(enabled = true) {
+  return useQuery({
+    queryKey: qk.whatsapp,
+    enabled,
+    queryFn: async (): Promise<WhatsAppState | null> => {
+      try {
+        return await api.whatsapp();
+      } catch (e) {
+        if (whatsappUnavailable(e)) return null;
+        throw e;
+      }
+    },
+    retry: (count, err) => !(isApiError(err) && err.status < 500) && count < 1,
+    staleTime: 10_000,
+    refetchInterval: (q) => (q.state.data ? 20_000 : false),
+  });
+}
+
+/** Mutations over the WhatsApp settings; each refreshes GET /api/whatsapp when it lands. */
+export function useWhatsAppActions() {
+  const qc = useQueryClient();
+  const refresh = () => void qc.invalidateQueries({ queryKey: qk.whatsapp });
+  return {
+    link: useMutation({ mutationFn: (phone: string) => api.whatsappLink(phone), onSuccess: refresh }),
+    verify: useMutation({ mutationFn: (code: string) => api.whatsappVerify(code), onSuccess: refresh }),
+    unlink: useMutation({ mutationFn: () => api.whatsappUnlink(), onSuccess: refresh }),
+    prefs: useMutation({
+      mutationFn: (prefs: WhatsAppPrefs) => api.whatsappPrefs(prefs),
+      onMutate: (prefs) => {
+        const prev = qc.getQueryData<WhatsAppState | null>(qk.whatsapp);
+        if (prev) qc.setQueryData(qk.whatsapp, { ...prev, prefs });
+        return { prev };
+      },
+      onError: (_e, _v, ctx) => {
+        if (ctx?.prev) qc.setQueryData(qk.whatsapp, ctx.prev);
+      },
+      onSettled: refresh,
+    }),
+    pause: useMutation({ mutationFn: (minutes: number) => api.whatsappPause(minutes), onSuccess: refresh }),
+    resume: useMutation({ mutationFn: () => api.whatsappResume(), onSuccess: refresh }),
+    test: useMutation({ mutationFn: () => api.whatsappTest(), onSettled: refresh }),
+    addWatch: useMutation({ mutationFn: (body: WhatsAppWatchBody) => api.whatsappAddWatch(body), onSuccess: refresh }),
+    deleteWatch: useMutation({ mutationFn: (id: string) => api.whatsappDeleteWatch(id), onSuccess: refresh }),
+    toggleWatch: useMutation({
+      mutationFn: ({ id, active }: { id: string; active: boolean }) => api.whatsappSetWatchActive(id, active),
+      onSuccess: refresh,
     }),
   };
 }

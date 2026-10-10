@@ -814,3 +814,60 @@ export type LiveEvent =
   | { type: "monitor"; data: MonitorStatus }
   | { type: "audit"; data: { id: number; event_type: string; ts: ISO } }
   | { type: "ping"; data: unknown };
+
+// WhatsApp alerts: a notification and read-only channel. It can never approve, place, modify or cancel a trade.
+export type WhatsAppMode = "live" | "log_only";
+
+export interface WhatsAppLink {
+  phone_masked: string;
+  verified: boolean;
+  opted_in: boolean;
+  paused_until: ISO | null;
+  /** Server note on the 24 hour delivery window, e.g. when the last inbound message was. */
+  window_hint: string | null;
+}
+
+export interface WhatsAppPrefs {
+  orders: boolean;
+  mandates: boolean;
+  security: boolean;
+  digests: boolean;
+}
+
+export type WhatsAppInterval = 2 | 5 | 10 | 15 | 30;
+
+export interface WhatsAppWatch {
+  id: string;
+  symbol: string;
+  interval_min: number;
+  min_move_pct: number | null;
+  market_hours_only: boolean;
+  active: boolean;
+  last_sent_at: ISO | null;
+  /** Last price sent, in rupees. */
+  last_price: number | null;
+}
+
+export interface WhatsAppMessage {
+  at: ISO;
+  kind: string;
+  status: string;
+  preview: string;
+}
+
+export interface WhatsAppState {
+  configured: boolean;
+  mode: WhatsAppMode;
+  sandbox: { number: string; join_hint: string };
+  link: WhatsAppLink | null;
+  prefs: WhatsAppPrefs;
+  watches: WhatsAppWatch[];
+  recent: WhatsAppMessage[];
+}
+
+export interface WhatsAppWatchBody {
+  symbol: string;
+  interval_min: WhatsAppInterval;
+  min_move_pct?: number;
+  market_hours_only?: boolean;
+}

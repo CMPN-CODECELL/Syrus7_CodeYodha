@@ -59,6 +59,10 @@ import type {
   StepUpBody,
   StepUpResult,
   Unlink021Result,
+  WhatsAppPrefs,
+  WhatsAppState,
+  WhatsAppWatch,
+  WhatsAppWatchBody,
 } from "./types";
 
 export { ApiError, errorMessage, isApiError } from "./errors";
@@ -150,6 +154,18 @@ export interface CountersignApi {
   demoReset(): Promise<unknown>;
   demoFeed(scenario: FeedScenario, symbol?: string): Promise<unknown>;
   demoBrokerFault(mode: BrokerFault, count?: number): Promise<unknown>;
+  // WhatsApp alerts: notifications and read-only commands. Nothing sent or received there can approve a trade.
+  whatsapp(): Promise<WhatsAppState>;
+  whatsappLink(phone: string): Promise<{ phone_masked: string; expires_at: string }>;
+  whatsappVerify(code: string): Promise<{ verified: true }>;
+  whatsappUnlink(): Promise<unknown>;
+  whatsappPrefs(prefs: WhatsAppPrefs): Promise<unknown>;
+  whatsappPause(minutes: number): Promise<unknown>;
+  whatsappResume(): Promise<unknown>;
+  whatsappAddWatch(body: WhatsAppWatchBody): Promise<WhatsAppWatch>;
+  whatsappDeleteWatch(id: string): Promise<unknown>;
+  whatsappSetWatchActive(id: string, active: boolean): Promise<unknown>;
+  whatsappTest(): Promise<unknown>;
   // Live events
   subscribe(handlers: LiveHandlers): () => void;
 }
@@ -233,7 +249,7 @@ async function toApiError(res: Response, method = "GET"): Promise<ApiError> {
   return new ApiError(status, `HTTP_${status}`, `The API returned HTTP ${status} for ${where}.`);
 }
 
-async function request<T>(method: "GET" | "POST" | "PUT" | "DELETE", path: string, body?: unknown): Promise<T> {
+async function request<T>(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET") Object.assign(headers, stateChangingHeaders());
@@ -370,6 +386,18 @@ export const realApi: CountersignApi = {
   demoReset: () => request("POST", "/api/demo/reset"),
   demoFeed: (scenario, symbol) => request("POST", "/api/demo/feed", symbol ? { scenario, symbol } : { scenario }),
   demoBrokerFault: (mode, count) => request("POST", "/api/demo/broker-fault", count ? { mode, count } : { mode }),
+
+  whatsapp: () => request("GET", "/api/whatsapp"),
+  whatsappLink: (phone) => request("POST", "/api/whatsapp/link", { phone }),
+  whatsappVerify: (code) => request("POST", "/api/whatsapp/verify", { code }),
+  whatsappUnlink: () => request("DELETE", "/api/whatsapp/link"),
+  whatsappPrefs: (prefs) => request("PUT", "/api/whatsapp/prefs", prefs),
+  whatsappPause: (minutes) => request("POST", "/api/whatsapp/pause", { minutes }),
+  whatsappResume: () => request("POST", "/api/whatsapp/resume"),
+  whatsappAddWatch: (body) => request("POST", "/api/whatsapp/watches", body),
+  whatsappDeleteWatch: (id) => request("DELETE", `/api/whatsapp/watches/${enc(id)}`),
+  whatsappSetWatchActive: (id, active) => request("PATCH", `/api/whatsapp/watches/${enc(id)}`, { active }),
+  whatsappTest: () => request("POST", "/api/whatsapp/test"),
 
   subscribe: (handlers) => connectLiveEvents(handlers),
 };
