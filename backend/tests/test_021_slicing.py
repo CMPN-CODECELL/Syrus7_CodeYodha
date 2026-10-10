@@ -17,6 +17,7 @@ ACCT = "HACKSLICE"
 @pytest.fixture
 def acct021(monkeypatch):
     monkeypatch.setattr(settings(), "gateway021_enabled", True)
+    monkeypatch.setattr(settings(), "slice_021", True)  # off by default; these cover the mode when it is turned on
     with session_scope() as s:
         if s.get(Account, ACCT) is None:
             s.add(Account(id=ACCT, user_id=user_id(), label="021 slicing test", segments=["EQ", "FO"], trading_enabled=True, broker_kind="021"))
