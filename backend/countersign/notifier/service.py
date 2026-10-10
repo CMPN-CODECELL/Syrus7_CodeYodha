@@ -40,7 +40,7 @@ def mode() -> str:
 # ------------------------------------------------------------------ one message
 
 
-def deliver(s: Session, user_id: str, kind: str, body: str, *, category: str | None = None, source_ref: str | None = None, pending: bool = False) -> dict:
+def deliver(s: Session, user_id: str, kind: str, body: str, *, category: str | None = None, source_ref: str | None = None, pending: bool = False, event_at: datetime | None = None) -> dict:
     """Sends one message to a user's linked number, at most once. category set: an alert, which also needs a
     verified, opted-in, unpaused link and the matching preference. pending: the verification code (unverified link)."""
     now = datetime.now(UTC)
@@ -53,6 +53,10 @@ def deliver(s: Session, user_id: str, kind: str, body: str, *, category: str | N
         if not link.opted_in:
             return {"status": "OPTED_OUT", "hint": "You sent STOP. Send START to the sandbox number, or turn alerts back on in the app.", "message_id": None}
         if category is not None and not wa.wants(s, user_id, category):
+            return {"status": "SKIPPED", "hint": None, "message_id": None}
+        if category is not None and event_at is not None and link.verified_at is not None and event_at < link.verified_at - timedelta(seconds=10):
+            # Alerts cover what happens after the number was verified, not events from before linking (10 s of slack
+            # for the database and process clocks).
             return {"status": "SKIPPED", "hint": None, "message_id": None}
     if source_ref and s.execute(select(WhatsAppMessage.id).where(WhatsAppMessage.user_id == user_id, WhatsAppMessage.source_ref == source_ref)).first():
         return {"status": "DUPLICATE", "hint": None, "message_id": None}
@@ -106,6 +110,28 @@ def _short(text: str, n: int = 320) -> str:
     return text if len(text) <= n else text[: n - 3] + "..."
 
 
+def _tidy(text: str, n: int = 700) -> str:
+    """Like _short, but keeps the line breaks that structure a WhatsApp message."""
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in (text or "").strip().split("\n")]
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+    return text if len(text) <= n else text[: n - 3] + "..."
+
+
+ORDER_HEADS = {"Filled": "Order filled", "Rejected": "Order rejected", "Partially filled": "Order partly filled", "Cancelled": "Order cancelled", "Not placed": "Order not placed"}
+
+
+def _titled(title: str, detail: str = "", *, footer: str = "") -> str:
+    """'Order filled: BUY 10 RELIANCE' + detail -> a bold title line, the subject below it, then the detail."""
+    head, _, subject = title.partition(": ")
+    head = ORDER_HEADS.get(head.strip(), head.strip())
+    parts = [f"*{head}*" + (f"\n{subject.strip()}" if subject.strip() else "")]
+    if detail and not detail.startswith(title):
+        parts.append(detail.strip())
+    if footer:
+        parts.append(f"_{footer}_")
+    return _tidy("\n\n".join(parts))
+
+
 def _mask_accounts(text: str, *account_ids: str | None) -> str:
     from countersign.broker021.linking import mask
 
@@ -119,7 +145,8 @@ def _sym(instrument_id: str) -> str:
     return instrument_id.split(":")[-1]
 
 
-def armed_text(m: StandingMandate) -> str:
+def mandate_summary(m: StandingMandate) -> tuple[str, str]:
+    """('If RELIANCE falls to ₹1,150.00 or below, buy 10 (limit ₹1,150.00).', 'Fires once · expires 17 Oct')"""
     p = m.predicate or {}
     who = "any holding" if m.instrument_id == ALL_HOLDINGS_ID else _sym(m.instrument_id)
     th = int(p.get("threshold") or 0)
@@ -134,28 +161,31 @@ def armed_text(m: StandingMandate) -> str:
         act = f", {str(t.get('side', '')).lower()} {t.get('quantity')} (limit {inr(t.get('limit_price_paise'))})"
     else:
         act = ", alert you (no order is placed)"
-    once = "At most once per holding per day." if m.instrument_id == ALL_HOLDINGS_ID else "Fires once."
+    once = "At most once per holding per day" if m.instrument_id == ALL_HOLDINGS_ID else "Fires once"
     exp = m.expires_at.astimezone(IST)
-    return f"Armed: {cond}{act}. {once} Expires {exp.day} {exp.strftime('%b')}."
+    return f"{cond[0].upper()}{cond[1:]}{act}.", f"{once} · expires {exp.day} {exp.strftime('%b')}"
+
+
+def armed_text(m: StandingMandate) -> str:
+    sentence, meta = mandate_summary(m)
+    return f"*Standing instruction armed*\n\n{sentence}\n{meta}"
 
 
 def outcome_text(r: OutcomeRow, m: StandingMandate | None) -> str:
     if r.kind == "MANDATE_ARMED" and m is not None:
         return armed_text(m)
     if r.kind == "MANDATE_TRIGGERED":
-        title = r.title.replace("Standing instruction triggered: ", "Triggered: ")
-        return _short(f"{title}. {r.detail}")
+        return _titled(r.title, r.detail)
     if r.kind == "ALERT":
-        return _short(f"Alert: {r.title.removeprefix('Alert: ')}. No order was placed.")
+        return _titled("Price alert: " + r.title.removeprefix("Alert: "), footer="No order was placed.")
     if r.kind == "KILL_SWITCH":
         if r.title.endswith("engaged"):
-            return _short(f"Security: kill switch engaged. Countersign will not send any order until it is released. Reason: {r.detail}")
-        return _short(f"Security: kill switch released. {r.detail}")
+            return _tidy(f"*Kill switch engaged*\nCountersign will not send any order until it is released.\n\nReason: {r.detail}")
+        return _tidy(f"*Kill switch released*\n{r.detail}")
     if r.kind == "EXTERNAL_ORDER":
-        return _short(f"Security: {r.title}. {r.detail}")
-    prefix = "Standing instruction: " if m is not None and r.kind in ORDER_KINDS else ""
-    detail = r.detail if r.detail and not r.detail.startswith(r.title) else ""
-    return _short(f"{prefix}{r.title}. {detail}".strip())
+        return _titled(r.title, r.detail)
+    footer = "From your standing instruction." if m is not None and r.kind in ORDER_KINDS else ""
+    return _titled(r.title, r.detail, footer=footer)
 
 
 def _all_linked(s: Session) -> set[str]:
@@ -185,7 +215,7 @@ def handle_outcome(s: Session, r: OutcomeRow) -> int:
     body = _mask_accounts(outcome_text(r, m), r.account_id)
     sent = 0
     for uid in sorted(users):
-        res = deliver(s, uid, r.kind.lower()[:24], body, category=category, source_ref=f"outcome:{r.id}")
+        res = deliver(s, uid, r.kind.lower()[:24], body, category=category, source_ref=f"outcome:{r.id}", event_at=r.ts)
         sent += res["status"] in ("SENT", "LOGGED", "FAILED", "FAILED_WINDOW")
     return sent
 
@@ -210,8 +240,11 @@ def handle_audit(s: Session, a: AuditEvent) -> int:
         if m is None:
             return 0
         category = "mandates"
-        who = "your holdings alert" if m.instrument_id == ALL_HOLDINGS_ID else f"your standing instruction on {_sym(m.instrument_id)}"
-        body = f"Expired: {who} ended without triggering." if a.event_type == "MANDATE_EXPIRED" else f"Cancelled: {who} was cancelled and can no longer fire."
+        who = "Your holdings alert" if m.instrument_id == ALL_HOLDINGS_ID else f"Your instruction on {_sym(m.instrument_id)}"
+        if a.event_type == "MANDATE_EXPIRED":
+            body = f"*Standing instruction expired*\n{who} ended without triggering."
+        else:
+            body = f"*Standing instruction cancelled*\n{who} can no longer fire."
         users = {m.user_id}
     elif a.event_type == "SESSION_CREATED":
         row = s.get(SessionRow, a.subject_id)
@@ -221,8 +254,8 @@ def handle_audit(s: Session, a: AuditEvent) -> int:
         if u is None or u.is_lab_user:
             return 0
         method = str((a.data or {}).get("method") or "")
-        how = f", {method}" if method else ""
-        body = f"Security: new sign-in to Countersign ({_ua_short(row.user_agent)}{how}). If this was not you, open Countersign > Security and sign that session out."
+        how = f" · {method}" if method else ""
+        body = f"*New sign-in to Countersign*\n{_ua_short(row.user_agent)}{how}\n\nNot you? Open Countersign > Security and sign that session out."
         users = {row.user_id}
     elif a.event_type == "SECURITY_EVENT":
         ev = s.get(SecurityEvent, a.subject_id)
@@ -233,12 +266,12 @@ def handle_audit(s: Session, a: AuditEvent) -> int:
             users = {uid}
         elif ev.account_id and ev.account_id not in ("", "*", "LAB1"):
             users = wa.operators(s, ev.account_id)
-        body = _mask_accounts(_short(f"Security: {ev.message}"), ev.account_id)
+        body = _mask_accounts(_tidy(f"*Security alert*\n{ev.message}"), ev.account_id)
     else:
         return 0
     sent = 0
     for uid in sorted(users):
-        res = deliver(s, uid, a.event_type.lower()[:24], body, category=category, source_ref=f"audit:{a.id}")
+        res = deliver(s, uid, a.event_type.lower()[:24], body, category=category, source_ref=f"audit:{a.id}", event_at=a.ts)
         sent += res["status"] in ("SENT", "LOGGED", "FAILED", "FAILED_WINDOW")
     return sent
 
@@ -277,7 +310,7 @@ def watch_line(w: WhatsAppWatch, tick: market.Tick) -> str:
     parts = [f"{wa.pct(day)} today"]
     if w.last_price_paise:
         parts.append(f"{wa.pct((tick.ltp_paise - w.last_price_paise) * 100 / w.last_price_paise)} since last update")
-    return f"{w.symbol} {inr(tick.ltp_paise)} ({', '.join(parts)})"
+    return f"*{w.symbol}* {inr(tick.ltp_paise)}\n{' · '.join(parts)}"
 
 
 def watches_once(s: Session, now: datetime | None = None) -> int:
@@ -304,7 +337,7 @@ def watches_once(s: Session, now: datetime | None = None) -> int:
         due.setdefault(w.user_id, []).append((w, tick))
     sent = 0
     for uid, items in due.items():
-        body = "\n".join(watch_line(w, t) for w, t in items)
+        body = "*Price update*\n\n" + "\n\n".join(watch_line(w, t) for w, t in items)
         res = deliver(s, uid, "watch", body, category="watch")
         for w, t in items:
             # Updated whatever the outcome, so a failed send is never retried in a loop.
