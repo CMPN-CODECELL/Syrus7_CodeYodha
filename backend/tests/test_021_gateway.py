@@ -236,6 +236,7 @@ def test_rejected_orders_reported_as_order_0_never_collide():
         store.create(tag, ACCT, mapping.request_fingerprint(o21), _body(tag), o21)
         store.update(tag, state="REJECTED", order_id="0", error="Price must be higher than the lower circuit limit")
         assert store.get(tag)["state"] == "REJECTED" and store.get(tag)["broker_order_id"] is None
+    assert store.by_order_id("0") is None and "0" not in store.mapped_order_ids(ACCT)  # a rejected row is never matched to us by id
     store.delete_tags("CSTEST021Z")
 
 

@@ -117,6 +117,8 @@ def get(tag: str) -> dict | None:
 
 
 def by_order_id(order_id: str) -> dict | None:
+    if str(order_id or "") in ("", "0", "None"):
+        return None  # 021's rejected orders are all order 0: never one of ours by id
     with _sf()() as s:
         return as_dict(s.execute(select(Attempt).where(Attempt.order_id == str(order_id))).scalar_one_or_none())
 
@@ -162,12 +164,12 @@ def holding_fingerprint(fp: str, account_id: str, hold_s: float) -> dict | None:
 
 def mapped_order_ids(account_id: str) -> set[str]:
     with _sf()() as s:
-        return {x for x in s.execute(select(Attempt.order_id).where(Attempt.account_id == account_id, Attempt.order_id.is_not(None))).scalars()}
+        return {x for x in s.execute(select(Attempt.order_id).where(Attempt.account_id == account_id, Attempt.order_id.is_not(None), Attempt.order_id != "0")).scalars()}
 
 
 def tags_by_order(account_id: str) -> dict[str, dict]:
     with _sf()() as s:
-        return {a.order_id: as_dict(a) for a in s.execute(select(Attempt).where(Attempt.account_id == account_id, Attempt.order_id.is_not(None))).scalars()}
+        return {a.order_id: as_dict(a) for a in s.execute(select(Attempt).where(Attempt.account_id == account_id, Attempt.order_id.is_not(None), Attempt.order_id != "0")).scalars()}
 
 
 def late_candidates(account_id: str, window_s: float) -> list[dict]:
