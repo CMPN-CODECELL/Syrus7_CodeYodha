@@ -1,27 +1,29 @@
 "use client";
 
-import { Calculator, Scale, TrendingDown, Workflow, type LucideIcon } from "lucide-react";
+import { Calculator, Scale, TrendingDown, Workflow, XCircle, type LucideIcon } from "lucide-react";
 import { Eyebrow } from "@/components/ui/panel";
 import { inr, pct, qty } from "@/lib/format";
-import type { Issue, PlanDetail, PlanFact, PlanMathColumn, Proposal, ProposalStep } from "@/lib/types";
+import type { Issue, PlanDetail, PlanFact, PlanKind, PlanMathColumn, Proposal, ProposalStep } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** Notes the verifier attaches to a plan it computed itself: the method, the scope and the resulting weights. */
-export const PLAN_NOTE_RE = /^(EXIT_|REBALANCE_)/;
+export const PLAN_NOTE_RE = /^(EXIT_|REBALANCE_|CANCEL_ALL_)/;
 
 /**
  * Which computed plan this is: from an explicit plan object ("exit_losing_intraday", "exit-losing-intraday", ...) or
  * from the verifier's notes (EXIT_SCOPE, REBALANCE_METHOD, REBALANCE_RESULT). Null for a plan the trader dictated.
  */
-export function planKind(p: Proposal): "exit_losing_intraday" | "rebalance" | "custom" | null {
+export function planKind(p: Proposal): PlanKind | null {
   const k = p.plan?.kind?.toLowerCase().replace(/-/g, "_");
   if (k) {
     if (k.startsWith("exit")) return "exit_losing_intraday";
     if (k.startsWith("rebalance")) return "rebalance";
+    if (k.startsWith("cancel_all")) return "cancel_all";
     return "custom";
   }
   if (p.issues.some((i) => i.code.startsWith("EXIT_"))) return "exit_losing_intraday";
   if (p.issues.some((i) => i.code.startsWith("REBALANCE_"))) return "rebalance";
+  if (p.issues.some((i) => i.code.startsWith("CANCEL_ALL_"))) return "cancel_all";
   return null;
 }
 
@@ -122,9 +124,10 @@ export function PlanNotes({ proposal, className }: { proposal: Proposal; classNa
   );
 }
 
-export const PLAN_KIND_LOOK: Record<"exit_losing_intraday" | "rebalance" | "custom", { title: string; icon: LucideIcon }> = {
+export const PLAN_KIND_LOOK: Record<PlanKind, { title: string; icon: LucideIcon }> = {
   exit_losing_intraday: { title: "Exit losing intraday positions", icon: TrendingDown },
   rebalance: { title: "Rebalance", icon: Scale },
+  cancel_all: { title: "Cancel open orders", icon: XCircle },
   custom: { title: "Plan", icon: Workflow },
 };
 

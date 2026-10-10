@@ -1,7 +1,9 @@
 "use client";
 
-import { Briefcase, ListOrdered, Package, Layers } from "lucide-react";
+import { Briefcase, ListOrdered, Package, Layers, XCircle } from "lucide-react";
 import { useState } from "react";
+import { useRedraft } from "@/components/approval/delivery-notice";
+import { Button } from "@/components/ui/button";
 import { Kpi } from "@/components/ui/kpi";
 import { PageContainer, PageHeader, Panel } from "@/components/ui/panel";
 import { EmptyState, ErrorState, SkeletonRows } from "@/components/ui/states";
@@ -9,6 +11,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { pct, time } from "@/lib/format";
 import type { OrdersFilter } from "@/lib/api";
 import { useAccountSummary, useActiveBroker, useHoldings, useOrders, usePositions } from "@/lib/queries";
+import { useChatStore } from "@/lib/store";
 import { HoldingsTable, OrdersTable, PositionsTable } from "./tables";
 
 function KpiStrip() {
@@ -27,6 +30,29 @@ function KpiStrip() {
   );
 }
 
+const CANCEL_ALL_TEXT = "Cancel all my open orders";
+
+/** Drafts one plan with a CANCEL step per open order in the Copilot. Nothing is cancelled until the trader countersigns it. */
+function CancelAllOpenOrders() {
+  const open = useOrders("open");
+  const redraft = useRedraft();
+  const streaming = useChatStore((s) => s.streaming);
+  const n = open.data?.length ?? 0;
+  if (!n) return null;
+  return (
+    <Button
+      size="sm"
+      variant="outline"
+      className="h-7 px-2 text-xs"
+      disabled={streaming}
+      onClick={() => redraft(CANCEL_ALL_TEXT)}
+      title={`Drafts "${CANCEL_ALL_TEXT}" in the Copilot: one plan, one CANCEL step per open order (${n}). Nothing is cancelled until you countersign it.`}
+    >
+      <XCircle /> Cancel all open orders
+    </Button>
+  );
+}
+
 function OrdersPanel() {
   const [filter, setFilter] = useState<OrdersFilter>("open");
   const orders = useOrders(filter);
@@ -41,7 +67,9 @@ function OrdersPanel() {
           : "Every order carries the executor's unique client tag"
       }
       actions={
-        <Tabs value={filter} onValueChange={(v) => setFilter(v as OrdersFilter)}>
+        <div className="flex flex-wrap items-center gap-2">
+          <CancelAllOpenOrders />
+          <Tabs value={filter} onValueChange={(v) => setFilter(v as OrdersFilter)}>
           <TabsList className="h-7">
             <TabsTrigger value="open" className="px-2 text-xs">
               Open
@@ -53,7 +81,8 @@ function OrdersPanel() {
               Rejected
             </TabsTrigger>
           </TabsList>
-        </Tabs>
+          </Tabs>
+        </div>
       }
     >
       {orders.isPending ? (

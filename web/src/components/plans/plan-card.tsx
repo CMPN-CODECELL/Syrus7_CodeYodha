@@ -1,7 +1,7 @@
 "use client";
 
 import { motion, useReducedMotion } from "motion/react";
-import { ChevronDown, CornerDownRight, Lock, ShieldAlert, Split } from "lucide-react";
+import { ChevronDown, CornerDownRight, Lock, ShieldAlert, Split, XCircle } from "lucide-react";
 import { DeliveryNotice } from "@/components/approval/delivery-notice";
 import { deliveryState, ExecutionTimeline } from "@/components/approval/execution-timeline";
 import { Interpretation } from "@/components/approval/approval-card";
@@ -48,6 +48,8 @@ function StepRow({ step, proposal, defaultOpen }: { step: ProposalStep; proposal
   // For a computed plan, the deciding number for this step (resulting weight or unrealised P&L).
   const key = step.fields.find((f) => f.key === "weight") ?? step.fields.find((f) => f.key === "unrealised_pnl");
   const why = step.rationale ?? (key ? `${key.label} ${key.display}` : null);
+  // A CANCEL step reads as a cancel at a glance, never as the BUY or SELL it removes.
+  const cancel = c.action === "CANCEL";
   return (
     <Collapsible defaultOpen={defaultOpen} className="rounded-lg bg-surface-2/50 ring-1 ring-hairline">
       <CollapsibleTrigger className="group/step flex w-full items-center gap-3 px-3 py-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring">
@@ -59,14 +61,27 @@ function StepRow({ step, proposal, defaultOpen }: { step: ProposalStep; proposal
         >
           {step.step_no}
         </span>
-        <SideBadge side={c.side} size="sm" />
+        {cancel ? (
+          <span className="grid size-6 shrink-0 place-items-center rounded-md bg-danger/12 text-danger ring-1 ring-danger/30" aria-label="Cancel">
+            <XCircle className="size-3.5" aria-hidden />
+          </span>
+        ) : (
+          <SideBadge side={c.side} size="sm" />
+        )}
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-baseline gap-x-2">
-            <span className="font-semibold">{c.instrument.symbol}</span>
-            <span className="num text-[13px]">
-              {qty(c.quantity)} <span className="unit">@</span> {c.limit_price_paise ? price(c.limit_price_paise) : `MKT (${price(c.protection_price_paise)})`}
-            </span>
-          </div>
+          {cancel ? (
+            <div className="flex flex-wrap items-baseline gap-x-2">
+              <span className="font-semibold text-danger">Cancel</span>
+              <span className="num text-[13px]">{step.summary.replace(/^CANCEL\s+/, "")}</span>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-baseline gap-x-2">
+              <span className="font-semibold">{c.instrument.symbol}</span>
+              <span className="num text-[13px]">
+                {qty(c.quantity)} <span className="unit">@</span> {c.limit_price_paise ? price(c.limit_price_paise) : `MKT (${price(c.protection_price_paise)})`}
+              </span>
+            </div>
+          )}
           <p className="num truncate text-[11px] text-subtle">
             {c.order_type} · {c.product} · {c.validity}
             {step.preview ? ` · value ${inr(step.preview.order_value_paise)}` : ""}
@@ -296,7 +311,7 @@ export function PlanCard({ proposal, className }: { proposal: Proposal; classNam
             />
           </div>
         ))}
-        {n > 0 && (
+        {n > 0 && kind !== "cancel_all" && (
           <div className="flex flex-wrap justify-end gap-x-4 gap-y-1 pt-1 text-xs text-muted-foreground">
             {buy > 0 && (
               <span>

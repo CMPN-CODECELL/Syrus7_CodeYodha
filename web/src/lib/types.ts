@@ -314,7 +314,7 @@ export interface ProposalStep {
 }
 
 /** Plans the backend computes from the account (L4). The math is data, formatted by the UI. */
-export type PlanKind = "exit_losing_intraday" | "rebalance" | "custom";
+export type PlanKind = "exit_losing_intraday" | "rebalance" | "cancel_all" | "custom";
 
 export interface PlanFact {
   label: string;
