@@ -63,7 +63,12 @@ class Stats:
     timeouts: int = 0
     last_error: str | None = None
     last_error_at: float | None = None
+    last_ok_at: float | None = None
     by_status: dict = field(default_factory=dict)
+
+    def current_error(self) -> str | None:
+        """The last failure, unless a call has succeeded since (older blips were already recovered from)."""
+        return self.last_error if (self.last_error_at or 0) > (self.last_ok_at or 0) else None
 
 
 def error_text(r: httpx.Response) -> str:
@@ -238,6 +243,8 @@ class Client021:
             else:
                 self._note_clock(r)
                 self.stats.by_status[r.status_code] = self.stats.by_status.get(r.status_code, 0) + 1
+                if r.status_code < 300:
+                    self.stats.last_ok_at = time.time()
                 if r.status_code == 401 and not relogged:
                     relogged = True
                     self.stats.relogins_on_401 += 1
@@ -297,6 +304,7 @@ class Client021:
         self.stats.by_status[r.status_code] = self.stats.by_status.get(r.status_code, 0) + 1
         err = error_text(r) if r.status_code != 200 else None
         if r.status_code == 200:
+            self.stats.last_ok_at = time.time()
             try:
                 env = r.json()
             except ValueError:

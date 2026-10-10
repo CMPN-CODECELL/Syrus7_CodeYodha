@@ -211,7 +211,7 @@ def _account_status(g: Gateway, source: str) -> dict:
         "logged_in": c.logged_in,
         "token_expires_at": datetime.fromtimestamp(c.token_expires_at, UTC).isoformat().replace("+00:00", "Z") if c.token_expires_at else None,
         "credentials_rejected": c.credentials_rejected,
-        "last_error": c.stats.last_error,
+        "last_error": c.stats.current_error(),
         "poll_error": _boot.get("poll_errors", {}).get(g.account_id),
     }
 

@@ -221,6 +221,15 @@ def test_writes_are_never_retried_by_the_client(fake):
     assert len(fake.posts) == 4
 
 
+def test_a_recovered_failure_is_not_reported_as_current(fake):
+    c = Client021(_cfg(), transport=httpx.MockTransport(fake.handler), sleep=lambda s: None)
+    fake.post_behaviour = ["timeout"]
+    c.write("POST", "/orders", mapping.to_021_order(_body("CSTEST021R1"), "NSECM", 1594))
+    assert c.stats.current_error() == "POST /orders: timeout"
+    c.get("/orders")
+    assert c.stats.last_error == "POST /orders: timeout" and c.stats.current_error() is None
+
+
 # ------------------------------------------------------------------ mapping
 
 
