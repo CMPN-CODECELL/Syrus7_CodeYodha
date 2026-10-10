@@ -1,17 +1,20 @@
 "use client";
 
+import Link from "next/link";
 import { motion, useReducedMotion } from "motion/react";
-import { Bell, Crosshair, Repeat1, TriangleAlert, X } from "lucide-react";
+import { Bell, Crosshair, MessageCircle, PenLine, Repeat1, TriangleAlert, X } from "lucide-react";
+import { useState } from "react";
 import { toast } from "sonner";
 import { Interpretation } from "@/components/approval/approval-card";
 import { ProposalActions, useRevise } from "@/components/approval/proposal-actions";
+import { needsStepUp, StepUpInline } from "@/components/approval/setup-inline";
 import { Button } from "@/components/ui/button";
 import { Chip, LookChip, SideBadge } from "@/components/ui/chip";
 import { Hash } from "@/components/ui/hash";
 import { Eyebrow } from "@/components/ui/panel";
 import { errorMessage } from "@/lib/errors";
 import { dateTime, pct, price, qty, until } from "@/lib/format";
-import { useCancelMandate, useHoldings, useProposal } from "@/lib/queries";
+import { useCancelMandate, useHoldings, useProposal, useWhatsApp } from "@/lib/queries";
 import { mandateLook } from "@/lib/status";
 import { useLiveStore, useTick } from "@/lib/store";
 import type { MandateView, Proposal } from "@/lib/types";
@@ -82,12 +85,35 @@ export function TriggerDistance({ mandate }: { mandate: MandateView }) {
   );
 }
 
+const CANCEL_STEP_UP_COPY =
+  "Cancelling a standing instruction needs your countersignature, just like arming it. Confirm with your passkey, app PIN or authenticator code. This only cancels; it places no trade.";
+
+/** One quiet line on an armed mandate: WhatsApp alerts are on for it, or where to turn them on. */
+function WhatsAppHint() {
+  const wa = useWhatsApp();
+  const s = wa.data;
+  if (!s) return null;
+  const on = !!s.link?.verified && s.link.opted_in && s.prefs.mandates;
+  return on ? (
+    <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+      <MessageCircle className="size-3.5 shrink-0 text-profit" aria-hidden />
+      You&apos;ll get WhatsApp alerts when this fires.
+    </p>
+  ) : (
+    <Link href="/alerts" className="inline-flex items-center gap-1.5 text-[11px] text-subtle underline-offset-2 hover:text-foreground hover:underline">
+      <MessageCircle className="size-3.5 shrink-0" aria-hidden />
+      Get WhatsApp alerts
+    </Link>
+  );
+}
+
 export function MandateCard({ mandate: initial, proposal, className }: { mandate: MandateView; proposal?: Proposal; className?: string }) {
   const reduce = useReducedMotion();
   const live = useLiveStore((s) => s.mandates[initial.mandate_id]);
   const m = live ?? initial;
   const now = useNow(15_000);
   const cancel = useCancelMandate();
+  const [stepUp, setStepUp] = useState<unknown>(null);
   const revise = useRevise();
   const source = useProposal(proposal ? null : m.proposal_id);
   const p = proposal ?? source.data;
@@ -95,6 +121,19 @@ export function MandateCard({ mandate: initial, proposal, className }: { mandate
   const awaitingApproval = p?.status === "AWAITING_APPROVAL" || p?.status === "BLOCKED";
   const cancellable = ["ACTIVE", "NEEDS_REVIEW"].includes(m.state) && !awaitingApproval;
   const t = m.template;
+  // A cancel needs a fresh step-up; on STEP_UP_REQUIRED the prompt opens and a confirmed step-up retries it.
+  // mutateAsync, not mutate callbacks: the live event can move the card to History and unmount it before the reply.
+  const doCancel = () =>
+    void cancel.mutateAsync(m.mandate_id).then(
+      () => {
+        setStepUp(null);
+        toast("Mandate cancelled", { description: `${m.instrument.symbol}: ${m.condition_text} will not fire.` });
+      },
+      (e: unknown) => {
+        if (needsStepUp(e)) setStepUp(e);
+        else toast.error("Could not cancel the mandate", { description: errorMessage(e) });
+      },
+    );
 
   return (
     <motion.article
@@ -201,6 +240,7 @@ export function MandateCard({ mandate: initial, proposal, className }: { mandate
           </div>
         )}
         {m.state === "FAILED" && m.reason && <p className="text-xs text-danger">{m.reason}</p>}
+        {m.state === "ACTIVE" && <WhatsAppHint />}
         {p && proposal && <Interpretation proposal={p} />}
       </div>
 
@@ -219,26 +259,43 @@ export function MandateCard({ mandate: initial, proposal, className }: { mandate
       ) : (
         (cancellable || m.state === "NEEDS_REVIEW") && (
           <footer className="mt-auto flex flex-wrap items-center gap-2 border-t border-hairline px-4 py-2.5">
+            {stepUp !== null && cancellable && (
+              <StepUpInline
+                error={stepUp}
+                description={CANCEL_STEP_UP_COPY}
+                className="w-full"
+                onVerified={() => {
+                  setStepUp(null);
+                  doCancel();
+                }}
+              />
+            )}
             {m.state === "NEEDS_REVIEW" && p && (
               <Button size="sm" className="bg-human text-background hover:bg-human/90" onClick={() => revise(p.interpretation.user_text)}>
                 Review and countersign again
               </Button>
             )}
             {cancellable && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="ml-auto"
-                disabled={cancel.isPending}
-                onClick={() =>
-                  cancel.mutate(m.mandate_id, {
-                    onSuccess: () => toast("Mandate cancelled", { description: `${m.instrument.symbol}: ${m.condition_text} will not fire.` }),
-                    onError: (e) => toast.error("Could not cancel the mandate", { description: errorMessage(e) }),
-                  })
-                }
-              >
-                <X /> Cancel mandate
-              </Button>
+              stepUp !== null ? (
+                <Button size="sm" variant="ghost" className="ml-auto" disabled={cancel.isPending} onClick={() => setStepUp(null)}>
+                  Keep mandate
+                </Button>
+              ) : (
+                <div className="ml-auto flex flex-col items-end gap-1">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={cancel.isPending}
+                    onClick={doCancel}
+                    title="Cancelling needs your countersignature: passkey, app PIN or authenticator code"
+                  >
+                    <X /> {cancel.isPending ? "Cancelling..." : "Cancel mandate"}
+                  </Button>
+                  <span className="flex items-center gap-1 text-[10.5px] text-subtle">
+                    <PenLine className="size-3" aria-hidden /> Needs your countersignature
+                  </span>
+                </div>
+              )
             )}
           </footer>
         )
