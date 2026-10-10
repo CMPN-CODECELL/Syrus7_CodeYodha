@@ -52,7 +52,7 @@ export const PROMPT_LEVELS: PromptLevel[] = [
     title: "Place, modify, cancel",
     hint: "Drafted exactly, sent only after you countersign",
     mode: "draft",
-    items: ["Buy 10 Reliance at market", "Sell half my TCS", "Move my stop-loss on HDFC Bank up to 1640", "Cancel all my open orders"],
+    items: ["Buy 5 TCS at market and buy 5 INFY at market", "Sell half my TCS", "Move my stop-loss on HDFC Bank up to 1640", "Cancel all my open orders"],
   },
   {
     level: "L3",
