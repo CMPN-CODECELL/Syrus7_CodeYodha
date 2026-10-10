@@ -67,6 +67,28 @@ With `CS_021_UCC` and `CS_021_PASSWORD` set, `scripts/dev.py` starts the `gatewa
 
 **Traders connecting their own 021 account.** With the gateway running, any signed-in trader can connect their own 021 account in the Security Center (Broker connection, "Connect your 021 account") or in the optional last onboarding step: they enter their UCC and 021 password, confirm with their passkey, app PIN or authenticator code, and the account becomes their active account. Nothing is added to `.env`. On first start the gateway creates `.secrets/gateway021_link_key.pem` (RSA-2048, the browser encrypts the credentials to it) and `.secrets/gateway021_store.key` (the AES-256-GCM key that seals stored passwords in the gateway's `g021_credentials` table). Keep both with the database: deleting the store key makes every stored password unreadable (those traders connect again), and anyone who can read both the key file and the table can decrypt the passwords. Connecting an account logs out other API sessions on that 021 account. **Disconnect** deletes the stored password.
 
+## 3c. WhatsApp alerts through Twilio (optional)
+
+Without this step the `notifier` process still runs, in log-only mode: every message is recorded in the app (Settings, WhatsApp alerts) and written to `.logs/notifier.log` with the phone number masked, but nothing is sent. To send real WhatsApp messages with the free Twilio sandbox:
+
+1. Create a Twilio account and open **Messaging > Try it out > Send a WhatsApp message** in the Twilio console.
+2. Add to `.env` (never commit it):
+
+| Setting | Meaning |
+|---|---|
+| `CS_TWILIO_ACCOUNT_SID` | the Account SID from the console home page |
+| `CS_TWILIO_AUTH_TOKEN` | the Auth Token from the console home page |
+| `CS_TWILIO_WHATSAPP_FROM` | the sender, a phone number: `whatsapp:+14155238886` for the sandbox (when empty or not a phone number, the notifier uses the sandbox number and `/health` shows `"sender_valid": false`) |
+| `CS_WHATSAPP_JOIN_CODE` | optional: the sandbox join code (the words after `join` on the console page); the app then shows "Send 'join <code>' to the sandbox number". Not a secret, and not the sender |
+| `CS_WHATSAPP_PUBLIC_URL` | optional: the exact public URL Twilio calls (default `https://countersign.everyrepo.me/api/whatsapp/inbound`); it is part of the signature, so it must match the console setting character for character |
+
+3. From WhatsApp on your phone, send `join <your code>` to **+1 415 523 8886** (the code is shown on the same console page). Every phone that should receive alerts has to join once.
+4. In the sandbox settings, set **When a message comes in** to `https://countersign.everyrepo.me/api/whatsapp/inbound` with method **POST**, and save.
+5. Restart the stack. `http://127.0.0.1:8300/health` shows `"mode": "live"` (it never shows a credential).
+6. In the app, open WhatsApp alerts, enter your number (for example `+91 98765 43210`), and type the 6-digit code you receive. Send `HELP` to the sandbox number to see the commands.
+
+The sandbox only delivers free-form messages within 24 hours of your last message to it. When the app shows "outside the 24-hour window", send any message (for example `HELP`) to the sandbox number to reopen it. `scripts/dev.py` passes the three Twilio values to the notifier only; every other process has them removed from its environment.
+
 ## 4. Start it
 
 1. Open **Docker Desktop** and wait until it shows "Engine running".

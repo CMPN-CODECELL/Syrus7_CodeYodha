@@ -353,6 +353,10 @@ Sliding one-minute windows, answered with `429 RATE_LIMITED`, `{ code, message: 
 | `POST /api/auth/login` | 10/min | IP |
 | `POST /api/auth/passkey/login/start`, `/finish` | 10/min each | IP |
 | `GET /api/public/status` | 60/min | IP |
+| `POST /api/whatsapp/link` | 5 per 10 min (and 3 codes per 10 min per user) | session |
+| `POST /api/whatsapp/verify` | 10/min (and 5 attempts per code) | session |
+| `POST /api/whatsapp/test` | 5/min | session |
+| `POST /api/whatsapp/inbound` | 120/min | IP |
 
 ### Public status (no auth, for the landing page)
 `GET /api/public/status` returns system-wide facts only, never per-user data. Cached for about 2 s.
@@ -465,7 +469,7 @@ Approval errors (HTTP 409/412/422/423) use codes: `APPROVAL_EXPIRED`, `PRICE_DRI
 ### Mandates, plans, outcomes
 | GET | `/api/mandates` | `MandateView[]` (with `proposal_id`) |
 |---|---|---|
-| POST | `/api/mandates/{id}/cancel` | `MandateView` |
+| POST | `/api/mandates/{id}/cancel` | `MandateView`. Needs a fresh step-up in this session (`POST /api/auth/step-up` within 10 minutes, the same rule as adding a factor or linking 021); otherwise `403 { code: "STEP_UP_REQUIRED", message, methods }` and nothing changes |
 | GET | `/api/plans` | `Proposal[]` (kind PLAN) |
 | GET | `/api/outcomes?limit=50` | `OutcomeEvent[]` |
 
@@ -481,6 +485,56 @@ interface OutcomeEvent {
   proposal_id?: string | null; broker_order_id?: string | null;
 }
 ```
+
+### WhatsApp alerts (Twilio; notification and read-only channel)
+WhatsApp can never approve, place, modify or cancel anything. All routes below use the session cookie, and the unsafe methods need `X-CSRF-Token` and an allowed Origin like every other route, except the Twilio webhook.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/api/whatsapp` | | `WhatsAppState` (always 200 for a signed-in trader, also in log-only mode or with the notifier down) |
+| POST | `/api/whatsapp/link` | `{ phone }` (E.164, spaces allowed; India: `+91` and a 10-digit mobile) | `{ phone_masked, expires_at, delivery: Delivery }`; `422 INVALID_PHONE`, `409 PHONE_IN_USE`, `429 RATE_LIMITED` (3 codes per 10 min) |
+| POST | `/api/whatsapp/verify` | `{ code }` (6 digits) | `{ verified: true, welcome: Delivery }`; `401 CODE_INVALID { attempts_left }`, `404 NO_CODE`, `410 CODE_EXPIRED`, `429 CODE_LOCKED`, `409 PHONE_IN_USE` |
+| DELETE | `/api/whatsapp/link` | | `{ unlinked: true }` (stops every message) |
+| POST | `/api/whatsapp/pause` | `{ minutes }` (1 to 10080) | `{ paused_until, link }`; alerts and watches are held back until then (held-back alerts are listed as `PAUSED`, never sent later); `409 NOT_LINKED` |
+| POST | `/api/whatsapp/resume` | | `{ paused_until: null, link }`; `409 NOT_LINKED` |
+| PUT | `/api/whatsapp/prefs` | `{ orders, mandates, security, digests }` (all booleans) | `Prefs` |
+| POST | `/api/whatsapp/watches` | `{ symbol, interval_min, min_move_pct?, market_hours_only? }` | `Watch`; `422 BAD_INTERVAL` / `UNKNOWN_SYMBOL` / `BAD_MIN_MOVE`, `409 WATCH_LIMIT` (10 per user). The same symbol again updates its watch |
+| PATCH | `/api/whatsapp/watches/{id}` | `{ active }` | `Watch` |
+| DELETE | `/api/whatsapp/watches/{id}` | | `{ deleted: true }` |
+| POST | `/api/whatsapp/test` | | `Delivery` ("Countersign test message: alerts are working."); `409 NOT_VERIFIED` |
+| POST | `/api/whatsapp/inbound` | Twilio webhook, `application/x-www-form-urlencoded` | TwiML `<Response><Message>...</Message></Response>`. No session and no CSRF: the `X-Twilio-Signature` header is checked by the notifier against `CS_WHATSAPP_PUBLIC_URL`; missing or wrong is `403`, notifier down or log-only mode is `503` |
+
+```ts
+interface WhatsAppState {
+  configured: boolean;                 // Twilio settings present in the notifier
+  mode: "live" | "log_only";           // log_only: messages are recorded, not sent
+  notifier_up: boolean;                // the notifier process answered
+  sandbox: { number: string;           // "+1 415 523 8886" (any other sender is masked)
+             join_hint: string };      // "Send 'join <your code>' to the sandbox number from WhatsApp (find the code in the Twilio console)"
+  link: null | { phone_masked: string; // "+91******3210"
+                 verified: boolean; opted_in: boolean;  // opted_in false after the trader sent STOP
+                 paused_until: ISO | null;              // PAUSE <N>H
+                 window_hint: string | null };          // set after Twilio 63016 until the trader messages the sandbox again
+  prefs: Prefs;
+  watches: Watch[];
+  recent: { at: ISO; kind: string; status: MessageStatus; preview: string; error_code: number | null; hint: string | null }[]; // last 10 sent or held back (inbound commands are not listed; their replies are, as SENT)
+}
+interface Prefs { orders: boolean; mandates: boolean; security: boolean; digests: boolean }  // defaults true, true, true, false
+interface Watch { id: string; symbol: string; interval_min: 2 | 5 | 10 | 15 | 30; min_move_pct: number | null;
+                  market_hours_only: boolean; active: boolean; last_sent_at: ISO | null; last_price: number | null } // rupees
+interface Delivery { status: MessageStatus | "NOT_LINKED" | "NOT_VERIFIED" | "OPTED_OUT"; hint: string | null; message_id: string | null; error_code: number | null }
+type MessageStatus =
+  | "SENT"           // accepted by Twilio (the notifier reads the delivery status back for 10 minutes and may turn it into a failure)
+  | "LOGGED"         // log-only mode: recorded, not sent
+  | "FAILED_WINDOW"  // Twilio 63016: "Send any message to the sandbox number to reopen the 24-hour window."
+  | "FAILED"         // anything else; error_code and hint say why: 63015 not joined the sandbox ("join <code>"), 63007 wrong
+                     // sender, 21211 / 21614 / 63003 bad number, 20003 wrong Twilio credentials, 429 this installation's own
+                     // rate limit (20 per user and 300 in total per 10 minutes), no code: notifier down or network error
+  | "PAUSED";        // an alert held back while paused (PAUSE <N>H or POST /pause); never sent later
+// A failed send is never retried.
+```
+
+Inbound commands (case-insensitive, read-only): `HELP`, `PNL`, `HOLDINGS`, `POSITIONS`, `ORDERS`, `PRICE <SYMBOL>`, `MANDATES`, `WATCH <SYMBOL> <MINUTES> [MIN%]`, `UNWATCH <SYMBOL>`, `WATCHES`, `PAUSE <N>H` (1 to 72), `RESUME`, `STOP` (opt out), `START` (opt back in). Trading verbs (`BUY`, `SELL`, `CANCEL`, `APPROVE`, `MODIFY`, `YES` and similar) are answered with "WhatsApp can't place or approve orders. Open Countersign to draft and countersign: https://countersign.everyrepo.me/copilot". A sender that is not a verified link is told how to link the number in the app.
 
 ### Live events (SSE, GET)
 `GET /api/events` streams `event: <type>` + `data: <json>`:

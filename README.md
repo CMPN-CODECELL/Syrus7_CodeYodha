@@ -74,6 +74,12 @@ With `CS_021_UCC` and `CS_021_PASSWORD` in `.env`, `scripts/dev.py` starts **`ga
 - **Fault drill.** With `CS_021_TEST_FAULTS=true` (off by default), the presenter controls on the 021 account can drill two faults inside the gateway, never at 021: "Connection fail" (the next order fails before any byte is sent: `NOT_PLACED`) and "Accept, drop ack" (021 accepts the order and the gateway drops the answer: reconciliation finds it, nothing is sent twice).
 - **Simulated prices never reach 021.** Presenter feed scenarios (spike, crash) can drive a live instrument for up to two minutes for paper demos; while they do, orders and standing instructions on the 021 account are blocked or paused for that instrument.
 
+## WhatsApp alerts (Twilio)
+
+Traders can get alerts on WhatsApp through the Twilio WhatsApp sandbox: standing instructions (armed, triggered, filled, rejected, expired, cancelled, needs review, holdings alerts), order updates, security events (kill switch, orders placed outside Countersign, new sign-ins, PIN / passkey / authenticator changes, 021 account linked or unlinked) and price watches every 2, 5, 10, 15 or 30 minutes. Link a number in the app with a 6-digit code, choose categories, and reply with read-only commands (HELP, PNL, HOLDINGS, POSITIONS, ORDERS, PRICE, MANDATES, WATCH, UNWATCH, WATCHES, PAUSE, RESUME, STOP, START).
+
+**WhatsApp is a notification and read-only channel.** It can never approve, place, modify or cancel anything; trading verbs get a pointer to the app, where every action still needs a passkey, app PIN or authenticator code. The Twilio credentials live only in the separate `notifier` process (port 8300); without them it runs in log-only mode (messages are recorded, not sent). Setup: `SETUP.md` section 3c; endpoints: `docs/API.md`; threat model: `docs/SECURITY.md` section 10.
+
 ## What the copilot does (021-01 levels)
 
 | Level | Examples that work | How |
