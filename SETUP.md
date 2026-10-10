@@ -86,6 +86,10 @@ With `CS_021_UCC` and `CS_021_PASSWORD` set, `scripts/dev.py` starts the `gatewa
 **To stop:** press `Ctrl+C` in that terminal, or run `uv run --project backend python scripts/stop.py`.
 **Next time:** just open Docker Desktop, run step 4.2, open the browser and sign in.
 
+**Local AI (Ollama).** If [Ollama](https://ollama.com) is installed, `dev.py` starts it in the background when it is not running (pass `--no-ollama` to skip this). Pull the model once with `ollama pull qwen3:4b-instruct-2507-q4_K_M` (about 2.3 GB). It is the third model in the default chain (Groq, then Gemini, then Ollama), and you can pick it directly in the Copilot's model menu. Ollama keeps running after the stack stops and unloads the model when idle.
+
+**Offline mode (no internet).** Run `uv run --project backend python scripts/dev.py --offline`. It skips the 021 gateway (every account trades on the local paper broker with replay prices) and uses only the local Ollama model, falling back to the deterministic engine when Ollama is not available. Docker images and the Ollama model must already be downloaded, and you open the app at http://localhost:3000 (the public HTTPS link needs internet).
+
 ## 5. Things to try
 
 - The suggested prompts on the Copilot page (the official 021-01 examples): P&L, losers, average price, NIFTY options, "Buy 10 Reliance at market", "Sell half my TCS", a stop-loss move, standing instructions and plans. On the 021 sandbox prices are real (RELIANCE trades near Rs 1,200), so "If Reliance drops below 2800, buy 10" is already true: the copilot says so and offers to buy now or to choose a lower trigger.
