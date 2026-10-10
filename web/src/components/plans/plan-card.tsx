@@ -299,7 +299,7 @@ export function PlanCard({ proposal, className }: { proposal: Proposal; classNam
             {s.depends_on && (
               <div className="flex items-center gap-2 pl-3 text-[11px] text-muted-foreground">
                 <CornerDownRight className="size-3.5 text-info" aria-hidden />
-                runs after step {s.depends_on} fills
+                runs after step {s.depends_on} fills, fully or partly
               </div>
             )}
             <StepRow
