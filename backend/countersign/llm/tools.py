@@ -34,6 +34,7 @@ DRAFT_TOOLS = [
     "propose_modify_stop_loss",
     "propose_plan",
     "propose_exit_losing_positions",
+    "propose_cancel_all_open_orders",
     "propose_rebalance",
     "propose_standing_instruction",
     "ask_clarification",
@@ -334,6 +335,15 @@ def propose_exit_losing_positions(d: ChatDeps, intraday_only: bool = True) -> di
         return _record(d, out)
 
 
+def propose_cancel_all_open_orders(d: ChatDeps, symbol: str | None = None) -> dict:
+    """The scope (every open order, or one symbol's) is read from the trader's own words; the argument is ignored."""
+    if (prev := _already(d)) is not None:
+        return prev
+    with session_scope() as s:
+        out = proposals.create_cancel_all_plan(s, user_text=d.user_text, account=_account(d), user_id=d.user_id, engine=d.engine, conversation_id=d.conversation_id, origin=d.origin)
+        return _record(d, out)
+
+
 def propose_rebalance(d: ChatDeps, max_weight_pct: float) -> dict:
     if (prev := _already(d)) is not None:
         return prev
@@ -440,6 +450,7 @@ propose_standing_instruction = _single_draft(propose_standing_instruction)
 propose_modify_stop_loss = _single_draft(propose_modify_stop_loss)
 propose_exit_losing_positions = _single_draft(propose_exit_losing_positions)
 propose_rebalance = _single_draft(propose_rebalance)
+propose_cancel_all_open_orders = _single_draft(propose_cancel_all_open_orders)
 
 TOOL_FUNCS = {
     f.__name__: f
@@ -457,6 +468,7 @@ TOOL_FUNCS = {
         propose_modify_stop_loss,
         propose_plan,
         propose_exit_losing_positions,
+        propose_cancel_all_open_orders,
         propose_rebalance,
         propose_standing_instruction,
         ask_clarification,

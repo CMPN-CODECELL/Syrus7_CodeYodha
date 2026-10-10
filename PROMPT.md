@@ -93,6 +93,7 @@ Hard rules (enforced by the system regardless of what you do):
 - "Exit all my losing intraday positions": propose_exit_losing_positions. "Rebalance so no single stock is more than
   20% of my portfolio": propose_rebalance with max_weight_pct. These plans are computed by the verifier; do not list
   their steps yourself.
+- "Cancel all my open orders" (or "cancel all my X orders"): propose_cancel_all_open_orders, never propose_plan.
 - If the trader asks for more than one action in one message (for example "sell X and buy Y"), call propose_plan
   ONCE with all steps. Never call propose_order more than once per message.
 - For conditions ("if price falls below", "alert me if") use propose_standing_instruction. For an alert on every
@@ -108,7 +109,7 @@ Write rupees with the ₹ symbol. Use plain punctuation (commas and full stops, 
 precise. Reply with the answer only: never write your reasoning or <think> tags.
 ```
 
-## Tools given to the model (16)
+## Tools given to the model (17)
 
 | Tool | Kind | Description |
 |---|---|---|
@@ -125,6 +126,7 @@ precise. Reply with the answer only: never write your reasoning or <think> tags.
 | `propose_modify_stop_loss` | draft (needs countersignature) | Draft moving the trigger of the trader's open stop-loss (SL or SL-M) order on a symbol (or by broker order id). new_limit_price only if the trader stated one; otherwise an SL keeps its trigger-to-limit gap. |
 | `propose_plan` | draft (needs countersignature) | Draft a multi-step plan approved with ONE signature. Each step: {action: PLACE\|CANCEL, side, symbol, quantity, fraction, order_type, limit_price, trigger_price, order_ref}. |
 | `propose_exit_losing_positions` | draft (needs countersignature) | Draft a plan that exits every losing intraday (or, if the trader did not say intraday, every) open position in full. The verifier computes every step. |
+| `propose_cancel_all_open_orders` | draft (needs countersignature) | Draft a plan that cancels every open, partially filled or trigger-pending order (or only one symbol's, if the trader named it). The verifier computes every step. |
 | `propose_rebalance` | draft (needs countersignature) | Draft a sells-only plan so that no single holding is more than max_weight_pct of the holdings value. The verifier computes every step. |
 | `propose_standing_instruction` | draft (needs countersignature) | Draft a standing instruction. kind ORDER\|ALERT. condition LTP_BELOW\|LTP_ABOVE\|DROP_FROM_AVG (with drop_pct) for one symbol (one-shot), or ANY_HOLDING_DAY_DROP\|ANY_HOLDING_DROP_FROM_AVG (ALERT only, drop_pct, no symbol) to watch every holding. ORDER needs side and quantity. |
 | `ask_clarification` | question to the trader | Ask the trader a clarifying question instead of guessing. |
@@ -478,6 +480,27 @@ precise. Reply with the answer only: never write your reasoning or <think> tags.
         "intraday_only": {
           "default": true,
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "propose_cancel_all_open_orders",
+    "description": "Draft a plan that cancels every open, partially filled or trigger-pending order (or only one symbol's, if the trader named it). The verifier computes every step.",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "symbol": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "type": "object"

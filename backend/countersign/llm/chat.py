@@ -33,6 +33,7 @@ TOOL_LABELS = {
     "propose_modify_stop_loss": "Drafting stop-loss modification for verification",
     "propose_plan": "Drafting plan for verification",
     "propose_exit_losing_positions": "Computing exits for losing positions",
+    "propose_cancel_all_open_orders": "Listing open orders to cancel",
     "propose_rebalance": "Computing a sells-only rebalance",
     "propose_standing_instruction": "Drafting standing instruction for verification",
     "ask_clarification": "Asking you to clarify",
@@ -164,7 +165,7 @@ def _dedupe_clarify(cards: list[dict]) -> list[dict]:
     return out
 
 
-FULLY_PARSED = {"order", "plan", "modify", "cancel"}
+FULLY_PARSED = {"order", "plan", "modify", "cancel", "cancel_all"}
 _REFUSAL = re.compile(r"\b(?:can['’]?t|cannot|won['’]?t|unable to|not able to)\b[^.]{0,40}\b(?:comply|help|assist|do that|do this|fulfil|fulfill)\b", re.I)
 
 
@@ -177,6 +178,10 @@ def _instruments_known(parsed) -> bool:
         refs = [parsed.order.instrument_ref]
     elif parsed.kind == "plan" and parsed.plan is not None:
         refs = [st.instrument_ref for st in parsed.plan.steps]
+    elif parsed.kind == "cancel_all":
+        if not parsed.args.get("symbol"):
+            return True  # every open order: no instrument named, nothing to mistake for a ticker
+        refs = [parsed.args["symbol"]]
     else:
         return False
     try:

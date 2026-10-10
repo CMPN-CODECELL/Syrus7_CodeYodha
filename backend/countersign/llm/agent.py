@@ -42,6 +42,7 @@ Hard rules (enforced by the system regardless of what you do):
 - "Exit all my losing intraday positions": propose_exit_losing_positions. "Rebalance so no single stock is more than
   20% of my portfolio": propose_rebalance with max_weight_pct. These plans are computed by the verifier; do not list
   their steps yourself.
+- "Cancel all my open orders" (or "cancel all my X orders"): propose_cancel_all_open_orders, never propose_plan.
 - If the trader asks for more than one action in one message (for example "sell X and buy Y"), call propose_plan
   ONCE with all steps. Never call propose_order more than once per message.
 - For conditions ("if price falls below", "alert me if") use propose_standing_instruction. For an alert on every
@@ -224,6 +225,11 @@ def build_agent(model: Model, *, extra_instructions: str = "", retries: int = 1)
     def propose_exit_losing_positions(ctx: RunContext[ChatDeps], intraday_only: bool = True) -> dict:
         """Draft a plan that exits every losing intraday (or, if the trader did not say intraday, every) open position in full. The verifier computes every step."""
         return T.propose_exit_losing_positions(ctx.deps, intraday_only)
+
+    @agent.tool
+    def propose_cancel_all_open_orders(ctx: RunContext[ChatDeps], symbol: str | None = None) -> dict:
+        """Draft a plan that cancels every open, partially filled or trigger-pending order (or only one symbol's, if the trader named it). The verifier computes every step."""
+        return T.propose_cancel_all_open_orders(ctx.deps, symbol)
 
     @agent.tool
     def propose_rebalance(ctx: RunContext[ChatDeps], max_weight_pct: float) -> dict:

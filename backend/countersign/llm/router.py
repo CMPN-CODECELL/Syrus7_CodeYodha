@@ -21,6 +21,7 @@ SUGGESTIONS = [
     "If Reliance drops below 1150, buy 10",
     "Tell me when any holding falls 3% in a day",
     "Exit all my losing intraday positions",
+    "Cancel all my open orders",
     "Rebalance so no single stock is more than 20% of my portfolio",
 ]
 
@@ -47,6 +48,8 @@ def handle(d: ChatDeps) -> str:
             out = proposals.create_mandate(s, parsed.mandate, **common)
         elif k == "exit_losers":
             out = proposals.create_exit_plan(s, **common)
+        elif k == "cancel_all":
+            out = proposals.create_cancel_all_plan(s, **common)
         elif k == "rebalance":
             out = proposals.create_rebalance_plan(s, max_pct=parsed.args.get("max_pct"), **common)
         else:
@@ -57,13 +60,15 @@ def handle(d: ChatDeps) -> str:
         return "I need one detail before I can prepare this."
     if res.get("status") == "NOTHING_DRAFTED":
         return res["message"]
-    is_plan = k in ("plan", "exit_losers", "rebalance")
+    is_plan = k in ("plan", "exit_losers", "rebalance", "cancel_all")
     if res["status"] == "BLOCKED":
         return f"I prepared the canonical {('plan' if is_plan else 'instruction' if k == 'mandate' else 'order')}, but the verifier blocked it. The card shows exactly why; nothing can be approved until it is fixed."
     if k == "mandate":
         if parsed.mandate is not None and parsed.mandate.scope == "ALL_HOLDINGS":
             return "Here is the exact alert. It watches every stock you hold, fires at most once per holding per trading day, survives restarts and never places an order. Countersign it to arm it."
         return "Here is the exact standing instruction. It fires at most once, only within the scope you sign. Countersign it with your passkey to arm it."
+    if k == "cancel_all":
+        return "Here is the plan the verifier computed: one CANCEL step per open order. One countersignature binds every step; a partly filled order keeps what already filled, and nothing new is placed."
     if k in ("exit_losers", "rebalance"):
         return "Here is the plan the verifier computed, with the arithmetic on each step. One countersignature binds every step; I will report exactly what fills and what is rejected, and no compensating trades are made."
     if k == "plan":
