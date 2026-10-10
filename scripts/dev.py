@@ -9,7 +9,11 @@ Credential zones are enforced at process launch: each process receives only the 
   gateway021 (only when CS_021_UCC and CS_021_PASSWORD are set in .env): the 021 sandbox adapter. It verifies the
              read / write / admin / audit keys like the paper broker and is the ONLY process that loads the 021 UCC,
              password and access token (it reads them from .env itself; they are stripped from every other process).
-Usage:  uv run --project backend python scripts/dev.py [--no-web] [--no-docker] [--no-021]"""
+  ollama   : the local model server is started (hidden) when it is installed but not running, so the AI fallback
+             chain can reach it after a reboot; --no-ollama skips this.
+--offline  : runs with no internet: no 021 gateway (paper broker and replay prices), and the AI is the local Ollama
+             model only (CS_LLM_ORDER=ollama), with the deterministic engine when Ollama is not available.
+Usage:  uv run --project backend python scripts/dev.py [--no-web] [--no-docker] [--no-021] [--no-ollama] [--offline]"""
 
 from __future__ import annotations
 
@@ -58,6 +62,29 @@ def py() -> str:
     return str(win if win.exists() else nix if nix.exists() else sys.executable)
 
 
+def ollama_exe() -> str | None:
+    import shutil
+
+    found = shutil.which("ollama")
+    if found:
+        return found
+    local = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
+    return str(local) if os.name == "nt" and local.exists() else None
+
+
+def ensure_ollama() -> str:
+    """Starts `ollama serve` in the background when Ollama is installed but not listening on 11434. It keeps running
+    after the stack stops (it unloads its model when idle). Returns a one-line status."""
+    if wait_port(11434, 0.5):
+        return "already running"
+    exe = ollama_exe()
+    if exe is None:
+        return "not installed (the AI falls back to the cloud models or the deterministic engine)"
+    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0
+    subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=flags, start_new_session=os.name != "nt")
+    return "started" if wait_port(11434, 20) else "did not start within 20 s (see the Ollama app)"
+
+
 def wait_port(port: int, timeout: float = 60) -> bool:
     import socket
 
@@ -78,8 +105,14 @@ def main() -> None:
     base = {kk: v for kk, v in os.environ.items() if not kk.startswith(("CS_BROKER_", "CS_021_UCC", "CS_021_PASSWORD"))}
     base["PYTHONIOENCODING"] = "utf-8"
     base["PYTHONUNBUFFERED"] = "1"
-    use_021 = "--no-021" not in args and has_021_credentials()
+    offline = "--offline" in args
+    use_021 = not offline and "--no-021" not in args and has_021_credentials()
     base["CS_GATEWAY021_ENABLED"] = "true" if use_021 else "false"
+    if offline:
+        # Only the local model: the cloud models are never tried, so no turn waits on a network that is not there.
+        base["CS_LLM_ORDER"] = "ollama"
+    if offline or "--no-ollama" not in args:
+        print(f"ollama: {ensure_ollama()}")
 
     if "--no-docker" not in args:
         print("starting postgres + valkey (docker compose)...")
@@ -129,6 +162,8 @@ def main() -> None:
         owners = os.environ.get("CS_021_OWNER_EMAILS") or next((ln.split("=", 1)[1].strip() for f in (ROOT / ".env", ROOT / ".env.local") if f.exists() for ln in f.read_text(encoding="utf-8").splitlines() if ln.startswith("CS_021_OWNER_EMAILS=")), "")
         if not owners:
             print("            CS_021_OWNER_EMAILS is empty: nobody is linked to the 021 account until you list sign-in emails there")
+    elif offline:
+        print("  Offline   paper broker + replay prices; AI = local Ollama (deterministic engine if Ollama is off)")
     else:
         print("  021       not started (set CS_021_UCC and CS_021_PASSWORD in .env to trade on the 021 sandbox)")
     print("  Logs      .logs/*.log      (Ctrl+C to stop everything)\n")
