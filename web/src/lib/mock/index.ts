@@ -4,7 +4,7 @@ import type { CountersignApi } from "../api";
 import { EMAIL_RE, PASSWORD_MAX, PASSWORD_MIN, weakPinReason } from "../auth";
 import { ApiError } from "../errors";
 import { link021Codec } from "../link021";
-import type { HistoryPoint, Link021Key, Me, OptionChain, PublicStatus, Quote, StepUpMethod } from "../types";
+import type { HistoryPoint, Link021Key, Me, OptionChain, PublicStatus, Quote, StepUpMethod, WhatsAppState, WhatsAppWatch } from "../types";
 import { chatHistory, simulateChat } from "./chat";
 import { MOCK_TOTP, engine, sleep } from "./engine";
 import {
@@ -81,6 +81,97 @@ function requireFreshStepUp() {
   if (methods.length && Date.now() > stepUpUntil) {
     throw new ApiError(403, "STEP_UP_REQUIRED", "Confirm it is you with a method you already have, then try again.", undefined, { methods });
   }
+}
+
+// WhatsApp alerts. The mock plays the server: Twilio sandbox details, a one-time code, and a log of sent messages.
+// Like the API, nothing here can approve, place, modify or cancel a trade.
+export const MOCK_WHATSAPP_CODE = "246810";
+const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+const wa: WhatsAppState & { pendingPhone: string | null } = {
+  configured: true,
+  mode: "live",
+  sandbox: { number: "+1 415 523 8886", join_hint: "join silver-tiger" },
+  link: null,
+  pendingPhone: null,
+  prefs: { orders: true, mandates: true, security: true, digests: false },
+  watches: [
+    {
+      id: "w_tcs",
+      symbol: "TCS",
+      interval_min: 5,
+      min_move_pct: null,
+      market_hours_only: true,
+      active: true,
+      last_sent_at: minutesAgo(3),
+      last_price: 4123.4,
+    },
+    {
+      id: "w_itc",
+      symbol: "ITC",
+      interval_min: 15,
+      min_move_pct: 0.5,
+      market_hours_only: false,
+      active: false,
+      last_sent_at: minutesAgo(190),
+      last_price: 468.15,
+    },
+  ],
+  recent: [
+    { at: minutesAgo(3), kind: "watch", status: "SENT", preview: "TCS 4,123.40 (+0.42% today). Next update in 5 min. Reply UNWATCH TCS to stop." },
+    { at: minutesAgo(26), kind: "order", status: "SENT", preview: "Filled: BUY 10 RELIANCE @ 2,931.20. Countersigned with passkey on this account." },
+    { at: minutesAgo(48), kind: "command", status: "SENT", preview: "PNL: today +1,284.50 across 6 holdings. Read only: BUY and SELL are refused here." },
+    { at: minutesAgo(31 * 60), kind: "digest", status: "FAILED", preview: "Daily digest for 9 Oct could not be delivered (63016 outside the 24 hour window)." },
+    { at: minutesAgo(32 * 60), kind: "security", status: "LOGGED", preview: "New sign-in from Chrome on Windows. If this was not you, engage the kill switch in the app." },
+  ],
+};
+
+// Kept in sessionStorage like the rest of the mock state, so a linked number survives a page load.
+const WA_KEY = "cs_mock_whatsapp_v1";
+let waLoaded = false;
+
+function waLoad() {
+  if (waLoaded) return;
+  waLoaded = true;
+  try {
+    const raw = typeof window === "undefined" ? null : sessionStorage.getItem(WA_KEY);
+    if (raw) Object.assign(wa, JSON.parse(raw));
+  } catch {
+    // storage unavailable: the seed state is used
+  }
+}
+
+function waSave() {
+  try {
+    sessionStorage.setItem(WA_KEY, JSON.stringify(wa));
+  } catch {
+    // ignore
+  }
+}
+
+/** Runs a WhatsApp mock handler against the stored state and saves what it changed. */
+function waDo<T>(fn: () => T): T {
+  waLoad();
+  const out = fn();
+  waSave();
+  return out;
+}
+
+function waState(): WhatsAppState {
+  const { pendingPhone: _pending, ...rest } = wa;
+  void _pending;
+  return rest;
+}
+
+function waLog(kind: string, preview: string) {
+  const live = wa.mode === "live" && wa.link?.verified && wa.link.opted_in;
+  const paused = wa.link?.paused_until && new Date(wa.link.paused_until).getTime() > Date.now();
+  wa.recent.unshift({ at: new Date().toISOString(), kind, status: paused ? "PAUSED" : live ? "SENT" : "LOGGED", preview });
+  wa.recent = wa.recent.slice(0, 20);
+}
+
+function maskPhone(p: string): string {
+  const digits = p.replace(/\D/g, "");
+  return `+${digits.slice(0, 2)} ${"•".repeat(5)} ${digits.slice(-4)}`;
 }
 
 // Failed sign-ins per email: 5 free attempts, then 30 s doubling up to 15 min (mirrors the API).
@@ -481,6 +572,8 @@ export const mockApi: CountersignApi = {
     ),
   cancelMandate: (id) =>
     authed(() => {
+      // Cancelling a standing instruction needs a fresh countersignature, like the API.
+      requireFreshStepUp();
       const p = [...engine.s.proposals.values()].find((x) => x.mandate?.mandate_id === id);
       if (!p?.mandate) throw new ApiError(404, "NOT_FOUND", `Mandate ${id} does not exist.`);
       if (!["ACTIVE", "NEEDS_REVIEW", "PENDING_APPROVAL"].includes(p.mandate.state)) {
@@ -553,6 +646,80 @@ export const mockApi: CountersignApi = {
       engine.audit("user:demo", "DEMO_BROKER_FAULT", "broker", mode);
       return { ok: true, broker_fault: mode };
     }),
+
+  whatsapp: () => authed(() => waDo(() => waState())),
+  whatsappLink: (phone) =>
+    authed(() => waDo(() => {
+      const clean = phone.replace(/[\s()-]/g, "");
+      if (!/^\+[1-9]\d{7,14}$/.test(clean)) {
+        throw new ApiError(422, "PHONE_INVALID", "Enter the number in international format, for example +91 98765 43210.");
+      }
+      wa.pendingPhone = clean;
+      return { phone_masked: maskPhone(clean), expires_at: new Date(Date.now() + 10 * 60_000).toISOString() };
+    })),
+  whatsappVerify: (code) =>
+    authed(() => waDo(() => {
+      if (!wa.pendingPhone) throw new ApiError(409, "NO_PENDING_LINK", "Send a code to your number first.");
+      if (code !== MOCK_WHATSAPP_CODE) throw new ApiError(400, "CODE_INVALID", "That code is not right. Check the latest WhatsApp message and try again.");
+      wa.link = { phone_masked: maskPhone(wa.pendingPhone), verified: true, opted_in: true, paused_until: null, window_hint: "Last message from you 2 min ago: delivery window open for about 23 h." };
+      wa.pendingPhone = null;
+      waLog("system", "Countersign: this number is linked. Alerts only; trades are approved in the app with your passkey, PIN or authenticator code.");
+      return { verified: true as const };
+    })),
+  whatsappUnlink: () =>
+    authed(() => waDo(() => {
+      wa.link = null;
+      wa.pendingPhone = null;
+    })),
+  whatsappPrefs: (prefs) =>
+    authed(() => waDo(() => {
+      wa.prefs = { ...prefs };
+      return wa.prefs;
+    })),
+  whatsappPause: (minutes) =>
+    authed(() => waDo(() => {
+      if (!wa.link) throw new ApiError(409, "NOT_LINKED", "Link a WhatsApp number first.");
+      wa.link.paused_until = new Date(Date.now() + minutes * 60_000).toISOString();
+    })),
+  whatsappResume: () =>
+    authed(() => waDo(() => {
+      if (wa.link) wa.link.paused_until = null;
+    })),
+  whatsappAddWatch: (body) =>
+    authed(() => waDo((): WhatsAppWatch => {
+      const symbol = body.symbol.trim().toUpperCase();
+      if (!symbol) throw new ApiError(422, "SYMBOL_REQUIRED", "Pick a stock to watch.");
+      if (wa.watches.some((w) => w.symbol === symbol)) throw new ApiError(409, "WATCH_EXISTS", `You already watch ${symbol}. Delete it first to change the interval.`);
+      if (wa.watches.length >= 5) throw new ApiError(409, "WATCH_LIMIT", "You can watch up to 5 stocks on WhatsApp.");
+      const w: WhatsAppWatch = {
+        id: `w_${symbol.toLowerCase()}_${Date.now().toString(36)}`,
+        symbol,
+        interval_min: body.interval_min,
+        min_move_pct: body.min_move_pct ?? null,
+        market_hours_only: !!body.market_hours_only,
+        active: true,
+        last_sent_at: null,
+        last_price: null,
+      };
+      wa.watches.push(w);
+      return w;
+    })),
+  whatsappDeleteWatch: (id) =>
+    authed(() => waDo(() => {
+      wa.watches = wa.watches.filter((w) => w.id !== id);
+    })),
+  whatsappSetWatchActive: (id, active) =>
+    authed(() => waDo(() => {
+      const w = wa.watches.find((x) => x.id === id);
+      if (!w) throw new ApiError(404, "NOT_FOUND", `Watch ${id} does not exist.`);
+      w.active = active;
+      return w;
+    })),
+  whatsappTest: () =>
+    authed(() => waDo(() => {
+      if (!wa.link?.verified) throw new ApiError(409, "NOT_LINKED", "Link and verify a WhatsApp number first.");
+      waLog("test", "Countersign test message. Reply HELP for commands. BUY and SELL are refused here.");
+    })),
 
   subscribe(handlers) {
     handlers.onStatus("connecting", { attempt: 0 });
