@@ -552,6 +552,18 @@ def _parse_modify_stop_loss(t: str, facts: Facts) -> Parsed:
     )
 
 
+def _plan_at_market(t: str, parts: list[str]) -> list[str]:
+    """The whole plan with 'at market' added to every step that names no price, offered only when it then parses."""
+    fixed = t
+    for p in parts:
+        intent, _, opts = _order_from_text(p, extract_facts(p))
+        if intent is None and opts and opts[0].lower().endswith("at market"):
+            fixed = fixed.replace(p.strip(), p.strip() + " at market", 1)
+    if fixed == t or parse(fixed).kind != "plan":
+        return []
+    return [fixed]
+
+
 def _parse_plan(t: str, parts: list[str], facts: Facts) -> Parsed:
     steps: list[OrderIntent] = []
     last_cancelled_ref: str | None = None
@@ -579,7 +591,7 @@ def _parse_plan(t: str, parts: list[str], facts: Facts) -> Parsed:
             )
         intent, q, opts = _order_from_text(p, pf)
         if intent is None:
-            return Parsed(kind="clarify", question=f"For the step '{p.strip()}': {q}", options=[], facts=facts)
+            return Parsed(kind="clarify", question=f"For the step '{p.strip()}': {q}", options=_plan_at_market(t, parts) if opts else [], facts=facts)
         steps.append(intent)
     return Parsed(kind="plan", plan=PlanIntent(steps=steps), facts=facts)
 
