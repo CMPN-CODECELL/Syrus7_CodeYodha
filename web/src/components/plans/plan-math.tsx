@@ -7,7 +7,7 @@ import type { Issue, PlanDetail, PlanFact, PlanKind, PlanMathColumn, Proposal, P
 import { cn } from "@/lib/utils";
 
 /** Notes the verifier attaches to a plan it computed itself: the method, the scope and the resulting weights. */
-export const PLAN_NOTE_RE = /^(EXIT_|REBALANCE_|CANCEL_ALL_)/;
+export const PLAN_NOTE_RE = /^(EXIT_|REBALANCE_|CANCEL_ALL_|SLICE_)/;
 
 /**
  * Which computed plan this is: from an explicit plan object ("exit_losing_intraday", "exit-losing-intraday", ...) or
@@ -108,7 +108,8 @@ export function PlanNotes({ proposal, className }: { proposal: Proposal; classNa
   return (
     <div className={cn("space-y-2.5 rounded-lg bg-surface-2/50 p-3 ring-1 ring-hairline", className)}>
       <Eyebrow className="flex items-center gap-1.5">
-        <Calculator className="size-3.5 text-info" aria-hidden /> How this plan was computed
+        <Calculator className="size-3.5 text-info" aria-hidden />{" "}
+        {notes.every((n) => n.code.startsWith("SLICE_")) ? "How 021 receives this" : "How this plan was computed"}
       </Eyebrow>
       {notes.map((n: Issue) => {
         const weights = n.code === "REBALANCE_RESULT" ? parseWeights(n.message) : null;
