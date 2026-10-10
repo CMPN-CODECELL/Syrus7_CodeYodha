@@ -230,6 +230,15 @@ def test_a_recovered_failure_is_not_reported_as_current(fake):
     assert c.stats.last_error == "POST /orders: timeout" and c.stats.current_error() is None
 
 
+def test_rejected_orders_reported_as_order_0_never_collide():
+    o21 = mapping.to_021_order(_body("CSTEST021Z1"), "NSECM", 1594)
+    for tag in ("CSTEST021Z1", "CSTEST021Z2"):
+        store.create(tag, ACCT, mapping.request_fingerprint(o21), _body(tag), o21)
+        store.update(tag, state="REJECTED", order_id="0", error="Price must be higher than the lower circuit limit")
+        assert store.get(tag)["state"] == "REJECTED" and store.get(tag)["broker_order_id"] is None
+    store.delete_tags("CSTEST021Z")
+
+
 # ------------------------------------------------------------------ mapping
 
 

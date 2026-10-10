@@ -128,6 +128,8 @@ def create(tag: str, account_id: str, fp: str, request: dict, order_021: dict) -
 
 
 def update(tag: str, **kw) -> None:
+    if "order_id" in kw and str(kw["order_id"] or "") in ("", "0", "None"):
+        kw["order_id"] = None  # 021 lists every rejected order as order 0: that is not an id, and it is not unique
     with _sf()() as s:
         a = s.get(Attempt, tag)
         if a is None:
