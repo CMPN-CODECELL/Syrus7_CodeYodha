@@ -131,7 +131,7 @@ def link(body: LinkBody, p: Principal = Depends(current)):
         wa.prefs_of(s, p.user_id)
         audit.record(s, "trader", "WHATSAPP_CODE_SENT", "user", p.user_id, {"phone": wa.mask_phone(phone)})
         expires = row.expires_at
-    delivery = wa.send_via_notifier(p.user_id, "verify", f"Your Countersign verification code is {code}. It expires in 10 minutes.", pending=True)
+    delivery = wa.send_via_notifier(p.user_id, "verify", f"*Countersign verification code*\n\nYour code is *{code}*.\nIt expires in 10 minutes. Never share it with anyone.", pending=True)
     return {"phone_masked": wa.mask_phone(phone), "expires_at": iso(expires), "delivery": delivery}
 
 
@@ -140,9 +140,11 @@ class CodeBody(BaseModel):
 
 
 WELCOME = (
-    "Countersign alerts are on. WhatsApp is read-only: it can never approve, place or cancel anything.\n"
-    "Commands: HELP, PNL, HOLDINGS, POSITIONS, ORDERS, PRICE <SYMBOL>, MANDATES, WATCH <SYMBOL> <MINUTES> [MIN%], "
-    "UNWATCH <SYMBOL>, WATCHES, PAUSE <N>H, RESUME, STOP, START"
+    "*Countersign alerts are on*\n\n"
+    "You will get alerts for your orders, standing instructions and account security.\n\n"
+    "*WhatsApp is read only.* It can never approve, place or cancel a trade. Approvals happen only in the app, "
+    "with your passkey or PIN.\n\n"
+    "Try *PNL*, *HOLDINGS* or *PRICE ITC*. Send *HELP* for every command."
 )
 
 
@@ -312,7 +314,7 @@ def test_message(p: Principal = Depends(current)):
         lk = s.get(WhatsAppLink, p.user_id)
         if lk is None or lk.verified_at is None:
             raise _err(409, "NOT_VERIFIED", "Link and verify your WhatsApp number first.")
-    return wa.send_via_notifier(p.user_id, "test", "Countersign test message: alerts are working.")
+    return wa.send_via_notifier(p.user_id, "test", "*Countersign test message*\nYour WhatsApp alerts are working.")
 
 
 # ------------------------------------------------------------------ inbound (Twilio webhook): read-only commands
@@ -322,26 +324,44 @@ TRADING_VERBS = {
     "ORDER", "TRADE", "EXECUTE", "SIGN", "COUNTERSIGN", "ACCEPT", "REJECT", "YES", "OK", "ARM", "DISARM", "KILL",
 }
 HELP = (
-    "Countersign on WhatsApp is read-only.\n"
-    "PNL, HOLDINGS, POSITIONS, ORDERS, MANDATES\n"
-    "PRICE <SYMBOL>\n"
-    "WATCH <SYMBOL> <MINUTES> [MIN%]  (minutes: 2, 5, 10, 15 or 30)\n"
-    "UNWATCH <SYMBOL>, WATCHES\n"
-    "PAUSE <N>H, RESUME, STOP, START\n"
-    "Orders and approvals happen only in the app."
+    "*Countersign commands*\n\n"
+    "*Your account*\n"
+    "- *PNL*: today's and total P&L\n"
+    "- *HOLDINGS*: your holdings\n"
+    "- *POSITIONS*: open positions\n"
+    "- *ORDERS*: today's orders\n"
+    "- *MANDATES*: your standing instructions\n\n"
+    "*Prices*\n"
+    "- *PRICE ITC*: live price\n"
+    "- *WATCH TCS 5*: an update every 5 minutes (2, 5, 10, 15 or 30)\n"
+    "- *WATCH TCS 5 1%*: only when it moves 1% or more\n"
+    "- *UNWATCH TCS*: stop a watch\n"
+    "- *WATCHES*: list your watches\n\n"
+    "*Alerts*\n"
+    "- *PAUSE 2H* and *RESUME*\n"
+    "- *STOP* and *START*\n\n"
+    "_WhatsApp is read only. Orders and approvals happen only in the app._"
 )
 
 
 def refusal() -> str:
-    return f"WhatsApp can't place or approve orders. Open Countersign to draft and countersign: {wa.public_app_url()}/copilot"
+    return (
+        "*WhatsApp can't place or approve orders*\n\n"
+        f"For your safety, trades are drafted and countersigned only in the app:\n{wa.public_app_url()}/copilot"
+    )
 
 
 def not_linked() -> str:
-    return f"This number is not linked to Countersign. Open {wa.public_app_url()}, go to Settings > WhatsApp alerts and link it with a code."
+    return (
+        "*This number is not linked to Countersign*\n\n"
+        f"1. Open {wa.public_app_url()}\n"
+        "2. Go to *WhatsApp alerts* in the menu\n"
+        "3. Enter this number and the code we send you"
+    )
 
 
 def _broker_down() -> str:
-    return "Could not reach your broker account right now. Try again in a minute."
+    return "*Broker not reachable*\nCould not reach your broker account right now. Try again in a minute."
 
 
 def _acct(s: Session, user_id: str) -> str | None:
@@ -355,12 +375,15 @@ def _acct(s: Session, user_id: str) -> str | None:
 def _cmd_pnl(s: Session, uid: str) -> str:
     acct = _acct(s, uid)
     if acct is None:
-        return "No trading account is linked to your Countersign user."
+        return "*No trading account*\nNo trading account is linked to your Countersign user."
     m = portfolio.summary(s, read_gateway(acct), acct)
     return (
-        f"P&L today {inr(m['day_pnl_paise'], signed=True)}, total {inr(m['total_pnl_paise'], signed=True)}.\n"
-        f"Holdings {inr(m['holdings_value_paise'])} ({m['holdings_count']}), positions {m['positions_count']}, open orders {m['open_orders_count']}.\n"
-        f"Available {inr(m['available_margin_paise'])}."
+        "*Your P&L*\n\n"
+        f"- Today: *{inr(m['day_pnl_paise'], signed=True)}*\n"
+        f"- Total: *{inr(m['total_pnl_paise'], signed=True)}*\n"
+        f"- Holdings: {inr(m['holdings_value_paise'])} ({m['holdings_count']} stocks)\n"
+        f"- Positions: {m['positions_count']} · Open orders: {m['open_orders_count']}\n"
+        f"- Available: {inr(m['available_margin_paise'])}"
     )
 
 
@@ -368,96 +391,120 @@ def _cmd_holdings(s: Session, uid: str) -> str:
     acct = _acct(s, uid)
     rows = portfolio.holdings(s, read_gateway(acct)) if acct else []
     if not rows:
-        return "No holdings."
-    lines = [f"{h['instrument']['symbol']} {h['quantity']} @ {inr(h['avg_price_paise'])}, LTP {inr(h['ltp_paise'])}, P&L {inr(h['pnl_paise'], signed=True)}" for h in rows[:10]]
-    more = f"\n+{len(rows) - 10} more in the app." if len(rows) > 10 else ""
-    return "Holdings:\n" + "\n".join(lines) + more
+        return "*Holdings*\nYou have no holdings right now."
+    lines = [
+        f"*{h['instrument']['symbol']}* · {h['quantity']} shares\nAvg {inr(h['avg_price_paise'])} · LTP {inr(h['ltp_paise'])} · P&L *{inr(h['pnl_paise'], signed=True)}*"
+        for h in rows[:10]
+    ]
+    more = f"\n\n_+{len(rows) - 10} more in the app._" if len(rows) > 10 else ""
+    return f"*Holdings* ({len(rows)})\n\n" + "\n\n".join(lines) + more
 
 
 def _cmd_positions(s: Session, uid: str) -> str:
     acct = _acct(s, uid)
     rows = [r for r in (portfolio.positions(s, read_gateway(acct)) if acct else []) if r["quantity"] != 0]
     if not rows:
-        return "No open positions."
-    lines = [f"{r['instrument']['symbol']} {r['quantity']} {r['product']} @ {inr(r['avg_price_paise'])}, LTP {inr(r['ltp_paise'])}, P&L {inr(r['pnl_paise'], signed=True)}" for r in rows[:10]]
-    return "Positions:\n" + "\n".join(lines)
+        return "*Positions*\nNo open positions."
+    lines = [
+        f"*{r['instrument']['symbol']}* · {r['quantity']} {r['product']}\nAvg {inr(r['avg_price_paise'])} · LTP {inr(r['ltp_paise'])} · P&L *{inr(r['pnl_paise'], signed=True)}*"
+        for r in rows[:10]
+    ]
+    return f"*Positions* ({len(rows)})\n\n" + "\n\n".join(lines)
 
 
 def _cmd_orders(s: Session, uid: str) -> str:
     acct = _acct(s, uid)
     rows = portfolio.orders(s, read_gateway(acct)) if acct else []
     if not rows:
-        return "No orders today."
+        return "*Orders*\nNo orders today."
     rows = sorted(rows, key=lambda o: str(o.get("updated_at") or o.get("placed_at") or ""), reverse=True)[:8]
     out = []
     for o in rows:
-        px = f" @ {inr(o.get('limit_price_paise'))}" if o.get("limit_price_paise") else ""
-        fill = f" ({o.get('filled_quantity')}/{o.get('quantity')} filled)" if o.get("filled_quantity") else ""
-        out.append(f"{o.get('side')} {o.get('quantity')} {o['instrument']['symbol']}{px} {o.get('status')}{fill}")
-    return "Recent orders:\n" + "\n".join(out)
+        px = f" @ {inr(o.get('limit_price_paise'))}" if o.get("limit_price_paise") else " at market"
+        status = ORDER_STATUS_WORDS.get(str(o.get("status")), str(o.get("status")).replace("_", " ").title())
+        fill = f" {o.get('filled_quantity')}/{o.get('quantity')}" if o.get("filled_quantity") else ""
+        out.append(f"- {o.get('side')} {o.get('quantity')} *{o['instrument']['symbol']}*{px} · {status}{fill}")
+    return f"*Today's orders* (latest {len(rows)})\n\n" + "\n".join(out)
+
+
+ORDER_STATUS_WORDS = {
+    "COMPLETE": "Filled",
+    "OPEN": "Open",
+    "PARTIALLY_FILLED": "Partly filled",
+    "TRIGGER_PENDING": "Waiting for trigger",
+    "REJECTED": "Rejected",
+    "CANCELLED": "Cancelled",
+}
 
 
 def _cmd_price(s: Session, arg: str) -> str:
     if not arg:
-        return "Send PRICE <SYMBOL>, for example PRICE RELIANCE."
+        return "Send *PRICE <SYMBOL>*, for example *PRICE RELIANCE*."
     r = instruments.resolve(s, arg[:40])
     if r.status != "RESOLVED" or r.instrument is None:
         return r.message or f"No instrument matches '{arg}'."
     t = market.latest(r.instrument.instrument_id)
     if t is None:
-        return f"No live price for {r.instrument.symbol} right now."
+        return f"No live price for *{r.instrument.symbol}* right now."
     day = (t.ltp_paise - t.prev_close_paise) * 100 / t.prev_close_paise if t.prev_close_paise else 0.0
-    return f"{r.instrument.symbol} {inr(t.ltp_paise)} ({wa.pct(day)} today)"
+    return f"*{r.instrument.symbol}* {inr(t.ltp_paise)}\n{wa.pct(day)} today"
 
 
 def _cmd_mandates(s: Session, uid: str) -> str:
     rows = s.execute(select(StandingMandate).where(StandingMandate.user_id == uid, StandingMandate.state.in_(["ACTIVE", "NEEDS_REVIEW", "TRIGGERED", "EXECUTING"])).order_by(StandingMandate.created_at.desc()).limit(10)).scalars().all()
     if not rows:
-        return "No active standing instructions."
-    from countersign.notifier.service import armed_text
+        return "*Standing instructions*\nYou have no active standing instructions."
+    from countersign.notifier.service import mandate_summary
 
     lines = []
-    for m in rows:
-        t = armed_text(m).removeprefix("Armed: ")
-        lines.append(f"[{m.state.replace('_', ' ').lower()}] {t}" if m.state != "ACTIVE" else t)
-    return "Standing instructions:\n" + "\n".join(lines) + "\nTo cancel one, open the app (it needs your passkey or PIN)."
+    for i, m in enumerate(rows, 1):
+        sentence, meta = mandate_summary(m)
+        state = "" if m.state == "ACTIVE" else f"_{m.state.replace('_', ' ').capitalize()}_ · "
+        lines.append(f"{i}. {sentence}\n    {state}{meta}")
+    return (
+        f"*Your standing instructions* ({len(rows)})\n\n" + "\n\n".join(lines)
+        + "\n\n_To cancel one, open the app. It needs your passkey or PIN._"
+    )
 
 
 def _cmd_watch(s: Session, uid: str, args: list[str]) -> str:
     if len(args) < 2 or not args[1].isdigit():
-        return "Send WATCH <SYMBOL> <MINUTES> [MIN%], for example WATCH RELIANCE 5 0.5%."
+        return "Send *WATCH <SYMBOL> <MINUTES>*, for example *WATCH RELIANCE 5*, or *WATCH RELIANCE 5 0.5%* for moves of 0.5% or more."
     mm = None
     if len(args) >= 3:
         try:
             mm = float(args[2].rstrip("%"))
         except ValueError:
-            return "Minimum move must be a number, for example 0.5%."
+            return "The minimum move must be a number, for example *0.5%*."
     try:
         w = add_watch(s, uid, args[0], int(args[1]), mm, False)
     except HTTPException as e:
         return (e.detail or {}).get("message", "Could not add that watch.") if isinstance(e.detail, dict) else "Could not add that watch."
     extra = f", only when it moves {mm:g}% or more" if mm else ""
-    return f"Watching {w.symbol} every {w.interval_min} minutes{extra}. Send UNWATCH {w.symbol} to stop."
+    return f"*Watching {w.symbol}*\nAn update every {w.interval_min} minutes{extra}.\nSend *UNWATCH {w.symbol}* to stop."
 
 
 def _cmd_unwatch(s: Session, uid: str, arg: str) -> str:
     if not arg:
-        return "Send UNWATCH <SYMBOL>."
+        return "Send *UNWATCH <SYMBOL>*, for example *UNWATCH RELIANCE*."
     sym = instruments.normalize_symbol(arg)
     rows = s.execute(select(WhatsAppWatch).where(WhatsAppWatch.user_id == uid, WhatsAppWatch.symbol == sym)).scalars().all()
     if not rows:
-        return f"You are not watching {sym}."
+        return f"You are not watching *{sym}*."
     for w in rows:
         s.delete(w)
-    return f"Stopped watching {sym}."
+    return f"*Watch stopped*\nNo more updates for {sym}."
 
 
 def _cmd_watches(s: Session, uid: str) -> str:
     rows = s.execute(select(WhatsAppWatch).where(WhatsAppWatch.user_id == uid).order_by(WhatsAppWatch.created_at)).scalars().all()
     if not rows:
-        return "No watches. Send WATCH <SYMBOL> <MINUTES> to add one."
-    lines = [f"{w.symbol} every {w.interval_min} min" + (f", min move {w.min_move_pct:g}%" if w.min_move_pct else "") + ("" if w.active else " (paused)") for w in rows]
-    return "Watches:\n" + "\n".join(lines)
+        return "*Price watches*\nNo watches yet. Send *WATCH TCS 5* to add one."
+    lines = [
+        f"- *{w.symbol}* every {w.interval_min} min" + (f", on a {w.min_move_pct:g}% move" if w.min_move_pct else "") + ("" if w.active else " _(paused)_")
+        for w in rows
+    ]
+    return f"*Your price watches* ({len(rows)})\n\n" + "\n".join(lines)
 
 
 def handle_command(s: Session, link: WhatsAppLink, text: str, now: datetime | None = None) -> str:
@@ -473,21 +520,21 @@ def handle_command(s: Session, link: WhatsAppLink, text: str, now: datetime | No
         return HELP
     if verb == "STOP":
         link.opted_in = False
-        return "Alerts stopped. You will get no more messages from Countersign. Send START to turn them back on."
+        return "*Alerts stopped*\nYou will get no more messages from Countersign.\nSend *START* to turn them back on."
     if verb == "START":
         link.opted_in = True
-        return "Alerts are back on. Send HELP for commands."
+        return "*Alerts are back on*\nSend *HELP* for the commands."
     if verb == "PAUSE":
         m = re.fullmatch(r"(\d{1,2})H?", (args[0].upper() if args else ""))
         if not m or not (1 <= int(m.group(1)) <= 72):
-            return "Send PAUSE <N>H with N from 1 to 72, for example PAUSE 2H."
+            return "Send *PAUSE <N>H* with N from 1 to 72, for example *PAUSE 2H*."
         link.paused_until = now + timedelta(hours=int(m.group(1)))
-        return f"Alerts paused for {int(m.group(1))} hours. Send RESUME to turn them back on sooner."
+        return f"*Alerts paused for {int(m.group(1))} hours*\nSend *RESUME* to turn them back on sooner."
     if verb == "RESUME":
         link.paused_until = None
-        return "Alerts resumed."
+        return "*Alerts resumed*\nYou will get alerts again."
     if not link.opted_in and verb not in ("HELP",):
-        return "Alerts are off for this number. Send START to turn them back on."
+        return "*Alerts are off for this number*\nSend *START* to turn them back on."
     try:
         if verb == "PNL":
             return _cmd_pnl(s, uid)
