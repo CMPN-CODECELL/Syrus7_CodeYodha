@@ -1064,6 +1064,7 @@ class PlanDraft:
     notes: list[Issue] = field(default_factory=list)
     message: str | None = None
     title: str = ""
+    summaries: list[str] = field(default_factory=list)  # per-step summary when the plain one would hide state (fills)
 
 
 def _market_exit(account: AccountState, inst: Instrument, side: Side, qty: int, product: Product, ltp: int) -> CanonicalOrder:
@@ -1240,6 +1241,99 @@ def build_rebalance_plan(s: Session, account: AccountState, facts: Facts, *, max
         )
     )
     d.notes.append(Issue(code="REBALANCE_RESULT", severity="INFO", message=f"Weights now → after this plan, at live prices: {after}."))
+    return d
+
+
+CANCELLABLE_STATUSES = ("OPEN", "PARTIALLY_FILLED", "TRIGGER_PENDING")
+
+
+def _cancel_step(account: AccountState, inst: Instrument, o: dict) -> CanonicalOrder:
+    return CanonicalOrder(
+        action="CANCEL",
+        account_id=account.account_id,
+        instrument=instruments.handle(inst),
+        side=Side(o["side"]),
+        quantity=int(o["quantity"]),
+        order_type=OrderType(o["order_type"]),
+        product=Product(product_of(o)),
+        validity=Validity(o.get("validity") or "DAY"),
+        limit_price_paise=o.get("limit_price_paise"),
+        trigger_price_paise=o.get("trigger_price_paise"),
+        protection_price_paise=o.get("protection_price_paise"),
+        target_broker_order_id=str(o["broker_order_id"]),
+    )
+
+
+def build_cancel_all_plan(s: Session, account: AccountState, *, symbol: str | None = None) -> PlanDraft:
+    """'Cancel all my open orders' (optionally limited to one symbol): one CANCEL step per order the broker still shows
+    as open, partially filled or trigger pending, whatever day it was placed. Steps are independent."""
+    rows = [o for o in account.open_orders if str(o.get("status") or "").upper() in CANCELLABLE_STATUSES]
+    sym_label = ""
+    if symbol:
+        r = _resolve_ref(s, symbol, [o["instrument_id"] for o in rows])
+        if r.status != "RESOLVED" or r.instrument is None:
+            return PlanDraft(message=f"I could not match '{symbol}' to one instrument, so nothing was drafted. Say 'cancel all my open orders', or give the exact symbol (for example 'cancel all my RELIANCE orders').")
+        rows = [o for o in rows if o["instrument_id"] == r.instrument.instrument_id]
+        sym_label = f"{r.instrument.symbol} "
+    if not rows:
+        return PlanDraft(title="Nothing to cancel", message=f"You have no open {sym_label}orders, so there is nothing to cancel. No plan was drafted.")
+    rows = sorted(rows, key=lambda o: (str(o.get("placed_at") or ""), str(o["broker_order_id"])))
+    built: list[tuple[CanonicalOrder, Instrument, dict]] = []
+    skipped: list[str] = []
+    for o in rows:
+        inst = s.get(Instrument, o["instrument_id"])
+        try:
+            if inst is None:
+                raise ValueError("unknown instrument")
+            built.append((_cancel_step(account, inst, o), inst, o))
+        except ValueError:
+            skipped.append(f"{o['broker_order_id']} ({o.get('symbol') or o['instrument_id']})")
+    if not built:
+        return PlanDraft(title="Nothing to cancel", message=f"I could not match your open orders ({', '.join(skipped)}) to the instrument master, so nothing was drafted. Cancel them at the broker.")
+    n = len(built)
+    d = PlanDraft(title=f"Cancel {n} open {sym_label}order{'s' if n != 1 else ''}")
+    partial = 0
+    for order, inst, o in built:
+        q = int(o["quantity"])
+        filled = int(o.get("filled_quantity") or 0)
+        pending = int(o.get("pending_quantity") if o.get("pending_quantity") is not None else q - filled)
+        status = str(o.get("status") or "").upper()
+        price = _price_text(order) if order.order_type != OrderType.MARKET else "MARKET"
+        fill_txt = f", {filled:,} of {q:,} filled" if filled else ""
+        d.summaries.append(f"CANCEL order {order.target_broker_order_id} ({order.side.value} {q:,} {inst.symbol}{fill_txt})")
+        placed = str(o.get("placed_at") or "")
+        d.fields.append(
+            [
+                FieldRow(key="action", label="Action", display="CANCEL", source=Source.TRADER, note="You asked to cancel all your open orders"),
+                FieldRow(key="target", label="Target order", display=str(order.target_broker_order_id), source=Source.ACCOUNT, note="From your broker's open orders"),
+                FieldRow(key="instrument", label="Instrument", display=f"{inst.symbol}  ({inst.display_name})", source=Source.ACCOUNT),
+                FieldRow(key="side", label="Side", display=order.side.value, source=Source.ACCOUNT),
+                FieldRow(key="quantity", label="Quantity", display=f"{q:,}", source=Source.ACCOUNT, note=f"{filled:,} filled, {pending:,} still open" if filled else None),
+                FieldRow(key="price", label="Price", display=price, source=Source.ACCOUNT),
+                FieldRow(key="status", label="Broker status", display=status, source=Source.ACCOUNT, note=f"Placed {placed[:16].replace('T', ' ')}" if placed else None),
+                FieldRow(key="product", label="Product", display=order.product.value, source=Source.ACCOUNT),
+            ]
+        )
+        step_issues: list[Issue] = []
+        if filled:
+            partial += 1
+            step_issues.append(Issue(code="PARTIAL_FILL_KEPT", severity="INFO", message=f"{filled:,} of {q:,} already filled. Cancelling keeps what already filled and cancels only the remaining {pending:,}."))
+        d.orders.append(order)
+        d.issues.append(step_issues)
+    scope = f"every open {sym_label}order" if sym_label else "every open order on your active account"
+    d.notes.append(
+        Issue(
+            code="CANCEL_ALL_SCOPE",
+            severity="INFO",
+            message=(
+                f"Cancels {scope} ({n}): open, partially filled and trigger pending, including orders from earlier days that are still open at the broker. "
+                + (f"{partial} {'is' if partial == 1 else 'are'} partly filled: cancelling keeps what already filled and cancels only the unfilled remainder. " if partial else "")
+                + "Nothing new is placed and no position is closed. Steps are independent (none waits for another)."
+            ),
+        )
+    )
+    if skipped:
+        d.notes.append(Issue(code="CANCEL_ALL_SKIPPED", severity="WARN", message=f"Not in this plan: {', '.join(skipped)}. They are not in the instrument master; cancel them at the broker."))
     return d
 
 

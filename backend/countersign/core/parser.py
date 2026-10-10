@@ -98,7 +98,7 @@ class Facts:
 
 @dataclass
 class Parsed:
-    kind: str  # query | order | modify | cancel | plan | mandate | exit_losers | rebalance | clarify | unknown
+    kind: str  # query | order | modify | cancel | plan | mandate | exit_losers | cancel_all | rebalance | clarify | unknown
     query: str | None = None
     args: dict = field(default_factory=dict)
     order: OrderIntent | None = None
@@ -274,6 +274,26 @@ def detect_exit_losers(text: str) -> dict | None:
     return {"intraday_only": bool(re.search(r"\bintraday\b|\bmis\b|\bday trades?\b", low))}
 
 
+_CANCEL_ALL_FILLER = {"my", "the", "of", "open", "pending", "outstanding", "working", "unfilled", "live", "active", "remaining", "current", "existing", "orders", "order", "all", "every", "each", "single", "stock", "share", "equity", "these", "those", "today's", "todays"}
+
+
+def detect_cancel_all(text: str) -> dict | None:
+    """'Cancel all my open orders', 'cancel every pending order', 'cancel all my RELIANCE orders'. symbol is what the
+    trader put between 'all' and 'orders' (or after 'orders in/for/on'), else None for every open order."""
+    low = text.lower()
+    if re.search(r"\b(?:buy|sell|purchase)\s+\d", low):
+        return None
+    m = re.search(r"\b(?:cancel|withdraw|kill)\s+(?:all|every|each)\b(?:\s+(?:of\s+)?([\w&.'-]+(?:\s+[\w&.'-]+){0,3}?))?\s+orders?\b(?:\s+(?:in|for|on|of)\s+([\w&.-]+))?", low)
+    if not m:
+        if re.search(r"\bcancel\s+(?:all\s+)?(?:my\s+)?(?:open|pending|outstanding)\s+orders\b", low):
+            return {"symbol": None}
+        return None
+    words = [w for w in (m.group(1) or "").split() if w not in _CANCEL_ALL_FILLER]
+    if m.group(2):
+        words.append(m.group(2))
+    return {"symbol": " ".join(words).upper() if words else None}
+
+
 def detect_rebalance(text: str) -> dict | None:
     """'Rebalance so no single stock is more than 20% of my portfolio'."""
     low = text.lower()
@@ -352,6 +372,8 @@ def parse(text: str) -> Parsed:
         return _parse_mandate(t, facts)
     if (ex := detect_exit_losers(t)) is not None:
         return Parsed(kind="exit_losers", args=ex, facts=facts)
+    if (ca := detect_cancel_all(t)) is not None:
+        return Parsed(kind="cancel_all", args=ca, facts=facts)
     if (rb := detect_rebalance(t)) is not None:
         if rb["max_pct"] is None:
             return Parsed(kind="clarify", question="What is the maximum weight for a single stock? For example 'Rebalance so no single stock is more than 20% of my portfolio'.", facts=facts)

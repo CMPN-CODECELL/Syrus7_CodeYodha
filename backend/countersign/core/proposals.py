@@ -16,12 +16,13 @@ from decimal import Decimal
 from countersign.core import audit, events, state
 from countersign.core.canonical import canonical_hash, short
 from countersign.core.models import Approval, ExecJob, OutboxEntry, Plan, PlanStep, Proposal, StandingMandate
-from countersign.core.parser import Facts, detect_exit_losers, detect_rebalance, extract_facts
+from countersign.core.parser import Facts, detect_cancel_all, detect_exit_losers, detect_rebalance, extract_facts
 from countersign.core.schemas import CanonicalMandate, CanonicalOrder, CanonicalPlan, MandateIntent, OrderIntent, PlanIntent, iso
 from countersign.core.verifier import (
     MAX_GENERATED_PLAN_STEPS,
     AccountState,
     PlanDraft,
+    build_cancel_all_plan,
     build_exit_plan,
     build_mandate,
     build_order,
@@ -261,8 +262,11 @@ def _generated_plan(
             # The plan card lists issues per step, so the method, the resulting weights and any plan-wide block
             # (for example too many steps) travel with step 1.
             step_issues = list(draft.notes) + plan_blocks + step_issues
-        steps_view.append(_step_view(st.step_no, st.order, draft.fields[i], previews[i], step_issues, None))
-    summary = " ; ".join(f"({st.step_no}) {summarize(st.order)}" for st in plan.steps)
+        view = _step_view(st.step_no, st.order, draft.fields[i], previews[i], step_issues, None)
+        if draft.summaries:
+            view["summary"] = draft.summaries[i]
+        steps_view.append(view)
+    summary = " ; ".join(f"({st.step_no}) {sv['summary']}" for st, sv in zip(plan.steps, steps_view, strict=True))
     p = _persist_plan(
         s, plan, steps_view, plan_issues, f"{draft.title}: {summary}", [],
         user_id=user_id, account=account, engine=engine, user_text=user_text, conversation_id=conversation_id, origin=origin,
@@ -287,6 +291,25 @@ def create_exit_plan(
         return Outcome(notice=("Nothing drafted", "Your message does not ask to exit losing positions, so no exit plan was drafted."))
     draft = build_exit_plan(s, account, extract_facts(user_text), intraday_only=req["intraday_only"])
     return _generated_plan(s, draft, user_text=user_text, account=account, user_id=user_id, engine=engine, conversation_id=conversation_id, origin=origin, kind="EXIT_LOSERS")
+
+
+def create_cancel_all_plan(
+    s: Session,
+    *,
+    user_text: str,
+    account: AccountState,
+    user_id: str,
+    engine: str,
+    conversation_id: str | None = None,
+    origin: str = "chat",
+) -> Outcome:
+    """'Cancel all my open orders' (or 'cancel all my RELIANCE orders'). The scope comes from the trader's words."""
+    req = detect_cancel_all(user_text)
+    if req is None:
+        audit.record(s, "verifier", "ACTION_NOT_REQUESTED", "account", account.account_id, {"kind": "CANCEL_ALL", "user_text": user_text[:300]})
+        return Outcome(notice=("Nothing drafted", "Your message does not ask to cancel all your open orders, so no cancel plan was drafted."))
+    draft = build_cancel_all_plan(s, account, symbol=req["symbol"])
+    return _generated_plan(s, draft, user_text=user_text, account=account, user_id=user_id, engine=engine, conversation_id=conversation_id, origin=origin, kind="CANCEL_ALL")
 
 
 def create_rebalance_plan(
