@@ -769,6 +769,17 @@ def skip_remaining(job_id: str, from_step: int, reason: str) -> None:
         audit.record(s, "executor", "PLAN_STEPS_SKIPPED", "plan", job.proposal_id, {"from_step": from_step, "reason": reason, "compensating_trades": "none (stop on failure)"})
 
 
+def skip_step(job_id: str, step_no: int, reason: str) -> None:
+    """Skips one plan step whose dependency did not succeed; steps that do not depend on it still run."""
+    with session_scope() as s:
+        job = s.get(ExecJob, job_id)
+        st = s.get(PlanStep, (job.proposal_id, step_no))
+        if st is not None and st.state == "PENDING":
+            st.state = "SKIPPED"
+            st.reason = reason
+        audit.record(s, "executor", "PLAN_STEPS_SKIPPED", "plan", job.proposal_id, {"from_step": step_no, "only": True, "reason": reason, "compensating_trades": "none"})
+
+
 def finalize(job_id: str) -> None:
     with session_scope() as s:
         job = s.get(ExecJob, job_id)

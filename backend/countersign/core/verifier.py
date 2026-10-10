@@ -1047,7 +1047,7 @@ def verify_plan(
     for i, st in enumerate(plan.steps):
         if st.depends_on is not None and not (1 <= st.depends_on < st.step_no):
             plan_issues.append(Issue(code="PLAN_DEPENDENCY_INVALID", severity="BLOCK", message=f"Step {st.step_no} depends on an invalid step."))
-    plan_issues.append(Issue(code="NO_AUTO_COMPENSATION", severity="INFO", message="If any step fails, the remaining steps are not executed and no compensating trades are invented."))
+    plan_issues.append(Issue(code="NO_AUTO_COMPENSATION", severity="INFO", message="If a step fails, the steps that depend on it are not executed; independent steps still run. No compensating trades are invented."))
     return per_issues, previews, plan_issues
 
 

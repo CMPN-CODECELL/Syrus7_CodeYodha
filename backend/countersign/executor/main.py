@@ -58,6 +58,11 @@ def step_skip(job_id: str, from_step: int, reason: str) -> None:
 
 
 @DBOS.step()
+def step_skip_one(job_id: str, step_no: int, reason: str) -> None:
+    pipeline.skip_step(job_id, step_no, reason)
+
+
+@DBOS.step()
 def step_finalize(job_id: str) -> None:
     pipeline.finalize(job_id)
 
@@ -67,16 +72,22 @@ def run_job(job_id: str) -> str:
     pre = step_preflight(job_id)
     if not pre.get("ok"):
         return pre.get("code", "BLOCKED")
+    failed: set[int] = set()  # a failed step skips only the steps that depend on it; independent steps still run
     for step in pre["steps"]:
-        if step.get("depends_on"):
-            w = step_wait(job_id, step["depends_on"])
+        dep = step.get("depends_on")
+        if dep in failed:
+            step_skip_one(job_id, step["step_no"], f"Step {dep} did not succeed and this step depends on it (no compensating trades).")
+            failed.add(step["step_no"])
+            continue
+        if dep:
+            w = step_wait(job_id, dep)
             if not w.get("filled"):
-                step_skip(job_id, step["step_no"], w.get("reason", "Dependency did not fill."))
-                break
+                step_skip_one(job_id, step["step_no"], w.get("reason", "Dependency did not fill."))
+                failed.add(step["step_no"])
+                continue
         r = step_send(job_id, step)
         if not r.get("ok"):
-            step_skip(job_id, step["step_no"] + 1, f"Step {step['step_no']} did not succeed; stop on failure (no compensating trades).")
-            break
+            failed.add(step["step_no"])
     step_finalize(job_id)
     return "DONE"
 
