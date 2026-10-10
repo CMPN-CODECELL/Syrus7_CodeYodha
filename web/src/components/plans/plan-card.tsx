@@ -259,8 +259,7 @@ export function PlanCard({ proposal, className }: { proposal: Proposal; classNam
             <span>
               <span className="font-semibold text-info">Independent steps: no automatic compensating trades.</span>{" "}
               <span className="text-muted-foreground">
-                No step waits for another. If the broker refuses a step when it is sent, the later steps are skipped; a rejection reported after a
-                step was accepted does not stop the others. Nothing is retried or reversed for you.
+                No step waits for another. If the broker refuses one, the others still go. Nothing is retried or reversed for you.
               </span>
             </span>
           </div>
@@ -270,8 +269,7 @@ export function PlanCard({ proposal, className }: { proposal: Proposal; classNam
             <span>
               <span className="font-semibold text-warning">Stop on failure: no automatic compensating trades.</span>{" "}
               <span className="text-muted-foreground">
-                If a step that a later one depends on does not fill, or the broker refuses a step when it is sent, later steps are skipped. Nothing is
-                reversed for you.
+                If a step does not fill or the broker refuses it, only the steps that depend on it are skipped. Nothing is reversed for you.
               </span>
             </span>
           </div>
