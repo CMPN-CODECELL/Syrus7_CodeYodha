@@ -72,7 +72,7 @@ def handle(d: ChatDeps) -> str:
     if k in ("exit_losers", "rebalance"):
         return "Here is the plan the verifier computed, with the arithmetic on each step. One countersignature binds every step; I will report exactly what fills and what is rejected, and no compensating trades are made."
     if k == "plan":
-        return "Here is the complete plan. One countersignature binds every step; if a step fails, later steps stop and no compensating trades are made."
+        return "Here is the complete plan. One countersignature binds every step; if a step fails, only the steps that depend on it stop, and no compensating trades are made."
     return "Here is the exact order the executor would send. Review every field and its source, then countersign it with your passkey. The approval expires in 60 seconds."
 
 
