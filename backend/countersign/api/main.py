@@ -57,11 +57,16 @@ from countersign.core.proposals import mandate_view, view
 from countersign.core.schemas import iso
 
 app = FastAPI(title="Countersign API", version="1.0")
+from countersign.api.whatsapp import router as _whatsapp_router  # noqa: E402
+
+# Registered route by route (not include_router) so app.routes stays a flat list of routes with a path.
+for _r in _whatsapp_router.routes:
+    app.add_api_route(_r.path, _r.endpoint, methods=sorted(_r.methods), name=_r.name)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings().allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "X-CSRF-Token"],
 )
 
@@ -86,6 +91,10 @@ RATE_LIMITS = [
     ("/api/auth/passkey/login/start", "POST", 10, 60.0, True),
     ("/api/auth/passkey/login/finish", "POST", 10, 60.0, True),
     ("/api/public/status", "GET", 60, 60.0, True),
+    ("/api/whatsapp/link", "POST", 5, 600.0, False),
+    ("/api/whatsapp/verify", "POST", 10, 60.0, False),
+    ("/api/whatsapp/test", "POST", 5, 60.0, False),
+    ("/api/whatsapp/inbound", "POST", 120, 60.0, True),
 ]
 _LOOPBACK = {"127.0.0.1", "::1"}
 
@@ -200,6 +209,8 @@ def _startup() -> None:
 
     if os.environ.get("CS_021_PASSWORD"):
         sys.exit("api: refusing to start. The 021 password belongs only to the gateway021 process (credential zone violation).")
+    if os.environ.get("CS_TWILIO_AUTH_TOKEN"):
+        sys.exit("api: refusing to start. The Twilio auth token belongs only to the notifier process (credential zone violation).")
     from countersign.core.bootstrap import bootstrap
     from countersign.core.mandate_engine import start_background
 
@@ -1431,12 +1442,30 @@ def list_mandates(p: Principal = Depends(current)):
         return [mandate_view(m, pr.canonical) for m, pr in rows if m.state != "PENDING_APPROVAL" or pr.status == "AWAITING_APPROVAL"]
 
 
+def _require_cancel_step_up(s, u: User, p: Principal) -> None:
+    """Cancelling a standing instruction needs the same fresh step-up as adding a factor or linking 021 (an approval
+    method proved in this session within STEP_UP_TTL), so a stolen session cannot silently disarm a protective order."""
+    methods = _factor_methods(s, u)
+    if not methods or not _step_up_fresh(s, p):
+        raise HTTPException(
+            403,
+            {
+                "code": "STEP_UP_REQUIRED",
+                "message": "Confirm it is you first with your passkey, app PIN or authenticator code. Being signed in is not enough to cancel a standing instruction."
+                if methods
+                else "Choose your app PIN first; cancelling a standing instruction needs a fresh confirmation with it.",
+                "methods": methods,
+            },
+        )
+
+
 @app.post("/api/mandates/{mid}/cancel")
 def cancel_mandate(mid: str, p: Principal = Depends(current)):
     with session_scope() as s:
         m = s.get(StandingMandate, mid)
         if m is None or m.user_id != p.user_id:
             raise HTTPException(404, {"code": "NOT_FOUND", "message": "No such standing instruction."})
+        _require_cancel_step_up(s, _user(s, p), p)
         r = s.execute(text("UPDATE mandates SET state='CANCELLED', reason='Cancelled by trader' WHERE id=:id AND state IN ('ACTIVE','NEEDS_REVIEW','PENDING_APPROVAL') RETURNING id"), {"id": mid}).first()
         if r is None:
             raise HTTPException(409, {"code": "NOT_CANCELLABLE", "message": f"This instruction is {m.state.lower()} and cannot be cancelled."})
@@ -1900,7 +1929,8 @@ def health():
     import os
 
     holds_021 = bool(os.environ.get("CS_021_UCC") or os.environ.get("CS_021_PASSWORD"))
-    return {"ok": True, "db": True, "valkey": events.ping(), "holds_write_key": bool(settings().broker_write_key), "holds_021_credentials": holds_021, "gateway021_enabled": settings().gateway021_enabled}
+    holds_twilio = bool(os.environ.get("CS_TWILIO_ACCOUNT_SID") or os.environ.get("CS_TWILIO_AUTH_TOKEN"))
+    return {"ok": True, "db": True, "valkey": events.ping(), "holds_write_key": bool(settings().broker_write_key), "holds_021_credentials": holds_021, "holds_twilio_credentials": holds_twilio, "gateway021_enabled": settings().gateway021_enabled}
 
 
 def main() -> None:
