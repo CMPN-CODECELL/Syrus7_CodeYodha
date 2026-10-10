@@ -11,6 +11,7 @@ os.environ["CS_BROKER_READ_KEY"] = "test-read"
 os.environ["CS_BROKER_WRITE_KEY"] = "test-write"
 os.environ["CS_MARKET_ALWAYS_OPEN"] = "true"
 os.environ["CS_RECONCILE_WINDOW_S"] = "0.6"
+os.environ["CS_NOTIFIER_KEY"] = "test-notifier"
 
 import itertools
 import json
@@ -27,6 +28,7 @@ from countersign.core.db import session_scope
 TRANSACTIONAL = [
     "outbox", "exec_jobs", "capabilities", "approvals", "plan_steps", "plans", "mandates", "proposals", "outcomes",
     "broker_orders", "order_fills", "chat_messages", "security_events", "attack_runs", "market_snapshots", "system_state",
+    "whatsapp_messages", "whatsapp_watches", "whatsapp_codes", "whatsapp_prefs", "whatsapp_links",
 ]
 
 
