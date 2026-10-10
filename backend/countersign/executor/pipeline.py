@@ -723,10 +723,11 @@ def _order_from_request(s, ob: OutboxEntry) -> dict:
     raise KeyError(ob.step_no)
 
 
-def wait_for_fill(job_id: str, depends_on: int, timeout_s: float = 30.0) -> dict:
+def wait_for_fill(job_id: str, depends_on: int, timeout_s: float = 180.0) -> dict:
     """A dependent step runs once the step it depends on has filled, fully or partly: 021's sandbox fills only part of
     an order and holds the rest, and a step that filled nothing stops the plan. The broker is asked directly every
-    2 s, so a missed order update cannot hold the plan back."""
+    2 s, so a missed order update cannot hold the plan back. 021 has taken over 40 s to fill a marketable order,
+    so the wait is 3 minutes; the job itself still had to start inside its 60 s approval window."""
     from countersign.executor import tracker
 
     deadline = time.time() + timeout_s
