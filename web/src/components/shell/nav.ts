@@ -3,6 +3,7 @@ import {
   Briefcase,
   ChartCandlestick,
   Crosshair,
+  MessageCircle,
   MessageSquare,
   ShieldCheck,
   Swords,
@@ -26,6 +27,7 @@ export const NAV: NavItem[] = [
   { href: "/mandates", label: "Mandates", short: "Mandates", icon: Crosshair, description: "Standing instructions" },
   { href: "/plans", label: "Plans", short: "Plans", icon: Workflow, description: "Multi-step plans" },
   { href: "/attack-lab", label: "Attack Lab", short: "Attacks", icon: Swords, description: "Proof under attack" },
+  { href: "/alerts", label: "WhatsApp alerts", short: "Alerts", icon: MessageCircle, description: "Notifications only, never trades" },
   { href: "/security", label: "Security Center", short: "Security", icon: ShieldCheck, description: "Devices, kill switch, audit" },
 ];
 

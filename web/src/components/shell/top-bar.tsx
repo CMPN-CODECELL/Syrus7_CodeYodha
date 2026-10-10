@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useSyncExternalStore } from "react";
-import { Landmark, LogOut, Monitor, Moon, Presentation, Search, ShieldCheck, Sun } from "lucide-react";
+import { Landmark, LogOut, MessageCircle, Monitor, Moon, Presentation, Search, ShieldCheck, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
 import {
   DropdownMenu,
@@ -79,6 +79,10 @@ function UserMenu({ me }: { me: Me }) {
         </DropdownMenuItem>
         <DropdownMenuItem render={<Link href="/security" />}>
           <ShieldCheck /> Security Center
+        </DropdownMenuItem>
+        <DropdownMenuItem render={<Link href="/alerts" />}>
+          <MessageCircle /> WhatsApp alerts
+          <DropdownMenuShortcut className="tracking-normal">read only</DropdownMenuShortcut>
         </DropdownMenuItem>
         {demoMode && (
           <DropdownMenuItem onClick={() => setPresenterOpen(true)}>

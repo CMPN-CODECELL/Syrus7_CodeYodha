@@ -24,5 +24,6 @@ export const config = {
     "/plans/:path*",
     "/attack-lab/:path*",
     "/security/:path*",
+    "/alerts/:path*",
   ],
 };
